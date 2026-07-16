@@ -83,6 +83,12 @@ export async function loadNotebookRevisionAndConnect(
 const targetsEqual = (left: NotebookRuntimeTarget, right: NotebookRuntimeTarget): boolean =>
   left.sessionId === right.sessionId && left.kernelName === right.kernelName;
 
+const isSessionNotFound = (cause: unknown): boolean =>
+  typeof cause === "object" &&
+  cause !== null &&
+  "reason" in cause &&
+  cause.reason === "session-not-found";
+
 export async function replaceNotebookWorkingCopyRuntime(
   request: LifecycleRequest & {
     readonly working: NotebookWorkingCopy;
@@ -96,11 +102,15 @@ export async function replaceNotebookWorkingCopyRuntime(
   const onState = guardedRuntimeState(request);
 
   if (identityChanged) {
-    await request.controller.dispose({
-      scope: request.scope,
-      sessionId: previousTarget.sessionId,
-      onState,
-    });
+    try {
+      await request.controller.dispose({
+        scope: request.scope,
+        sessionId: previousTarget.sessionId,
+        onState,
+      });
+    } catch (cause) {
+      if (!isSessionNotFound(cause)) throw cause;
+    }
   }
   if (!isActive()) return null;
 

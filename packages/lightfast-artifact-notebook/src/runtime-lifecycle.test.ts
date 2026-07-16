@@ -9,6 +9,7 @@ import {
   replaceNotebookWorkingCopyRuntime,
 } from "./runtime-lifecycle.ts";
 import {
+  applyImportedNotebookRevision,
   createNotebookWorkingCopy,
   openLatestNotebookRevision,
   viewReferencedNotebookRevision,
@@ -188,6 +189,116 @@ describe("notebook runtime lifecycle", () => {
     expect(isNotebookRevisionSwitchDisabled(null, new Set(["code-1"]))).toBe(true);
   });
 
+  it("continues import after an explicitly disposed old runtime is already absent", async () => {
+    const original = revision("original-doc", {
+      name: "python3",
+      displayName: "Python 3",
+      language: "python",
+    });
+    const imported = revision("imported-doc", {
+      name: "julia-1.11",
+      displayName: "Julia 1.11",
+      language: "julia",
+    });
+    const workingCopies: string[] = [];
+    const bindings = controller({
+      importRevision: vi.fn(async () => imported),
+      dispose: vi.fn(async () => {
+        throw { reason: "session-not-found", message: "Already disposed." };
+      }),
+      connect: vi.fn(async () => undefined),
+    });
+
+    await expect(
+      importNotebookRevisionAndReplaceRuntime({
+        controller: bindings,
+        scope,
+        working: createNotebookWorkingCopy(original),
+        ipynbJson: "{}",
+        onState,
+        onWorkingCopy: (working) => workingCopies.push(working.documentId),
+      }),
+    ).resolves.toMatchObject({ documentId: "imported-doc" });
+
+    expect(workingCopies).toEqual(["imported-doc"]);
+    expect(bindings.connect).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "notebook-imported-doc", kernelName: "julia-1.11" }),
+    );
+  });
+
+  it("continues revision switching after an explicitly disposed old runtime is already absent", async () => {
+    const original = revision("original-doc", {
+      name: "python3",
+      displayName: "Python 3",
+      language: "python",
+    });
+    const imported = revision("imported-doc", {
+      name: "julia-1.11",
+      displayName: "Julia 1.11",
+      language: "julia",
+    });
+    const current = applyImportedNotebookRevision(createNotebookWorkingCopy(original), imported);
+    const workingCopies: string[] = [];
+    const bindings = controller({
+      dispose: vi.fn(async () => {
+        throw { reason: "session-not-found", message: "Already disposed." };
+      }),
+      connect: vi.fn(async () => undefined),
+    });
+
+    await expect(
+      replaceNotebookWorkingCopyRuntime({
+        controller: bindings,
+        scope,
+        working: current,
+        nextWorking: viewReferencedNotebookRevision(current),
+        onState,
+        onWorkingCopy: (working) => workingCopies.push(working.documentId),
+      }),
+    ).resolves.toMatchObject({ documentId: "original-doc" });
+
+    expect(workingCopies).toEqual(["original-doc"]);
+    expect(bindings.connect).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "notebook-original-doc", kernelName: "python3" }),
+    );
+  });
+
+  it("aborts revision switching for disposal failures other than session-not-found", async () => {
+    const original = revision("original-doc", {
+      name: "python3",
+      displayName: "Python 3",
+      language: "python",
+    });
+    const imported = revision("imported-doc", {
+      name: "julia-1.11",
+      displayName: "Julia 1.11",
+      language: "julia",
+    });
+    const current = applyImportedNotebookRevision(createNotebookWorkingCopy(original), imported);
+    const workingCopies: string[] = [];
+    const failure = { reason: "runtime-unavailable", message: "Sidecar unavailable." };
+    const bindings = controller({
+      dispose: vi.fn(async () => {
+        throw failure;
+      }),
+      connect: vi.fn(async () => undefined),
+    });
+
+    await expect(
+      replaceNotebookWorkingCopyRuntime({
+        controller: bindings,
+        scope,
+        working: current,
+        nextWorking: viewReferencedNotebookRevision(current),
+        onState,
+        onWorkingCopy: (working) => workingCopies.push(working.documentId),
+      }),
+    ).rejects.toBe(failure);
+
+    expect(workingCopies).toEqual([]);
+    expect(bindings.connect).not.toHaveBeenCalled();
+  });
+
   it("drops stale runtime callbacks after a load generation is invalidated", async () => {
     const loaded = revision("original-doc", {
       name: "python3",
@@ -226,6 +337,8 @@ describe("notebook runtime lifecycle", () => {
       lastSequence: 10,
       recoveryAfterSequence: null,
       outputsByCell: new Map(),
+      outputKeysByCell: new Map(),
+      outputRetentionByCell: new Map(),
       executionCountByCell: new Map(),
       runningCellIds: new Set(),
       error: null,

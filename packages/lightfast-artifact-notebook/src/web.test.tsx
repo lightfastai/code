@@ -10,8 +10,16 @@ import type {
 import {
   NotebookCell,
   NotebookOutput,
+  NOTEBOOK_OUTPUT_RENDER_MAX_BYTES_PER_CELL,
+  NOTEBOOK_OUTPUT_RENDER_MAX_BYTES_PER_SESSION,
+  NOTEBOOK_OUTPUT_RENDER_MAX_CHARACTERS,
+  NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_CELL,
+  NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_SESSION,
+  NOTEBOOK_OUTPUT_RENDER_MAX_LINES,
+  boundedNotebookText,
   notebookOutputKey,
   notebookWebCapability,
+  planNotebookOutputRendering,
   sanitizeNotebookSvg,
 } from "./web.tsx";
 
@@ -30,6 +38,26 @@ describe("NotebookCell", () => {
   it("keys outputs by stable cell identity and output position", () => {
     expect(notebookOutputKey("code-1", 0)).toBe("code-1-output-0");
     expect(notebookOutputKey("code-1", 2)).toBe("code-1-output-2");
+  });
+
+  it("preserves runtime output keys when older entries are omitted", () => {
+    const outputs = Array.from(
+      { length: NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_CELL + 2 },
+      (_, index): NotebookOutputValue => ({
+        output_type: "stream",
+        name: "stdout",
+        text: `entry-${index}`,
+      }),
+    );
+    const outputKeys = outputs.map((_, index) => `runtime-key-${index}`);
+    const plan = planNotebookOutputRendering([{ cellId: "code-1", outputs, outputKeys }]).get(
+      "code-1",
+    );
+
+    expect(plan?.outputs).toHaveLength(NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_CELL);
+    expect(plan?.outputKeys[0]).toBe("runtime-key-2");
+    expect(plan?.retention?.omittedEntries).toBe(2);
+    expect(outputs).toHaveLength(NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_CELL + 2);
   });
 
   it("renders Markdown cells without executing embedded HTML", () => {
@@ -65,6 +93,30 @@ describe("NotebookCell", () => {
     expect(html).toContain("Execution 7");
     expect(html).toContain('aria-label="Code cell 1 source"');
     expect(html).toContain("Run cell");
+  });
+
+  it("renders an explicit notice when output has been omitted", () => {
+    const cell: NotebookCellValue = {
+      cell_type: "code",
+      id: "code-omitted",
+      metadata: {},
+      source: "print('many rows')",
+      execution_count: 1,
+      outputs: [],
+    };
+
+    const html = renderToStaticMarkup(
+      createElement(NotebookCell, {
+        cell,
+        index: 0,
+        total: 1,
+        renderedOutputs: [],
+        outputRetention: { omittedEntries: 4, omittedBytes: 8192 },
+      }),
+    );
+
+    expect(html).toContain("Earlier output omitted (4 entries, 8192 bytes)");
+    expect(html).toContain("Export the notebook");
   });
 });
 
@@ -199,14 +251,62 @@ describe("NotebookOutput", () => {
     expect(html).not.toContain("alert(1)");
   });
 
-  it("collapses oversized output behind an accessible expansion control", () => {
+  it("does not mount complete oversized text while collapsed and caps expanded rendering", () => {
+    const endMarker = "COMPLETE-OUTPUT-END";
     const html = renderOutput({
       output_type: "stream",
       name: "stdout",
-      text: "line\n".repeat(500),
+      text: `${"line\n".repeat(5_000)}${endMarker}`,
     });
 
-    expect(html).toContain("<details");
-    expect(html).toContain("Show complete Standard output");
+    const expanded = boundedNotebookText(
+      `${"line\n".repeat(5_000)}${endMarker}`,
+      NOTEBOOK_OUTPUT_RENDER_MAX_CHARACTERS,
+      NOTEBOOK_OUTPUT_RENDER_MAX_LINES,
+    );
+
+    expect(html).toContain("Show more Standard output");
+    expect(html).toContain("export the notebook");
+    expect(html).not.toContain("<details");
+    expect(html).not.toContain(endMarker);
+    expect(expanded.truncated).toBe(true);
+    expect(expanded.text).not.toContain(endMarker);
+  });
+
+  it("bounds mounted output entries and bytes across many cells without mutating source data", () => {
+    const inputs = Array.from({ length: 20 }, (_, cellIndex) => ({
+      cellId: `code-${cellIndex}`,
+      outputs: Array.from(
+        { length: NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_CELL + 4 },
+        (_, outputIndex): NotebookOutputValue => ({
+          output_type: "display_data",
+          metadata: {},
+          data: { "text/plain": `${cellIndex}-${outputIndex}-${"x".repeat(4_096)}` },
+        }),
+      ),
+    }));
+    const originalEntryCount = inputs.reduce((total, input) => total + input.outputs.length, 0);
+    const plan = planNotebookOutputRendering(inputs);
+    const retainedEntries = [...plan.values()].reduce(
+      (total, item) => total + item.outputs.length,
+      0,
+    );
+    const retainedBytes = [...plan.values()].reduce((total, item) => total + item.retainedBytes, 0);
+
+    expect(retainedEntries).toBeLessThanOrEqual(NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_SESSION);
+    expect(retainedBytes).toBeLessThanOrEqual(NOTEBOOK_OUTPUT_RENDER_MAX_BYTES_PER_SESSION);
+    expect(
+      [...plan.values()].every(
+        (item) =>
+          item.outputs.length <= NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_CELL &&
+          item.retainedBytes <= NOTEBOOK_OUTPUT_RENDER_MAX_BYTES_PER_CELL,
+      ),
+    ).toBe(true);
+    expect(
+      [...plan.values()].reduce((total, item) => total + (item.retention?.omittedEntries ?? 0), 0),
+    ).toBeGreaterThan(0);
+    expect(inputs.reduce((total, input) => total + input.outputs.length, 0)).toBe(
+      originalEntryCount,
+    );
   });
 });

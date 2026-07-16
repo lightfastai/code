@@ -45,7 +45,7 @@ it("authenticates every request and parses split NDJSON in order", async () => {
         );
         setImmediate(() => {
           response.end(
-            '"sessionId":"session-1","commandId":"command-1","executionId":"execution-1","sequence":5,"name":"stdout","text":"hello\\n"}\n',
+            '"sessionId":"session-1","commandId":"command-1","executionId":"execution-1","cellId":"cell-1","sequence":5,"name":"stdout","text":"hello\\n"}\n',
           );
         });
       });
@@ -136,6 +136,7 @@ it("rejects oversized NDJSON lines and aggregate execution bytes", async () => {
         sessionId: "session-1",
         commandId: "command-line",
         executionId: "execution-line",
+        cellId: "cell-line",
         sequence: 1,
         name: "stdout",
         text: "x".repeat(2 * 1024 * 1024),
@@ -165,6 +166,7 @@ it("rejects oversized NDJSON lines and aggregate execution bytes", async () => {
           sessionId: "session-1",
           commandId: "command-aggregate",
           executionId: "execution-aggregate",
+          cellId: "cell-aggregate",
           sequence,
           name: "stdout",
           text: "x".repeat(64 * 1024),

@@ -2,7 +2,6 @@ import {
   type NotebookCellExecuteInput,
   type NotebookExecutionEvent,
   type NotebookExecutionReplay,
-  type NotebookRevision,
   WS_METHODS,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -17,12 +16,21 @@ import {
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
 } from "./runtime.ts";
+import {
+  appendNotebookCellOutput,
+  createNotebookOutputState,
+  resetNotebookCellOutputs,
+  type NotebookOutputState,
+  type NotebookRuntimeOutput,
+} from "./notebook-output-retention.ts";
 
-type NotebookCodeCell = Extract<
-  NotebookRevision["document"]["cells"][number],
-  { cell_type: "code" }
->;
-type NotebookOutput = NotebookCodeCell["outputs"][number];
+export {
+  NOTEBOOK_RUNTIME_OUTPUT_MAX_BYTES_PER_CELL,
+  NOTEBOOK_RUNTIME_OUTPUT_MAX_BYTES_PER_SESSION,
+  NOTEBOOK_RUNTIME_OUTPUT_MAX_ENTRIES_PER_CELL,
+  NOTEBOOK_RUNTIME_OUTPUT_MAX_ENTRIES_PER_SESSION,
+  type NotebookOutputRetention,
+} from "./notebook-output-retention.ts";
 
 export type NotebookKernelStatus =
   | "disconnected"
@@ -33,13 +41,12 @@ export type NotebookKernelStatus =
   | "restarted"
   | "terminated";
 
-export interface NotebookRuntimeState {
+export interface NotebookRuntimeState extends NotebookOutputState {
   readonly kernelStatus: NotebookKernelStatus;
   readonly lastSequence: number;
   readonly recoveryAfterSequence: number | null;
   readonly pendingEvents: ReadonlyMap<number, NotebookExecutionEvent>;
   readonly cellIdByExecution: ReadonlyMap<string, string>;
-  readonly outputsByCell: ReadonlyMap<string, ReadonlyArray<NotebookOutput>>;
   readonly executionCountByCell: ReadonlyMap<string, number | null>;
   readonly runningCellIds: ReadonlySet<string>;
   readonly error: string | null;
@@ -52,7 +59,7 @@ export function createNotebookRuntimeState(): NotebookRuntimeState {
     recoveryAfterSequence: null,
     pendingEvents: new Map(),
     cellIdByExecution: new Map(),
-    outputsByCell: new Map(),
+    ...createNotebookOutputState(),
     executionCountByCell: new Map(),
     runningCellIds: new Set(),
     error: null,
@@ -64,16 +71,15 @@ export function beginNotebookCellExecution(
   cellId: string,
   executionId: string,
 ): NotebookRuntimeState {
+  const outputState = resetNotebookCellOutputs(state, cellId);
   const cellIdByExecution = new Map(state.cellIdByExecution);
   cellIdByExecution.set(executionId, cellId);
-  const outputsByCell = new Map(state.outputsByCell);
-  outputsByCell.set(cellId, []);
   const runningCellIds = new Set(state.runningCellIds);
   runningCellIds.add(cellId);
   return {
     ...state,
+    ...outputState,
     cellIdByExecution,
-    outputsByCell,
     runningCellIds,
     error: null,
   };
@@ -82,98 +88,106 @@ export function beginNotebookCellExecution(
 const appendOutput = (
   state: NotebookRuntimeState,
   cellId: string,
-  output: NotebookOutput,
-): NotebookRuntimeState => {
-  const outputsByCell = new Map(state.outputsByCell);
-  const existing = [...(outputsByCell.get(cellId) ?? [])];
-  const previous = existing.at(-1);
-  if (
-    output.output_type === "stream" &&
-    previous?.output_type === "stream" &&
-    previous.name === output.name
-  ) {
-    existing[existing.length - 1] = { ...previous, text: previous.text + output.text };
-  } else {
-    existing.push(output);
-  }
-  outputsByCell.set(cellId, existing);
-  return { ...state, outputsByCell };
-};
+  output: NotebookRuntimeOutput,
+  sequence: number,
+): NotebookRuntimeState => ({
+  ...state,
+  ...appendNotebookCellOutput(state, cellId, output, `${cellId}-runtime-output-${sequence}`),
+});
 
 const applyOrderedEvent = (
   state: NotebookRuntimeState,
   event: NotebookExecutionEvent,
 ): NotebookRuntimeState => {
+  let mappedState = state;
+  if (event.executionId !== undefined && event.cellId !== undefined) {
+    const cellIdByExecution = new Map(state.cellIdByExecution);
+    cellIdByExecution.set(event.executionId, event.cellId);
+    mappedState = { ...state, cellIdByExecution };
+  }
   if (event.type === "rejected") {
-    const runningCellIds = new Set(state.runningCellIds);
+    const runningCellIds = new Set(mappedState.runningCellIds);
     if (event.executionId !== undefined) {
-      const cellId = state.cellIdByExecution.get(event.executionId);
-      if (cellId !== undefined) runningCellIds.delete(cellId);
+      runningCellIds.delete(event.cellId);
     }
-    return { ...state, runningCellIds, error: event.message };
+    return { ...mappedState, runningCellIds, error: event.message };
   }
   if (event.type === "kernel") {
-    const runningCellIds = new Set(state.runningCellIds);
+    const runningCellIds = new Set(mappedState.runningCellIds);
     if (event.state === "idle" || event.state === "interrupted" || event.state === "terminated") {
       if (event.executionId) {
-        const cellId = state.cellIdByExecution.get(event.executionId);
-        if (cellId) runningCellIds.delete(cellId);
+        runningCellIds.delete(event.cellId);
       } else if (event.state !== "idle") {
         runningCellIds.clear();
       }
     }
-    return { ...state, kernelStatus: event.state, runningCellIds };
+    return { ...mappedState, kernelStatus: event.state, runningCellIds };
   }
-  if (event.type === "limit") return { ...state, error: event.message };
+  if (event.type === "limit") return { ...mappedState, error: event.message };
   if (event.type === "accepted") {
-    if (event.commandType !== "execute") return state;
-    const cellIdByExecution = new Map(state.cellIdByExecution);
-    cellIdByExecution.set(event.executionId, event.cellId);
-    const outputsByCell = new Map(state.outputsByCell);
-    outputsByCell.set(event.cellId, []);
-    const runningCellIds = new Set(state.runningCellIds);
+    if (event.commandType !== "execute") return mappedState;
+    const outputState = resetNotebookCellOutputs(mappedState, event.cellId);
+    const runningCellIds = new Set(mappedState.runningCellIds);
     runningCellIds.add(event.cellId);
     return {
-      ...state,
-      cellIdByExecution,
-      outputsByCell,
+      ...mappedState,
+      ...outputState,
       runningCellIds,
       error: null,
     };
   }
 
-  const cellId = state.cellIdByExecution.get(event.executionId);
-  if (cellId === undefined) return state;
+  const cellId = event.cellId;
   if (event.type === "stream") {
-    return appendOutput(state, cellId, {
-      output_type: "stream",
-      name: event.name,
-      text: event.text,
-    });
+    return appendOutput(
+      mappedState,
+      cellId,
+      {
+        output_type: "stream",
+        name: event.name,
+        text: event.text,
+      },
+      event.sequence,
+    );
   }
   if (event.type === "display") {
-    return appendOutput(state, cellId, {
-      output_type: "display_data",
-      data: event.data,
-      metadata: {},
-    });
+    return appendOutput(
+      mappedState,
+      cellId,
+      {
+        output_type: "display_data",
+        data: event.data,
+        metadata: {},
+      },
+      event.sequence,
+    );
   }
   if (event.type === "result") {
-    const executionCountByCell = new Map(state.executionCountByCell);
+    const executionCountByCell = new Map(mappedState.executionCountByCell);
     executionCountByCell.set(cellId, event.executionCount);
-    return appendOutput({ ...state, executionCountByCell }, cellId, {
-      output_type: "execute_result",
-      execution_count: event.executionCount,
-      data: event.data,
-      metadata: {},
-    });
+    return appendOutput(
+      { ...mappedState, executionCountByCell },
+      cellId,
+      {
+        output_type: "execute_result",
+        execution_count: event.executionCount,
+        data: event.data,
+        metadata: {},
+      },
+      event.sequence,
+    );
   }
-  return appendOutput(state, cellId, {
-    output_type: "error",
-    ename: event.ename,
-    evalue: event.evalue,
-    traceback: event.traceback,
-  });
+  return appendOutput(
+    mappedState,
+    cellId,
+    {
+      output_type: "error",
+      ename: event.ename,
+      evalue: event.evalue,
+      traceback: event.traceback,
+    },
+    event.sequence,
+  );
 };
 
 export function applyNotebookExecutionEvents(

@@ -32,11 +32,17 @@ const NotebookExecutionEventBase = Schema.Struct({
 const NotebookExecutionScopedEventBase = Schema.Struct({
   ...NotebookExecutionEventBase.fields,
   executionId: NotebookExecutionId,
+  cellId: NotebookCellId,
+});
+const NotebookLifecycleEventBase = Schema.Struct({
+  ...NotebookExecutionEventBase.fields,
+  executionId: Schema.optionalKey(Schema.Never),
+  cellId: Schema.optionalKey(Schema.Never),
 });
 
 export const NotebookExecutionEvent = Schema.Union([
   Schema.Struct({
-    ...NotebookExecutionEventBase.fields,
+    ...NotebookLifecycleEventBase.fields,
     type: Schema.Literal("accepted"),
     commandType: Schema.Literals(["open", "interrupt", "restart", "dispose"]),
   }),
@@ -44,19 +50,27 @@ export const NotebookExecutionEvent = Schema.Union([
     ...NotebookExecutionScopedEventBase.fields,
     type: Schema.Literal("accepted"),
     commandType: Schema.Literal("execute"),
-    cellId: NotebookCellId,
   }),
   Schema.Struct({
-    ...NotebookExecutionEventBase.fields,
+    ...NotebookExecutionScopedEventBase.fields,
     type: Schema.Literal("rejected"),
-    executionId: Schema.optional(NotebookExecutionId),
     reason: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
     message: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
   }),
   Schema.Struct({
-    ...NotebookExecutionEventBase.fields,
+    ...NotebookLifecycleEventBase.fields,
+    type: Schema.Literal("rejected"),
+    reason: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+    message: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
+  }),
+  Schema.Struct({
+    ...NotebookExecutionScopedEventBase.fields,
     type: Schema.Literal("kernel"),
-    executionId: Schema.optional(NotebookExecutionId),
+    state: Schema.Literals(["starting", "busy", "idle", "interrupted", "restarted", "terminated"]),
+  }),
+  Schema.Struct({
+    ...NotebookLifecycleEventBase.fields,
+    type: Schema.Literal("kernel"),
     state: Schema.Literals(["starting", "busy", "idle", "interrupted", "restarted", "terminated"]),
   }),
   Schema.Struct({

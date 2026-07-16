@@ -28,6 +28,7 @@ import {
   replaceNotebookWorkingCopyRuntime,
 } from "./runtime-lifecycle.ts";
 import { NotebookCell } from "./NotebookCell.tsx";
+import { planNotebookOutputRendering } from "./notebook-output-rendering.ts";
 import { type NotebookRuntimeView, useNotebookWebBindings } from "./web.tsx";
 
 const INITIAL_RUNTIME_STATE: NotebookRuntimeView = {
@@ -35,6 +36,8 @@ const INITIAL_RUNTIME_STATE: NotebookRuntimeView = {
   lastSequence: 0,
   recoveryAfterSequence: null,
   outputsByCell: new Map(),
+  outputKeysByCell: new Map(),
+  outputRetentionByCell: new Map(),
   executionCountByCell: new Map(),
   runningCellIds: new Set(),
   error: null,
@@ -231,6 +234,24 @@ export function NotebookArtifactEnvelopeRenderer({
     );
     return selected.length > 0 ? selected : working.document.cells;
   }, [payload, working]);
+  const outputRenderPlan = useMemo(
+    () =>
+      planNotebookOutputRendering(
+        visibleCells.flatMap((cell) =>
+          cell.cell_type === "code"
+            ? [
+                {
+                  cellId: cell.id,
+                  outputs: cell.outputs,
+                  outputKeys: runtime.outputKeysByCell.get(cell.id),
+                  retention: runtime.outputRetentionByCell.get(cell.id),
+                },
+              ]
+            : [],
+        ),
+      ),
+    [runtime.outputKeysByCell, runtime.outputRetentionByCell, visibleCells],
+  );
 
   if (payload === null) {
     return (
@@ -510,6 +531,7 @@ export function NotebookArtifactEnvelopeRenderer({
               const actualIndex = working.document.cells.findIndex(
                 (candidate) => candidate.id === cell.id,
               );
+              const renderedOutput = outputRenderPlan.get(cell.id);
               return (
                 <NotebookCell
                   key={cell.id}
@@ -517,6 +539,9 @@ export function NotebookArtifactEnvelopeRenderer({
                   index={actualIndex}
                   total={working.document.cells.length}
                   disabled={disabled || runtime.runningCellIds.has(cell.id)}
+                  renderedOutputs={renderedOutput?.outputs}
+                  outputKeys={renderedOutput?.outputKeys}
+                  outputRetention={renderedOutput?.retention}
                   onSourceChange={(source) =>
                     setWorking(updateNotebookCellSource(working, cell.id, source))
                   }

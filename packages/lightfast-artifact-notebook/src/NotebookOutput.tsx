@@ -1,9 +1,15 @@
+import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import type { NotebookMimeBundle, NotebookOutput as NotebookOutputValue } from "./contracts.ts";
 import { sandboxedNotebookHtmlDocument, sanitizeNotebookSvg } from "./notebook-sanitize.ts";
+import {
+  NOTEBOOK_OUTPUT_RENDER_MAX_CHARACTERS,
+  NOTEBOOK_OUTPUT_RENDER_MAX_LINES,
+  boundedNotebookText,
+} from "./notebook-output-rendering.ts";
 
 const OUTPUT_PREVIEW_CHARACTERS = 12_000;
 const OUTPUT_PREVIEW_LINES = 80;
@@ -39,33 +45,43 @@ function BoundedText({
   text: string;
   tone?: "error" | undefined;
 }) {
-  const lines = text.split("\n");
-  const bounded = text.length > OUTPUT_PREVIEW_CHARACTERS || lines.length > OUTPUT_PREVIEW_LINES;
-  const preview = lines
-    .slice(0, OUTPUT_PREVIEW_LINES)
-    .join("\n")
-    .slice(0, OUTPUT_PREVIEW_CHARACTERS);
+  const [expanded, setExpanded] = useState(false);
+  const preview = boundedNotebookText(text, OUTPUT_PREVIEW_CHARACTERS, OUTPUT_PREVIEW_LINES);
   const className = `overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-5 ${tone === "error" ? "text-destructive" : "text-foreground"}`;
-  if (!bounded) {
+  if (!preview.truncated) {
     return (
       <pre aria-label={label} className={className}>
         {text}
       </pre>
     );
   }
+  const rendered = expanded
+    ? boundedNotebookText(
+        text,
+        NOTEBOOK_OUTPUT_RENDER_MAX_CHARACTERS,
+        NOTEBOOK_OUTPUT_RENDER_MAX_LINES,
+      )
+    : preview;
   return (
     <div>
-      <pre aria-label={`${label} preview`} className={`${className} max-h-80`}>
-        {preview}…
+      <pre
+        aria-label={expanded ? label : `${label} preview`}
+        className={`${className} ${expanded ? "max-h-[32rem]" : "max-h-80"}`}
+      >
+        {rendered.text}
+        {rendered.truncated ? "…" : null}
       </pre>
-      <details className="mt-1 text-xs">
-        <summary className="cursor-pointer rounded-sm text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-          Show complete {label}
-        </summary>
-        <pre aria-label={label} className={`${className} mt-1 max-h-[32rem]`}>
-          {text}
-        </pre>
-      </details>
+      <button
+        type="button"
+        aria-expanded={expanded}
+        className="mt-1 cursor-pointer rounded-sm text-xs text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {expanded ? "Show less" : "Show more"} {label}
+      </button>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Expanded output is render-capped; export the notebook for complete immutable revision data.
+      </p>
     </div>
   );
 }

@@ -7,9 +7,23 @@ import {
   type NotebookOutput,
   type NotebookRevision,
 } from "./contracts.ts";
+import type { NotebookOutputRetentionNotice } from "./notebook-output-rendering.ts";
 
 export { NotebookCell, notebookOutputKey, type NotebookCellProps } from "./NotebookCell.tsx";
 export { NotebookMarkdown, NotebookOutput } from "./NotebookOutput.tsx";
+export {
+  NOTEBOOK_OUTPUT_RENDER_MAX_BYTES_PER_CELL,
+  NOTEBOOK_OUTPUT_RENDER_MAX_BYTES_PER_SESSION,
+  NOTEBOOK_OUTPUT_RENDER_MAX_CHARACTERS,
+  NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_CELL,
+  NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_SESSION,
+  NOTEBOOK_OUTPUT_RENDER_MAX_LINES,
+  boundedNotebookText,
+  planNotebookOutputRendering,
+  type NotebookOutputRenderInput,
+  type NotebookOutputRenderPlan,
+  type NotebookOutputRetentionNotice,
+} from "./notebook-output-rendering.ts";
 export { sanitizeNotebookSvg } from "./notebook-sanitize.ts";
 
 export type NotebookProjectScope = {
@@ -29,6 +43,8 @@ export type NotebookRuntimeView = {
   readonly lastSequence: number;
   readonly recoveryAfterSequence: number | null;
   readonly outputsByCell: ReadonlyMap<string, ReadonlyArray<NotebookOutput>>;
+  readonly outputKeysByCell: ReadonlyMap<string, ReadonlyArray<string>>;
+  readonly outputRetentionByCell: ReadonlyMap<string, NotebookOutputRetentionNotice>;
   readonly executionCountByCell: ReadonlyMap<string, number | null>;
   readonly runningCellIds: ReadonlySet<string>;
   readonly error: string | null;

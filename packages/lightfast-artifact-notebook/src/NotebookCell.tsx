@@ -1,16 +1,25 @@
 import type { ReactNode } from "react";
 
-import type { NotebookCell as NotebookCellValue } from "./contracts.ts";
+import type {
+  NotebookCell as NotebookCellValue,
+  NotebookOutput as NotebookOutputValue,
+} from "./contracts.ts";
+import {
+  notebookOutputKey,
+  type NotebookOutputRetentionNotice,
+} from "./notebook-output-rendering.ts";
 import { NotebookMarkdown, NotebookOutput } from "./NotebookOutput.tsx";
 
-export const notebookOutputKey = (cellId: string, outputIndex: number): string =>
-  `${cellId}-output-${outputIndex}`;
+export { notebookOutputKey } from "./notebook-output-rendering.ts";
 
 export type NotebookCellProps = {
   readonly cell: NotebookCellValue;
   readonly index: number;
   readonly total: number;
   readonly disabled?: boolean;
+  readonly renderedOutputs?: ReadonlyArray<NotebookOutputValue> | undefined;
+  readonly outputKeys?: ReadonlyArray<string> | undefined;
+  readonly outputRetention?: NotebookOutputRetentionNotice | null | undefined;
   readonly onSourceChange?: ((source: string) => void) | undefined;
   readonly onRun?: (() => void) | undefined;
   readonly onRunAbove?: (() => void) | undefined;
@@ -24,6 +33,9 @@ export function NotebookCell({
   index,
   total,
   disabled = false,
+  renderedOutputs,
+  outputKeys,
+  outputRetention,
   onSourceChange,
   onRun,
   onRunAbove,
@@ -32,6 +44,7 @@ export function NotebookCell({
   onRemove,
 }: NotebookCellProps) {
   const number = index + 1;
+  const outputs = renderedOutputs ?? (cell.cell_type === "code" ? cell.outputs : []);
   const sourceLabel = `${cell.cell_type === "code" ? "Code" : "Markdown"} cell ${number} source`;
   const action = (
     label: string,
@@ -79,10 +92,23 @@ export function NotebookCell({
             <NotebookMarkdown>{cell.source}</NotebookMarkdown>
           </div>
         ) : null}
-        {cell.cell_type === "code" && cell.outputs.length > 0 ? (
+        {cell.cell_type === "code" && (outputs.length > 0 || outputRetention != null) ? (
           <div aria-label={`Outputs for code cell ${number}`} className="mt-2 space-y-2">
-            {cell.outputs.map((output, outputIndex) => (
-              <NotebookOutput key={notebookOutputKey(cell.id, outputIndex)} output={output} />
+            {outputRetention ? (
+              <p
+                className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+                role="status"
+              >
+                Earlier output omitted ({outputRetention.omittedEntries} entries,{" "}
+                {outputRetention.omittedBytes} bytes) to keep this notebook responsive. Export the
+                notebook for complete immutable revision data.
+              </p>
+            ) : null}
+            {outputs.map((output, outputIndex) => (
+              <NotebookOutput
+                key={outputKeys?.[outputIndex] ?? notebookOutputKey(cell.id, outputIndex)}
+                output={output}
+              />
             ))}
           </div>
         ) : null}

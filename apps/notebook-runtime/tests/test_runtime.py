@@ -321,6 +321,7 @@ async def test_normalizes_kernel_errors(service: RuntimeService) -> None:
         "sessionId": "session-1",
         "commandId": "command-error",
         "executionId": "execution-error",
+        "cellId": "cell-error",
         "sequence": error["sequence"],
         "ename": "ValueError",
         "evalue": "boom",
@@ -405,6 +406,7 @@ async def test_duplicate_command_replays_without_executing_twice(service: Runtim
     ]
     assert replay == first
     assert manager.client_instance.execute_count == 1
+    assert all(event["cellId"] == "cell-1" for event in first)
 
     rejected = [
         event
@@ -415,6 +417,7 @@ async def test_duplicate_command_replays_without_executing_twice(service: Runtim
     assert len(rejected) == 1
     assert rejected[0]["type"] == "rejected"
     assert rejected[0]["reason"] == "command-id-conflict"
+    assert rejected[0]["cellId"] == "cell-2"
 
 
 async def test_execution_survives_subscriber_cancellation_and_replays_terminal_events(
@@ -492,6 +495,7 @@ async def test_dispose_finalizes_execution_cancelled_before_owner_task_starts(
 
     assert cancelled["type"] == "rejected"
     assert cancelled["reason"] == "execution-cancelled"
+    assert cancelled["cellId"] == "cell-pre-start-cancel"
     assert record.completed.is_set()
     assert owner_task.done()
     with pytest.raises(StopAsyncIteration):
@@ -534,6 +538,7 @@ async def test_output_and_time_limits_emit_structured_events(service: RuntimeSer
             "sessionId": "session-1",
             "commandId": "large",
             "executionId": "execution-large",
+            "cellId": "cell-large",
             "sequence": limits[0]["sequence"],
             "kind": "output",
             "limit": 5,
@@ -613,6 +618,24 @@ async def test_resume_returns_only_events_after_sequence(service: RuntimeService
     await service.interrupt("session-1", "interrupt-resume")
     events = service.events_after("session-1", 3)
     assert [event["sequence"] for event in events] == [4, 5]
+
+
+async def test_trimmed_execution_replay_keeps_cell_identity_without_accepted_event(
+    service: RuntimeService,
+) -> None:
+    service.event_history_limit = 2
+    await open_session(service)
+    events = [
+        event
+        async for event in service.execute(
+            "session-1", "trimmed", "execution-trimmed", "cell-trimmed", "ordered"
+        )
+    ]
+    replay = service.event_replay("session-1", 0)
+
+    assert any(event["type"] == "accepted" for event in events)
+    assert all(event["type"] != "accepted" for event in replay["events"])
+    assert all(event["cellId"] == "cell-trimmed" for event in replay["events"])
 
 
 async def test_resume_api_reports_trimmed_history_baseline(service: RuntimeService) -> None:

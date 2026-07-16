@@ -223,14 +223,18 @@ class RuntimeService:
         event_type: str,
         *,
         execution_id: str | None = None,
+        cell_id: str | None = None,
         **fields: Any,
     ) -> Event:
+        if (execution_id is None) != (cell_id is None):
+            raise RuntimeError("Execution-scoped notebook events require executionId and cellId.")
         session.sequence += 1
         event: Event = {
             "type": event_type,
             "sessionId": session.session_id,
             "commandId": command_id,
             **({"executionId": execution_id} if execution_id is not None else {}),
+            **({"cellId": cell_id} if cell_id is not None else {}),
             "sequence": session.sequence,
             **fields,
         }
@@ -248,6 +252,7 @@ class RuntimeService:
         command_id: str,
         *,
         execution_id: str | None,
+        cell_id: str | None = None,
         reason: str,
         message: str,
     ) -> Event:
@@ -256,6 +261,7 @@ class RuntimeService:
             command_id,
             "rejected",
             execution_id=execution_id,
+            cell_id=cell_id,
             reason=reason,
             message=message,
         )
@@ -265,8 +271,6 @@ class RuntimeService:
         session: KernelSession,
         command_id: str,
         fingerprint: str,
-        *,
-        execution_id: str | None = None,
     ) -> tuple[CommandRecord | None, list[Event] | None]:
         existing = session.commands.get(command_id)
         if existing is not None:
@@ -275,7 +279,7 @@ class RuntimeService:
                     self._rejected(
                         session,
                         command_id,
-                        execution_id=execution_id,
+                        execution_id=None,
                         reason="command-id-conflict",
                         message="The command ID was already used with a different payload.",
                     )
@@ -307,6 +311,7 @@ class RuntimeService:
         command_id: str,
         fingerprint: str,
         execution_id: str,
+        cell_id: str,
     ) -> tuple[CommandRecord | None, list[Event] | None, bool]:
         existing = session.commands.get(command_id)
         if existing is not None:
@@ -318,6 +323,7 @@ class RuntimeService:
                             session,
                             command_id,
                             execution_id=execution_id,
+                            cell_id=cell_id,
                             reason="command-id-conflict",
                             message="The command ID was already used with a different payload.",
                         )
@@ -435,7 +441,7 @@ class RuntimeService:
             },
         )
         record, replay, is_new = self._begin_execution_command(
-            session, command_id, fingerprint, execution_id
+            session, command_id, fingerprint, execution_id, cell_id
         )
         if replay is not None:
             for event in replay:
@@ -449,7 +455,7 @@ class RuntimeService:
             record.task = task
             task.add_done_callback(
                 lambda completed_task: self._finalize_execution_task(
-                    session, command_id, execution_id, record, completed_task
+                    session, command_id, execution_id, cell_id, record, completed_task
                 )
             )
         index = 0
@@ -478,7 +484,12 @@ class RuntimeService:
 
         def emit(event_type: str, **fields: Any) -> Event:
             event = self._event(
-                session, command_id, event_type, execution_id=execution_id, **fields
+                session,
+                command_id,
+                event_type,
+                execution_id=execution_id,
+                cell_id=cell_id,
+                **fields,
             )
             record.events.append(event)
             record.updated.set()
@@ -505,6 +516,7 @@ class RuntimeService:
                     "sessionId": session.session_id,
                     "commandId": command_id,
                     "executionId": execution_id,
+                    "cellId": cell_id,
                     "sequence": session.sequence + 1,
                     **fields,
                 }
@@ -528,7 +540,7 @@ class RuntimeService:
                     high = midpoint - 1
             return text[:low], True
 
-        emit("accepted", commandType="execute", cellId=cell_id)
+        emit("accepted", commandType="execute")
         try:
             async with session.lock:
                 msg_id = session.client.execute(code, allow_stdin=False, stop_on_error=True)
@@ -690,6 +702,7 @@ class RuntimeService:
         session: KernelSession,
         command_id: str,
         execution_id: str,
+        cell_id: str,
         record: CommandRecord,
         task: asyncio.Task[None],
     ) -> None:
@@ -705,6 +718,7 @@ class RuntimeService:
                     command_id,
                     "kernel",
                     execution_id=execution_id,
+                    cell_id=cell_id,
                     state="terminated",
                 )
                 if accepted
@@ -712,6 +726,7 @@ class RuntimeService:
                     session,
                     command_id,
                     execution_id=execution_id,
+                    cell_id=cell_id,
                     reason="execution-cancelled",
                     message="Execution was cancelled before it started.",
                 )
