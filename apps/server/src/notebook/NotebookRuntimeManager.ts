@@ -26,6 +26,11 @@ const DEFAULT_EVENT_HISTORY_LIMIT = 4096;
 const DEFAULT_COMMAND_CACHE_LIMIT = 512;
 const DEFAULT_EVENT_HISTORY_LIMIT_BYTES = 16 * 1024 * 1024;
 const DEFAULT_COMMAND_CACHE_LIMIT_BYTES = 16 * 1024 * 1024;
+const DEFAULT_DISPOSE_TOMBSTONE_LIMIT = 512;
+const DEFAULT_DISPOSE_TOMBSTONE_LIMIT_BYTES = 4 * 1024 * 1024;
+const DEFAULT_DISPOSE_TOMBSTONE_TTL_MS = 15 * 60_000;
+const DEFAULT_MAX_SESSIONS_PER_PROJECT = 4;
+const DEFAULT_MAX_SESSIONS_GLOBAL = 8;
 const DOCKER_OUTPUT_LIMIT_BYTES = 1024 * 1024;
 
 export interface DockerCommandRunner {
@@ -122,6 +127,13 @@ interface CommandCacheEntry {
   readonly completion: Promise<CommandResult>;
   retainedBytes: number;
   completed: boolean;
+}
+
+interface DisposeTombstone {
+  readonly fingerprint: string;
+  readonly events: ReadonlyArray<NotebookExecutionEvent>;
+  readonly expiresAt: number;
+  readonly retainedBytes: number;
 }
 
 interface PendingEvent {
@@ -223,6 +235,11 @@ export interface NotebookRuntimeManagerOptions {
   readonly commandCacheLimitBytes?: number;
   readonly executionTimeoutSeconds?: number;
   readonly timeoutIdleGraceSeconds?: number;
+  readonly disposeTombstoneLimit?: number;
+  readonly disposeTombstoneLimitBytes?: number;
+  readonly disposeTombstoneTtlMs?: number;
+  readonly maxSessionsPerProject?: number;
+  readonly maxSessionsGlobal?: number;
 }
 
 export interface NotebookManagerSessionOpenInput {
@@ -257,12 +274,19 @@ export class NotebookRuntimeManager {
   readonly #commandCacheLimitBytes: number;
   readonly #executionTimeoutSeconds: number;
   readonly #timeoutIdleGraceSeconds: number;
+  readonly #disposeTombstoneLimit: number;
+  readonly #disposeTombstoneLimitBytes: number;
+  readonly #disposeTombstoneTtlMs: number;
+  readonly #maxSessionsPerProject: number;
+  readonly #maxSessionsGlobal: number;
   readonly #projects = new Map<string, ProjectState>();
   readonly #sessions = new Map<string, SessionRuntime>();
   readonly #containers = new Map<string, OwnedSessionContainer>();
   readonly #sessionStarts = new Map<string, SessionStart>();
   readonly #sessionRemovals = new Map<string, Promise<void>>();
   readonly #projectRemovals = new Map<string, Promise<void>>();
+  readonly #disposeTombstones = new Map<string, DisposeTombstone>();
+  #disposeTombstoneBytes = 0;
   #closing = false;
 
   constructor(options: NotebookRuntimeManagerOptions) {
@@ -287,8 +311,29 @@ export class NotebookRuntimeManager {
       options.executionTimeoutSeconds ?? DEFAULT_EXECUTION_TIMEOUT_SECONDS;
     this.#timeoutIdleGraceSeconds =
       options.timeoutIdleGraceSeconds ?? DEFAULT_TIMEOUT_IDLE_GRACE_SECONDS;
+    this.#disposeTombstoneLimit = options.disposeTombstoneLimit ?? DEFAULT_DISPOSE_TOMBSTONE_LIMIT;
+    this.#disposeTombstoneLimitBytes =
+      options.disposeTombstoneLimitBytes ?? DEFAULT_DISPOSE_TOMBSTONE_LIMIT_BYTES;
+    this.#disposeTombstoneTtlMs = options.disposeTombstoneTtlMs ?? DEFAULT_DISPOSE_TOMBSTONE_TTL_MS;
+    this.#maxSessionsPerProject = options.maxSessionsPerProject ?? DEFAULT_MAX_SESSIONS_PER_PROJECT;
+    this.#maxSessionsGlobal = options.maxSessionsGlobal ?? DEFAULT_MAX_SESSIONS_GLOBAL;
     if (this.#executionTimeoutSeconds <= 0 || this.#timeoutIdleGraceSeconds <= 0) {
       throw new Error("Notebook runtime timeout settings must be positive.");
+    }
+    const positiveIntegerSettings = [
+      this.#disposeTombstoneLimit,
+      this.#disposeTombstoneLimitBytes,
+      this.#disposeTombstoneTtlMs,
+      this.#maxSessionsPerProject,
+      this.#maxSessionsGlobal,
+    ];
+    if (positiveIntegerSettings.some((value) => !Number.isSafeInteger(value) || value <= 0)) {
+      throw new Error(
+        "Notebook runtime retention and admission settings must be positive integers.",
+      );
+    }
+    if (this.#maxSessionsPerProject > this.#maxSessionsGlobal) {
+      throw new Error("The per-project notebook session limit cannot exceed the global limit.");
     }
   }
 
@@ -297,7 +342,11 @@ export class NotebookRuntimeManager {
   ): Promise<ReadonlyArray<NotebookExecutionEvent>> {
     const activeRemoval = this.#projectRemovals.get(input.projectId);
     if (activeRemoval !== undefined) await activeRemoval;
+    const sessionKey = this.#sessionKey(input.projectId, input.sessionId);
+    const activeSessionRemoval = this.#sessionRemovals.get(sessionKey);
+    if (activeSessionRemoval !== undefined) await activeSessionRemoval;
     this.#assertCanStart();
+    this.#assertAdmissionAvailable(input.projectId, sessionKey);
     const project = this.#selectProject(input.projectId, input.bookPaths ?? []);
     const runtime = await this.#ensureSession(project, input.sessionId);
     project.lastUsedAt = this.#now();
@@ -445,17 +494,25 @@ export class NotebookRuntimeManager {
   async dispose(
     input: NotebookManagerControlInput,
   ): Promise<ReadonlyArray<NotebookExecutionEvent>> {
+    const sessionKey = this.#sessionKey(input.projectId, input.sessionId);
+    const fingerprint = this.#fingerprint("dispose", input);
+    const tombstone = this.#getDisposeTombstone(sessionKey, input.commandId);
+    if (tombstone !== undefined) {
+      this.#assertFingerprint(tombstone, fingerprint);
+      const disposedRuntime = this.#sessions.get(sessionKey);
+      if (disposedRuntime?.session.disposed === true) {
+        await this.#removeContainer(disposedRuntime);
+      }
+      return tombstone.events;
+    }
     const { project, runtime, session } = this.#getSession(input, true);
     project.lastUsedAt = this.#now();
-    const events = await this.#runCached(
-      session,
-      input.commandId,
-      this.#fingerprint("dispose", input),
-      "dispose",
-      () => runtime.client.dispose(input),
+    const events = await this.#runCached(session, input.commandId, fingerprint, "dispose", () =>
+      runtime.client.dispose(input),
     );
     if (this.#commandResultState(events, input.commandId, "dispose") === "accepted-terminal") {
       session.disposed = true;
+      this.#cacheDisposeTombstone(sessionKey, input.commandId, fingerprint, events);
       await this.#removeContainer(runtime);
     }
     return events;
@@ -480,6 +537,8 @@ export class NotebookRuntimeManager {
     this.#closing = true;
     await Promise.allSettled([...this.#sessionStarts.values()].map((start) => start.promise));
     await this.#removeContainers([...this.#containers.values()]);
+    this.#disposeTombstones.clear();
+    this.#disposeTombstoneBytes = 0;
   }
 
   startIdleReaper(intervalMs = Math.min(this.#idleTimeoutMs, 60_000)): () => void {
@@ -727,7 +786,7 @@ export class NotebookRuntimeManager {
     return terminal ? "accepted-terminal" : "incomplete";
   }
 
-  #assertFingerprint(entry: CommandCacheEntry, fingerprint: string): void {
+  #assertFingerprint(entry: { readonly fingerprint: string }, fingerprint: string): void {
     if (entry.fingerprint !== fingerprint) {
       throw new NotebookRuntimeManagerError({
         reason: "command-id-conflict",
@@ -738,6 +797,59 @@ export class NotebookRuntimeManager {
 
   #fingerprint(command: string, input: unknown): string {
     return NodeCrypto.createHash("sha256").update(JSON.stringify({ command, input })).digest("hex");
+  }
+
+  #disposeTombstoneKey(sessionKey: string, commandId: string): string {
+    return JSON.stringify([sessionKey, commandId]);
+  }
+
+  #getDisposeTombstone(sessionKey: string, commandId: string): DisposeTombstone | undefined {
+    this.#pruneDisposeTombstones();
+    return this.#disposeTombstones.get(this.#disposeTombstoneKey(sessionKey, commandId));
+  }
+
+  #cacheDisposeTombstone(
+    sessionKey: string,
+    commandId: string,
+    fingerprint: string,
+    events: ReadonlyArray<NotebookExecutionEvent>,
+  ): void {
+    this.#pruneDisposeTombstones();
+    const key = this.#disposeTombstoneKey(sessionKey, commandId);
+    this.#deleteDisposeTombstone(key);
+    const retainedEvents = [...events];
+    const retainedBytes = Buffer.byteLength(
+      JSON.stringify({ key, fingerprint, events: retainedEvents }),
+    );
+    this.#disposeTombstones.set(key, {
+      fingerprint,
+      events: retainedEvents,
+      expiresAt: this.#now() + this.#disposeTombstoneTtlMs,
+      retainedBytes,
+    });
+    this.#disposeTombstoneBytes += retainedBytes;
+    while (
+      this.#disposeTombstones.size > this.#disposeTombstoneLimit ||
+      this.#disposeTombstoneBytes > this.#disposeTombstoneLimitBytes
+    ) {
+      const oldestKey = this.#disposeTombstones.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.#deleteDisposeTombstone(oldestKey);
+    }
+  }
+
+  #pruneDisposeTombstones(): void {
+    const now = this.#now();
+    for (const [key, tombstone] of this.#disposeTombstones) {
+      if (tombstone.expiresAt <= now) this.#deleteDisposeTombstone(key);
+    }
+  }
+
+  #deleteDisposeTombstone(key: string): void {
+    const tombstone = this.#disposeTombstones.get(key);
+    if (tombstone === undefined) return;
+    this.#disposeTombstoneBytes -= tombstone.retainedBytes;
+    this.#disposeTombstones.delete(key);
   }
 
   #selectProject(projectId: string, bookPaths: ReadonlyArray<string>): ProjectState {
@@ -768,6 +880,33 @@ export class NotebookRuntimeManager {
       .digest("hex");
   }
 
+  #assertAdmissionAvailable(projectId: string, sessionKey: string): void {
+    const admittedSessionKeys = new Set([
+      ...this.#containers.keys(),
+      ...this.#sessionStarts.keys(),
+    ]);
+    if (admittedSessionKeys.has(sessionKey)) return;
+    const projectSessionKeys = new Set<string>();
+    for (const [key, container] of this.#containers) {
+      if (container.projectId === projectId) projectSessionKeys.add(key);
+    }
+    for (const [key, start] of this.#sessionStarts) {
+      if (start.projectId === projectId) projectSessionKeys.add(key);
+    }
+    if (projectSessionKeys.size >= this.#maxSessionsPerProject) {
+      throw new NotebookRuntimeManagerError({
+        reason: "runtime-unavailable",
+        message: "Notebook project reached its active session limit.",
+      });
+    }
+    if (admittedSessionKeys.size >= this.#maxSessionsGlobal) {
+      throw new NotebookRuntimeManagerError({
+        reason: "runtime-unavailable",
+        message: "Notebook runtime reached its global active session limit.",
+      });
+    }
+  }
+
   async #ensureSession(project: ProjectState, sessionId: string): Promise<SessionRuntime> {
     this.#assertCanStart();
     const sessionKey = this.#sessionKey(project.projectId, sessionId);
@@ -775,7 +914,8 @@ export class NotebookRuntimeManager {
     if (existing !== undefined) return existing;
     const starting = this.#sessionStarts.get(sessionKey);
     if (starting !== undefined) return starting.promise;
-    const promise = (async () => {
+    this.#assertAdmissionAvailable(project.projectId, sessionKey);
+    const promise = Promise.resolve().then(async () => {
       const orphaned = this.#containers.get(sessionKey);
       if (orphaned !== undefined) {
         await this.#removeContainer(orphaned);
@@ -784,7 +924,7 @@ export class NotebookRuntimeManager {
         if (racedSession !== undefined) return racedSession;
       }
       return this.#startSession(project, sessionId, sessionKey);
-    })();
+    });
     this.#sessionStarts.set(sessionKey, { projectId: project.projectId, promise });
     try {
       return await promise;

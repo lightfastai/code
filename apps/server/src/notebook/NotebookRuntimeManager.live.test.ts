@@ -541,3 +541,112 @@ liveIt(
   },
   60_000,
 );
+
+liveIt(
+  "enforces admission and replays dispose across a new-container reopen",
+  async () => {
+    const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "notebook-lifecycle-live-"));
+    const projectId = "live-lifecycle-project";
+    const projectLabel = NodeCrypto.createHash("sha256")
+      .update(projectId)
+      .digest("hex")
+      .slice(0, 16);
+    const clients: Array<{
+      readonly client: DockerExecNotebookRuntimeClient;
+      readonly containerId: string;
+    }> = [];
+    const manager = new NotebookRuntimeManager({
+      docker: new DockerCliCommandRunner(),
+      image,
+      runtimeRoot: NodePath.join(root, "control"),
+      readinessTimeoutMs: 30_000,
+      maxSessionsGlobal: 1,
+      maxSessionsPerProject: 1,
+      clientFactory: (options) => {
+        const client = new DockerExecNotebookRuntimeClient({
+          ...options,
+          requestTimeoutMs: 130_000,
+        });
+        clients.push({ client, containerId: options.containerId });
+        return client;
+      },
+    });
+    try {
+      await manager.open({
+        projectId,
+        sessionId: "live-session",
+        commandId: "open-first",
+        kernelName: "python3",
+      });
+      const firstContainerId = clients[0]?.containerId;
+      if (firstContainerId === undefined) throw new Error("missing first lifecycle container");
+
+      await expect(
+        manager.open({
+          projectId,
+          sessionId: "excess-session",
+          commandId: "open-excess",
+          kernelName: "python3",
+        }),
+      ).rejects.toMatchObject({ reason: "runtime-unavailable" });
+      expect(clients).toHaveLength(1);
+      const { stdout: admittedContainers } = await execFilePromise("docker", [
+        "ps",
+        "-q",
+        "--filter",
+        `label=lightfast.notebook.project=${projectLabel}`,
+      ]);
+      expect(admittedContainers.trim().split(/\s+/).filter(Boolean)).toHaveLength(1);
+
+      const firstDisposeInput = {
+        projectId,
+        sessionId: "live-session",
+        commandId: "dispose-first",
+      } as const;
+      const firstDispose = await manager.dispose(firstDisposeInput);
+      await expect(manager.dispose(firstDisposeInput)).resolves.toEqual(firstDispose);
+      await expect(execFilePromise("docker", ["inspect", firstContainerId])).rejects.toBeDefined();
+
+      await manager.open({
+        projectId,
+        sessionId: "live-session",
+        commandId: "open-reopened",
+        kernelName: "python3",
+      });
+      const reopenedContainerId = clients[1]?.containerId;
+      if (reopenedContainerId === undefined)
+        throw new Error("missing reopened lifecycle container");
+      expect(reopenedContainerId).not.toBe(firstContainerId);
+      await expect(manager.dispose(firstDisposeInput)).resolves.toEqual(firstDispose);
+      await expect(
+        execFilePromise("docker", ["inspect", reopenedContainerId]),
+      ).resolves.toBeDefined();
+
+      await manager.dispose({
+        projectId,
+        sessionId: "live-session",
+        commandId: "dispose-reopened",
+      });
+      const { stdout: remainingContainers } = await execFilePromise("docker", [
+        "ps",
+        "-aq",
+        "--filter",
+        `label=lightfast.notebook.project=${projectLabel}`,
+      ]);
+      expect(remainingContainers.trim()).toBe("");
+    } finally {
+      await manager.close().catch(() => undefined);
+      const { stdout: leakedContainers } = await execFilePromise("docker", [
+        "ps",
+        "-aq",
+        "--filter",
+        `label=lightfast.notebook.project=${projectLabel}`,
+      ]);
+      if (leakedContainers.trim()) {
+        await execFilePromise("docker", ["rm", "--force", ...leakedContainers.trim().split(/\s+/)]);
+      }
+      await NodeFSP.rm(root, { force: true, recursive: true });
+    }
+  },
+  60_000,
+);

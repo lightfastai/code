@@ -15,6 +15,7 @@ import type {
 import { NotebookRuntimeClientError } from "./NotebookRuntimeClient.ts";
 import {
   type DockerCommandRunner,
+  type NotebookManagerControlInput,
   NotebookRuntimeManager,
   NotebookRuntimeManagerError,
 } from "./NotebookRuntimeManager.ts";
@@ -28,8 +29,26 @@ afterEach(async () => {
 
 class FakeDocker implements DockerCommandRunner {
   readonly calls: Array<{ args: readonly string[]; env?: Readonly<Record<string, string>> }> = [];
+  readonly removeStarted: Promise<void>;
+  readonly #markRemoveStarted: () => void;
+  readonly #removalsReleased: Promise<void>;
+  readonly releaseRemovals: () => void;
+  holdRemovals = false;
   removeFailures = 0;
   runCount = 0;
+
+  constructor() {
+    let markRemoveStarted!: () => void;
+    let releaseRemovals!: () => void;
+    this.removeStarted = new Promise((resolve) => {
+      markRemoveStarted = resolve;
+    });
+    this.#removalsReleased = new Promise((resolve) => {
+      releaseRemovals = resolve;
+    });
+    this.#markRemoveStarted = markRemoveStarted;
+    this.releaseRemovals = releaseRemovals;
+  }
 
   async run(
     args: readonly string[],
@@ -42,6 +61,10 @@ class FakeDocker implements DockerCommandRunner {
     if (args[0] === "rm" && this.removeFailures > 0) {
       this.removeFailures -= 1;
       throw new Error("injected remove failure");
+    }
+    if (args[0] === "rm" && this.holdRemovals) {
+      this.#markRemoveStarted();
+      await this.#removalsReleased;
     }
     if (args[0] === "run") {
       this.runCount += 1;
@@ -253,6 +276,11 @@ const makeHarness = async (options?: {
   readonly idleTimeoutMs?: number;
   readonly eventHistoryLimitBytes?: number;
   readonly commandCacheLimitBytes?: number;
+  readonly disposeTombstoneLimit?: number;
+  readonly disposeTombstoneLimitBytes?: number;
+  readonly disposeTombstoneTtlMs?: number;
+  readonly maxSessionsPerProject?: number;
+  readonly maxSessionsGlobal?: number;
   readonly createClient?: () => FakeRuntimeClient;
   readonly now?: () => number;
   readonly readinessTimeoutMs?: number;
@@ -282,6 +310,21 @@ const makeHarness = async (options?: {
     ...(options?.commandCacheLimitBytes === undefined
       ? {}
       : { commandCacheLimitBytes: options.commandCacheLimitBytes }),
+    ...(options?.disposeTombstoneLimit === undefined
+      ? {}
+      : { disposeTombstoneLimit: options.disposeTombstoneLimit }),
+    ...(options?.disposeTombstoneLimitBytes === undefined
+      ? {}
+      : { disposeTombstoneLimitBytes: options.disposeTombstoneLimitBytes }),
+    ...(options?.disposeTombstoneTtlMs === undefined
+      ? {}
+      : { disposeTombstoneTtlMs: options.disposeTombstoneTtlMs }),
+    ...(options?.maxSessionsPerProject === undefined
+      ? {}
+      : { maxSessionsPerProject: options.maxSessionsPerProject }),
+    ...(options?.maxSessionsGlobal === undefined
+      ? {}
+      : { maxSessionsGlobal: options.maxSessionsGlobal }),
   });
   return { docker, clients, manager, setNow: (value: number) => (now = value) };
 };
@@ -422,6 +465,210 @@ it("forwards controls, disposes sessions, reaps idle projects, and removes conta
   expect(docker.calls.some((call) => call.args.join(" ") === "rm --force container-id-2")).toBe(
     true,
   );
+});
+
+it("replays a completed dispose after teardown and rejects a conflicting fingerprint", async () => {
+  const { clients, docker, manager } = await makeHarness();
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+  const input = {
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "dispose-1",
+  } as const;
+
+  const first = await manager.dispose(input);
+  const replay = await manager.dispose(input);
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-2",
+    kernelName: "python3",
+  });
+  const replayAfterReopen = await manager.dispose(input);
+  const conflicting = { ...input, unexpectedPayload: "different" } as NotebookManagerControlInput;
+
+  expect(replay).toEqual(first);
+  expect(replayAfterReopen).toEqual(first);
+  await expect(manager.dispose(conflicting)).rejects.toMatchObject({
+    reason: "command-id-conflict",
+  });
+  expect(clients[0]?.disposeCount).toBe(1);
+  expect(clients[1]?.disposeCount).toBe(0);
+  expect(
+    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id-1"),
+  ).toHaveLength(1);
+  await manager.close();
+});
+
+it("bounds dispose tombstones by count, serialized bytes, and TTL", async () => {
+  const countHarness = await makeHarness({
+    disposeTombstoneLimit: 1,
+    disposeTombstoneTtlMs: 10,
+  });
+  const disposeInputs = ["session-1", "session-2"].map((sessionId, index) => ({
+    projectId: "project-1",
+    sessionId,
+    commandId: `dispose-${index}`,
+  }));
+  const disposeEvents: Array<ReadonlyArray<NotebookExecutionEvent>> = [];
+  for (const [index, input] of disposeInputs.entries()) {
+    await countHarness.manager.open({
+      projectId: "project-1",
+      sessionId: input.sessionId,
+      commandId: `open-${index}`,
+      kernelName: "python3",
+    });
+    disposeEvents.push(await countHarness.manager.dispose(input));
+  }
+
+  await expect(countHarness.manager.dispose(disposeInputs[0]!)).rejects.toMatchObject({
+    reason: "session-not-found",
+  });
+  await expect(countHarness.manager.dispose(disposeInputs[1]!)).resolves.toEqual(disposeEvents[1]);
+  countHarness.setNow(1_011);
+  await expect(countHarness.manager.dispose(disposeInputs[1]!)).rejects.toMatchObject({
+    reason: "session-not-found",
+  });
+  await countHarness.manager.close();
+
+  const byteHarness = await makeHarness({ disposeTombstoneLimitBytes: 1 });
+  const byteInput = {
+    projectId: "project-1",
+    sessionId: "session-byte",
+    commandId: "dispose-byte",
+  } as const;
+  await byteHarness.manager.open({
+    projectId: "project-1",
+    sessionId: "session-byte",
+    commandId: "open-byte",
+    kernelName: "python3",
+  });
+  await byteHarness.manager.dispose(byteInput);
+  await expect(byteHarness.manager.dispose(byteInput)).rejects.toMatchObject({
+    reason: "session-not-found",
+  });
+  await byteHarness.manager.close();
+});
+
+it("bounds concurrent session admission per project and globally before Docker starts", async () => {
+  const projectHarness = await makeHarness();
+  const projectResults = await Promise.allSettled(
+    Array.from({ length: 5 }, (_, index) =>
+      projectHarness.manager.open({
+        projectId: "bounded-project",
+        sessionId: `session-${index}`,
+        commandId: `open-${index}`,
+        kernelName: "python3",
+      }),
+    ),
+  );
+
+  expect(projectResults.filter((result) => result.status === "fulfilled")).toHaveLength(4);
+  expect(projectResults.filter((result) => result.status === "rejected")).toEqual([
+    expect.objectContaining({ reason: expect.anything() }),
+  ]);
+  expect(projectHarness.docker.runCount).toBe(4);
+  await projectHarness.manager.close();
+  expect(projectHarness.docker.calls.filter((call) => call.args[0] === "rm")).toHaveLength(4);
+
+  const globalHarness = await makeHarness();
+  const globalResults = await Promise.allSettled(
+    Array.from({ length: 9 }, (_, index) =>
+      globalHarness.manager.open({
+        projectId: `project-${index}`,
+        sessionId: `session-${index}`,
+        commandId: `open-${index}`,
+        kernelName: "python3",
+      }),
+    ),
+  );
+
+  expect(globalResults.filter((result) => result.status === "fulfilled")).toHaveLength(8);
+  expect(globalResults.filter((result) => result.status === "rejected")).toEqual([
+    expect.objectContaining({ reason: expect.anything() }),
+  ]);
+  expect(globalHarness.docker.runCount).toBe(8);
+  await globalHarness.manager.close();
+  expect(globalHarness.docker.calls.filter((call) => call.args[0] === "rm")).toHaveLength(8);
+});
+
+it("releases configured admission after a failed start is removed", async () => {
+  let created = 0;
+  let clock = 0;
+  const { docker, manager } = await makeHarness({
+    createClient: () => {
+      created += 1;
+      return created === 1 ? new FailingHealthRuntimeClient() : new FakeRuntimeClient();
+    },
+    maxSessionsGlobal: 1,
+    maxSessionsPerProject: 1,
+    now: () => (clock += 100),
+  });
+
+  await expect(
+    manager.open({
+      projectId: "project-1",
+      sessionId: "failed-session",
+      commandId: "open-failed",
+      kernelName: "python3",
+    }),
+  ).rejects.toMatchObject({ reason: "runtime-unavailable" });
+  await expect(
+    manager.open({
+      projectId: "project-1",
+      sessionId: "replacement-session",
+      commandId: "open-replacement",
+      kernelName: "python3",
+    }),
+  ).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ type: "accepted" })]));
+
+  expect(docker.runCount).toBe(2);
+  expect(docker.calls.filter((call) => call.args[0] === "rm")).toHaveLength(1);
+  await manager.close();
+});
+
+it("waits for session removal before reopening in a new container", async () => {
+  const { clients, docker, manager } = await makeHarness();
+  const firstOpen = {
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  } as const;
+  await manager.open(firstOpen);
+  docker.holdRemovals = true;
+  const disposing = manager.dispose({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "dispose-1",
+  });
+  await docker.removeStarted;
+  let reopenSettled = false;
+  const reopening = manager.open(firstOpen).then((events) => {
+    reopenSettled = true;
+    return events;
+  });
+
+  try {
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(reopenSettled).toBe(false);
+  } finally {
+    docker.releaseRemovals();
+  }
+
+  await disposing;
+  const reopened = await reopening;
+  expect(reopened.at(-1)).toMatchObject({ type: "kernel", state: "idle" });
+  expect(docker.runCount).toBe(2);
+  expect(clients).toHaveLength(2);
+  expect(clients.map((client) => client.openedSessionIds)).toEqual([["session-1"], ["session-1"]]);
+  await manager.close();
 });
 
 it("rejects non-monotonic sidecar events", async () => {
