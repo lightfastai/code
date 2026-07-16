@@ -9,6 +9,10 @@ describe("artifact renderer registry", () => {
     expect(hasArtifactRenderer("3d-scene")).toBe(true);
   });
 
+  it("registers the versioned notebook renderer", () => {
+    expect(hasArtifactRenderer("notebook")).toBe(true);
+  });
+
   it("does not claim unknown artifact kinds", () => {
     expect(hasArtifactRenderer("javascript-widget")).toBe(false);
   });

@@ -1,6 +1,7 @@
 import {
   type EnvironmentId,
   type MessageId,
+  type ScopedProjectRef,
   type ScopedThreadRef,
   type ServerProviderSkill,
   type TurnId,
@@ -99,6 +100,8 @@ import { useUiStateStore } from "~/uiStateStore";
 import { type TimestampFormat } from "@t3tools/contracts/settings";
 import { formatChatTimestampTooltip, formatShortTimestamp } from "../../timestampFormat";
 import { ArtifactRenderer } from "../artifacts/ArtifactRenderer";
+import { NotebookArtifactProvider } from "../artifacts/notebook/NotebookArtifact";
+import type { NotebookAgentExecutionPermission } from "@t3tools/lightfast-artifact-notebook/web";
 
 import {
   buildInlineTerminalContextText,
@@ -125,6 +128,8 @@ interface TimelineRowSharedState {
   timestampFormat: TimestampFormat;
   routeThreadKey: string;
   threadRef: ScopedThreadRef | null;
+  projectRef: ScopedProjectRef | null;
+  notebookAgentExecutionPermission: NotebookAgentExecutionPermission | undefined;
   markdownCwd: string | undefined;
   resolvedTheme: "light" | "dark";
   workspaceRoot: string | undefined;
@@ -163,6 +168,8 @@ interface MessagesTimelineProps {
   runningTurnId: TurnId | null;
   turnDiffSummaryByAssistantMessageId: Map<MessageId, TurnDiffSummary>;
   routeThreadKey: string;
+  projectRef?: ScopedProjectRef | null;
+  notebookAgentExecutionPermission?: NotebookAgentExecutionPermission;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   revertTurnCountByUserMessageId: Map<MessageId, number>;
   onRevertUserMessage: (messageId: MessageId) => void;
@@ -196,6 +203,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   runningTurnId,
   turnDiffSummaryByAssistantMessageId,
   routeThreadKey,
+  projectRef = null,
+  notebookAgentExecutionPermission,
   onOpenTurnDiff,
   revertTurnCountByUserMessageId,
   onRevertUserMessage,
@@ -412,6 +421,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       timestampFormat,
       routeThreadKey,
       threadRef: parseScopedThreadKey(routeThreadKey),
+      projectRef,
+      notebookAgentExecutionPermission,
       markdownCwd,
       resolvedTheme,
       workspaceRoot,
@@ -426,6 +437,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     [
       timestampFormat,
       routeThreadKey,
+      projectRef,
+      notebookAgentExecutionPermission,
       markdownCwd,
       resolvedTheme,
       workspaceRoot,
@@ -999,9 +1012,18 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
           isStreaming={Boolean(row.message.streaming)}
           skills={ctx.skills}
         />
-        {artifacts.map((artifact) => (
-          <ArtifactRenderer key={artifact.id} artifact={artifact} />
-        ))}
+        {artifacts.length > 0 ? (
+          <NotebookArtifactProvider
+            projectRef={ctx.projectRef}
+            {...(ctx.notebookAgentExecutionPermission === undefined
+              ? {}
+              : { agentExecutionPermission: ctx.notebookAgentExecutionPermission })}
+          >
+            {artifacts.map((artifact) => (
+              <ArtifactRenderer key={artifact.id} artifact={artifact} />
+            ))}
+          </NotebookArtifactProvider>
+        ) : null}
         <AssistantChangedFilesSection
           turnSummary={row.assistantTurnDiffSummary}
           routeThreadKey={ctx.routeThreadKey}

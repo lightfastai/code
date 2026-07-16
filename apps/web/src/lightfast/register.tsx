@@ -5,6 +5,7 @@ import {
   type ArtifactDefinition,
 } from "@t3tools/lightfast-capability-core/registry";
 import { scene3DWebCapability } from "@t3tools/lightfast-artifact-3d/web";
+import { notebookWebCapability } from "@t3tools/lightfast-artifact-notebook/web";
 import type { ComponentType } from "react";
 
 export type LightfastArtifactRenderer = ComponentType<{
@@ -18,6 +19,7 @@ export type LightfastArtifactRendererRegistration = {
 
 const webArtifactCapabilities: readonly LightfastArtifactRendererRegistration[] = [
   scene3DWebCapability,
+  notebookWebCapability,
 ];
 
 export const lightfastWebCapabilities = {

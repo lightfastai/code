@@ -1,3 +1,4 @@
+import { defineArtifact } from "@t3tools/lightfast-capability-core/registry";
 import * as Schema from "effect/Schema";
 
 export const NOTEBOOK_NBFORMAT_MAJOR = 4 as const;
@@ -181,6 +182,13 @@ export const NotebookArtifactPayload = Schema.Struct({
   initialView: NotebookInitialView,
 });
 export type NotebookArtifactPayload = typeof NotebookArtifactPayload.Type;
+
+export const notebookArtifactDefinition = defineArtifact({
+  kind: "notebook",
+  schemaVersion: 1,
+  payloadSchema: NotebookArtifactPayload,
+  capabilities: ["edit", "execute", "import", "export"] as const,
+});
 
 export class NotebookRevisionError extends Schema.TaggedErrorClass<NotebookRevisionError>()(
   "NotebookRevisionError",

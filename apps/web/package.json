@@ -29,6 +29,7 @@
     "@t3tools/client-runtime": "workspace:*",
     "@t3tools/contracts": "workspace:*",
     "@t3tools/lightfast-artifact-3d": "workspace:*",
+    "@t3tools/lightfast-artifact-notebook": "workspace:*",
     "@t3tools/lightfast-capability-core": "workspace:*",
     "@t3tools/shared": "workspace:*",
     "@tanstack/react-pacer": "^0.19.4",

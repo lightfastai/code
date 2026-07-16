@@ -10,6 +10,14 @@
     "./nbformat": {
       "types": "./src/nbformat.ts",
       "import": "./src/nbformat.ts"
+    },
+    "./web": {
+      "types": "./src/web.tsx",
+      "import": "./src/web.tsx"
+    },
+    "./working-copy": {
+      "types": "./src/working-copy.ts",
+      "import": "./src/working-copy.ts"
     }
   },
   "scripts": {
@@ -17,11 +25,18 @@
     "test": "vp test run"
   },
   "dependencies": {
-    "effect": "catalog:"
+    "@t3tools/lightfast-capability-core": "workspace:*",
+    "effect": "catalog:",
+    "react": "19.2.6",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@effect/platform-node": "catalog:",
     "@effect/vitest": "catalog:",
+    "@types/react": "~19.2.14",
+    "@types/react-dom": "~19.2.3",
+    "react-dom": "19.2.6",
     "vite-plus": "catalog:"
   }
 }

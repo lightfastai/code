@@ -1,0 +1,600 @@
+import type { ArtifactEnvelope } from "@t3tools/lightfast-capability-core/artifacts";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import {
+  type NotebookArtifactPayload,
+  type NotebookCell as NotebookCellValue,
+  type NotebookOutput as NotebookOutputValue,
+} from "./contracts.ts";
+import {
+  addNotebookCell,
+  applyImportedNotebookRevision,
+  applySavedNotebookRevision,
+  createNotebookWorkingCopy,
+  duplicateNotebookCell,
+  isNotebookWorkingCopyDirty,
+  moveNotebookCell,
+  openLatestNotebookRevision,
+  removeNotebookCell,
+  updateNotebookCellSource,
+  updateNotebookCodeCellExecution,
+  viewReferencedNotebookRevision,
+  type NotebookWorkingCopy,
+} from "./working-copy.ts";
+import { NotebookCell } from "./NotebookCell.tsx";
+import { type NotebookRuntimeView, useNotebookWebBindings } from "./web.tsx";
+
+const INITIAL_RUNTIME_STATE: NotebookRuntimeView = {
+  kernelStatus: "disconnected",
+  lastSequence: 0,
+  recoveryAfterSequence: null,
+  outputsByCell: new Map(),
+  executionCountByCell: new Map(),
+  runningCellIds: new Set(),
+  error: null,
+};
+
+let fallbackId = 0;
+const randomToken = (): string => {
+  const values = new Uint32Array(4);
+  globalThis.crypto?.getRandomValues?.(values);
+  return [...values].map((value) => value.toString(16).padStart(8, "0")).join("");
+};
+const nextId = (prefix: string): string => {
+  fallbackId += 1;
+  const token = randomToken();
+  return `${prefix}-${token === "00000000000000000000000000000000" ? fallbackId : token}`
+    .replace(/[^A-Za-z0-9_-]/g, "-")
+    .slice(0, 64);
+};
+
+const sessionIdFor = (documentId: string): string =>
+  `notebook-${documentId}`.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 128);
+
+const isNotebookPayload = (value: unknown): value is NotebookArtifactPayload => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.documentId === "string" &&
+    typeof record.revisionId === "string" &&
+    typeof record.contentHash === "string" &&
+    typeof record.kernel === "object" &&
+    record.kernel !== null &&
+    typeof record.initialView === "object" &&
+    record.initialView !== null
+  );
+};
+
+const errorMessage = (cause: unknown): string =>
+  cause instanceof Error
+    ? cause.message
+    : typeof cause === "string"
+      ? cause
+      : "Notebook action failed.";
+
+function applyRuntimeToWorkingCopy(
+  working: NotebookWorkingCopy,
+  runtime: NotebookRuntimeView,
+): NotebookWorkingCopy {
+  let next = working;
+  for (const cell of working.document.cells) {
+    if (cell.cell_type !== "code") continue;
+    const outputs = runtime.outputsByCell.get(cell.id);
+    const executionCount = runtime.executionCountByCell.get(cell.id);
+    if (outputs === undefined && executionCount === undefined) continue;
+    next = updateNotebookCodeCellExecution(
+      next,
+      cell.id,
+      executionCount === undefined ? cell.execution_count : executionCount,
+      outputs === undefined ? cell.outputs : outputs,
+    );
+  }
+  return next;
+}
+
+export function NotebookArtifactEnvelopeRenderer({
+  artifact,
+}: {
+  readonly artifact: ArtifactEnvelope;
+}) {
+  const bindings = useNotebookWebBindings();
+  const payload = isNotebookPayload(artifact.payload) ? artifact.payload : null;
+  const [working, setWorking] = useState<NotebookWorkingCopy | null>(null);
+  const [runtime, setRuntime] = useState<NotebookRuntimeView>(INITIAL_RUNTIME_STATE);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState(true);
+  const mounted = useRef(true);
+  const importInput = useRef<HTMLInputElement | null>(null);
+  const sessionId = payload === null ? "notebook-invalid" : sessionIdFor(payload.documentId);
+
+  const onRuntimeState = useCallback((next: NotebookRuntimeView) => {
+    if (!mounted.current) return;
+    setRuntime(next);
+    setWorking((current) =>
+      current === null ? current : applyRuntimeToWorkingCopy(current, next),
+    );
+  }, []);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (bindings === null || payload === null) return;
+    let active = true;
+    setLoadError(null);
+    void bindings.controller
+      .readRevision(bindings.scope, payload.documentId, payload.revisionId)
+      .then(async (revision) => {
+        if (!active) return;
+        setWorking(createNotebookWorkingCopy(revision));
+        await bindings.controller.connect({
+          scope: bindings.scope,
+          sessionId,
+          kernelName: payload.kernel.name,
+          onState: onRuntimeState,
+        });
+      })
+      .catch((cause: unknown) => {
+        if (active) setLoadError(errorMessage(cause));
+      });
+    return () => {
+      active = false;
+    };
+  }, [bindings, onRuntimeState, payload, sessionId]);
+
+  const runAction = useCallback(async (label: string, action: () => Promise<void>) => {
+    setPendingAction(label);
+    setActionError(null);
+    try {
+      await action();
+    } catch (cause) {
+      if (mounted.current) setActionError(errorMessage(cause));
+    } finally {
+      if (mounted.current) setPendingAction(null);
+    }
+  }, []);
+
+  const runCell = useCallback(
+    async (cell: NotebookCellValue) => {
+      if (bindings === null || cell.cell_type !== "code") return;
+      await bindings.controller.executeCell({
+        scope: bindings.scope,
+        sessionId,
+        cellId: cell.id,
+        code: cell.source,
+        onState: onRuntimeState,
+      });
+    },
+    [bindings, onRuntimeState, sessionId],
+  );
+
+  const visibleCells = useMemo(() => {
+    if (working === null || payload === null) return [];
+    if (payload.initialView.mode !== "cell") return working.document.cells;
+    const selected = working.document.cells.filter(
+      (cell) => cell.id === payload.initialView.cellId,
+    );
+    return selected.length > 0 ? selected : working.document.cells;
+  }, [payload, working]);
+
+  if (payload === null) {
+    return (
+      <div className="my-3 rounded-xl border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+        Notebook artifact payload is invalid.
+      </div>
+    );
+  }
+  if (bindings === null) {
+    return (
+      <div className="my-3 rounded-xl border border-border bg-card px-4 py-3 text-sm text-muted-foreground">
+        Notebook controls are unavailable outside a project-scoped authenticated session.
+      </div>
+    );
+  }
+  if (loadError !== null) {
+    return (
+      <div
+        className="my-3 rounded-xl border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm"
+        role="alert"
+      >
+        <p className="font-medium text-destructive">Could not load notebook</p>
+        <p className="mt-1 text-muted-foreground">{loadError}</p>
+        <button
+          type="button"
+          className="mt-2 rounded border border-border px-2 py-1 text-xs"
+          onClick={() =>
+            void runAction("reconnect", () =>
+              bindings.controller.connect({
+                scope: bindings.scope,
+                sessionId,
+                kernelName: payload.kernel.name,
+                onState: onRuntimeState,
+              }),
+            )
+          }
+        >
+          Reconnect runtime
+        </button>
+      </div>
+    );
+  }
+  if (working === null) {
+    return (
+      <div
+        className="my-3 rounded-xl border border-border bg-card px-4 py-3 text-sm text-muted-foreground"
+        role="status"
+      >
+        Loading notebook revision…
+      </div>
+    );
+  }
+
+  const dirty = isNotebookWorkingCopyDirty(working);
+  const disabled = pendingAction !== null;
+  const permission = bindings.agentExecutionPermission;
+  const currentRevision = working.baseRevision;
+
+  return (
+    <article
+      className="my-3 overflow-hidden rounded-xl border border-border bg-card"
+      aria-label={`Notebook: ${artifact.title}`}
+    >
+      <header className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
+        <button
+          type="button"
+          className="rounded text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}
+        >
+          <span className="block text-sm font-medium">{artifact.title}</span>
+          <span className="block text-[11px] text-muted-foreground">
+            {working.document.metadata.kernelspec.display_name} · {working.document.cells.length}{" "}
+            cells
+          </span>
+        </button>
+        <span
+          className="ml-auto rounded-full bg-muted px-2 py-0.5 text-[11px] capitalize text-muted-foreground"
+          role="status"
+        >
+          Kernel {runtime.kernelStatus}
+        </span>
+        <span className="text-[11px] text-muted-foreground">seq {runtime.lastSequence}</span>
+        <button
+          type="button"
+          className="rounded px-2 py-1 text-xs hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          onClick={() => setExpanded((value) => !value)}
+        >
+          {expanded ? "Collapse" : "Expand"}
+        </button>
+      </header>
+
+      {expanded ? (
+        <div className="space-y-3 p-3">
+          <div className="flex flex-wrap items-center gap-2 rounded-md bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground">
+            <span>Referenced {working.referencedRevision.revisionId.slice(0, 8)}</span>
+            {working.latestRevision ? (
+              <span>Latest {working.latestRevision.revisionId.slice(0, 8)}</span>
+            ) : null}
+            {dirty ? (
+              <span className="font-medium text-foreground">Unsaved changes</span>
+            ) : (
+              <span>Saved</span>
+            )}
+            {working.baseRevision.revisionId !== working.referencedRevision.revisionId ? (
+              <button
+                type="button"
+                className="rounded underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={() => setWorking(viewReferencedNotebookRevision(working))}
+              >
+                View referenced revision
+              </button>
+            ) : null}
+            {working.latestRevision &&
+            working.baseRevision.revisionId !== working.latestRevision.revisionId ? (
+              <button
+                type="button"
+                className="rounded underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={() => setWorking(openLatestNotebookRevision(working))}
+              >
+                Open latest revision
+              </button>
+            ) : null}
+          </div>
+
+          <div
+            className="flex flex-wrap items-center gap-1.5"
+            role="toolbar"
+            aria-label="Notebook execution controls"
+          >
+            <button
+              type="button"
+              className="rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
+              disabled={disabled}
+              onClick={() =>
+                void runAction("run all", async () => {
+                  for (const cell of working.document.cells)
+                    if (cell.cell_type === "code") await runCell(cell);
+                })
+              }
+            >
+              Run all
+            </button>
+            <button
+              type="button"
+              className="rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
+              disabled={disabled || runtime.runningCellIds.size === 0}
+              onClick={() =>
+                void runAction("interrupt", () =>
+                  bindings.controller.interrupt({
+                    scope: bindings.scope,
+                    sessionId,
+                    onState: onRuntimeState,
+                  }),
+                )
+              }
+            >
+              Interrupt
+            </button>
+            <button
+              type="button"
+              className="rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
+              disabled={disabled}
+              onClick={() =>
+                void runAction("restart", () =>
+                  bindings.controller.restart({
+                    scope: bindings.scope,
+                    sessionId,
+                    onState: onRuntimeState,
+                  }),
+                )
+              }
+            >
+              Restart kernel
+            </button>
+            <button
+              type="button"
+              className="rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
+              disabled={disabled}
+              onClick={() =>
+                void runAction("reconnect", async () => {
+                  await bindings.controller.connect({
+                    scope: bindings.scope,
+                    sessionId,
+                    kernelName: payload.kernel.name,
+                    onState: onRuntimeState,
+                  });
+                  await bindings.controller.recover({
+                    scope: bindings.scope,
+                    sessionId,
+                    onState: onRuntimeState,
+                  });
+                })
+              }
+            >
+              Reconnect
+            </button>
+            <button
+              type="button"
+              className="rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
+              disabled={disabled}
+              onClick={() =>
+                void runAction("dispose", () =>
+                  bindings.controller.dispose({
+                    scope: bindings.scope,
+                    sessionId,
+                    onState: onRuntimeState,
+                  }),
+                )
+              }
+            >
+              Dispose runtime
+            </button>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 rounded-md border border-border px-2 py-1.5 text-xs">
+            <span className="font-medium">Agent execution</span>
+            <span className="text-muted-foreground">{permission.label}</span>
+            <span className="rounded-full bg-muted px-2 py-0.5 capitalize">
+              {permission.status}
+            </span>
+            {permission.change ? (
+              <button
+                type="button"
+                className="rounded underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={permission.change}
+              >
+                Change thread permission
+              </button>
+            ) : null}
+          </div>
+
+          {runtime.error || actionError ? (
+            <div
+              className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1.5 text-xs text-destructive"
+              role="alert"
+            >
+              <span>{actionError ?? runtime.error}</span>
+              <button
+                type="button"
+                className="ml-auto rounded underline"
+                onClick={() => {
+                  setActionError(null);
+                  bindings.controller.clearError({
+                    scope: bindings.scope,
+                    sessionId,
+                    onState: onRuntimeState,
+                  });
+                }}
+              >
+                Clear error
+              </button>
+            </div>
+          ) : null}
+          {runtime.recoveryAfterSequence !== null ? (
+            <p className="text-xs text-amber-600" role="status">
+              Recovering events after sequence {runtime.recoveryAfterSequence}…
+            </p>
+          ) : null}
+
+          <div className="space-y-3">
+            {visibleCells.map((cell) => {
+              const actualIndex = working.document.cells.findIndex(
+                (candidate) => candidate.id === cell.id,
+              );
+              return (
+                <NotebookCell
+                  key={cell.id}
+                  cell={cell}
+                  index={actualIndex}
+                  total={working.document.cells.length}
+                  disabled={disabled || runtime.runningCellIds.has(cell.id)}
+                  onSourceChange={(source) =>
+                    setWorking(updateNotebookCellSource(working, cell.id, source))
+                  }
+                  onRun={
+                    cell.cell_type === "code"
+                      ? () => void runAction(`run ${cell.id}`, () => runCell(cell))
+                      : undefined
+                  }
+                  onRunAbove={
+                    cell.cell_type === "code"
+                      ? () =>
+                          void runAction(`run above ${cell.id}`, async () => {
+                            for (const previous of working.document.cells.slice(0, actualIndex))
+                              if (previous.cell_type === "code") await runCell(previous);
+                          })
+                      : undefined
+                  }
+                  onMove={(direction) => setWorking(moveNotebookCell(working, cell.id, direction))}
+                  onDuplicate={() =>
+                    setWorking(duplicateNotebookCell(working, cell.id, () => nextId("cell")))
+                  }
+                  onRemove={() => setWorking(removeNotebookCell(working, cell.id))}
+                />
+              );
+            })}
+          </div>
+
+          <div
+            className="flex flex-wrap gap-1.5 border-t border-border pt-3"
+            role="toolbar"
+            aria-label="Notebook editing controls"
+          >
+            <button
+              type="button"
+              className="rounded border border-border px-2 py-1 text-xs"
+              onClick={() =>
+                setWorking(
+                  addNotebookCell(working, "markdown", working.document.cells.length, () =>
+                    nextId("markdown"),
+                  ),
+                )
+              }
+            >
+              Add Markdown cell
+            </button>
+            <button
+              type="button"
+              className="rounded border border-border px-2 py-1 text-xs"
+              onClick={() =>
+                setWorking(
+                  addNotebookCell(working, "code", working.document.cells.length, () =>
+                    nextId("code"),
+                  ),
+                )
+              }
+            >
+              Add code cell
+            </button>
+            <button
+              type="button"
+              className="ml-auto rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
+              disabled={disabled || !dirty}
+              onClick={() =>
+                void runAction("save", async () => {
+                  const revision = await bindings.controller.saveRevision(
+                    bindings.scope,
+                    working.documentId,
+                    working.document,
+                  );
+                  if (mounted.current)
+                    setWorking((current) =>
+                      current === null ? current : applySavedNotebookRevision(current, revision),
+                    );
+                })
+              }
+            >
+              Save new revision
+            </button>
+            <button
+              type="button"
+              className="rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
+              disabled={disabled}
+              onClick={() => importInput.current?.click()}
+            >
+              Import .ipynb
+            </button>
+            <input
+              ref={importInput}
+              className="sr-only"
+              type="file"
+              accept=".ipynb,application/x-ipynb+json,application/json"
+              aria-label="Import notebook file"
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                event.currentTarget.value = "";
+                if (!file) return;
+                void runAction("import", async () => {
+                  const revision = await bindings.controller.importRevision(
+                    bindings.scope,
+                    await file.text(),
+                  );
+                  if (mounted.current)
+                    setWorking((current) =>
+                      current === null ? current : applyImportedNotebookRevision(current, revision),
+                    );
+                });
+              }}
+            />
+            <button
+              type="button"
+              className="rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
+              disabled={disabled}
+              title={
+                dirty ? "Export saves only immutable revisions; save changes first." : undefined
+              }
+              onClick={() =>
+                void runAction("export", async () =>
+                  bindings.controller.downloadExport(
+                    await bindings.controller.exportRevision(
+                      bindings.scope,
+                      currentRevision.documentId,
+                      currentRevision.revisionId,
+                    ),
+                  ),
+                )
+              }
+            >
+              Export .ipynb
+            </button>
+          </div>
+          {pendingAction ? (
+            <p className="text-xs text-muted-foreground" role="status">
+              {pendingAction}…
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+export default NotebookArtifactEnvelopeRenderer;
+
+export type NotebookRenderedOutput = NotebookOutputValue;
