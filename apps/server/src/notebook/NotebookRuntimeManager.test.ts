@@ -29,6 +29,7 @@ afterEach(async () => {
 
 class FakeDocker implements DockerCommandRunner {
   readonly calls: Array<{ args: readonly string[]; env?: Readonly<Record<string, string>> }> = [];
+  readonly activeContainers = new Set<string>();
   readonly removeStarted: Promise<void>;
   readonly #markRemoveStarted: () => void;
   readonly #removalsReleased: Promise<void>;
@@ -36,6 +37,7 @@ class FakeDocker implements DockerCommandRunner {
   holdRemovals = false;
   removeFailures = 0;
   runCount = 0;
+  imageDigests: string[] = [];
 
   constructor() {
     let markRemoveStarted!: () => void;
@@ -62,16 +64,22 @@ class FakeDocker implements DockerCommandRunner {
       this.removeFailures -= 1;
       throw new Error("injected remove failure");
     }
+    if (args[0] === "rm") {
+      const containerId = args.at(-1);
+      if (containerId !== undefined) this.activeContainers.delete(containerId);
+    }
     if (args[0] === "rm" && this.holdRemovals) {
       this.#markRemoveStarted();
       await this.#removalsReleased;
     }
     if (args[0] === "run") {
       this.runCount += 1;
-      return { stdout: `container-id-${this.runCount}\n` };
+      const containerId = `container-id-${this.runCount}`;
+      this.activeContainers.add(containerId);
+      return { stdout: `${containerId}\n` };
     }
     if (args[0] === "image") {
-      return { stdout: `sha256:${"a".repeat(64)}\n` };
+      return { stdout: `${this.imageDigests.shift() ?? `sha256:${"a".repeat(64)}`}\n` };
     }
     return {
       stdout: args[0] === "exec" ? "fake-bootstrap-token-with-sufficient-entropy\n" : "",
@@ -177,6 +185,37 @@ class FailingHealthRuntimeClient extends FakeRuntimeClient {
   override async health(): Promise<void> {
     this.healthCount += 1;
     throw new Error("injected readiness failure");
+  }
+}
+
+class RejectedDisposeRuntimeClient extends FakeRuntimeClient {
+  override async dispose(
+    input: RuntimeSessionCommandRequest,
+  ): Promise<readonly NotebookExecutionEvent[]> {
+    this.disposeCount += 1;
+    const sequence = this.nextSequence.get(input.sessionId) ?? 1;
+    this.nextSequence.set(input.sessionId, sequence + 1);
+    return [
+      event(input.sessionId, input.commandId, sequence, "rejected", {
+        reason: "dispose-rejected",
+        message: "The runtime rejected disposal.",
+      }),
+    ];
+  }
+}
+
+class IncompleteDisposeRuntimeClient extends FakeRuntimeClient {
+  override async dispose(
+    input: RuntimeSessionCommandRequest,
+  ): Promise<readonly NotebookExecutionEvent[]> {
+    this.disposeCount += 1;
+    const sequence = this.nextSequence.get(input.sessionId) ?? 1;
+    this.nextSequence.set(input.sessionId, sequence + 1);
+    return [
+      event(input.sessionId, input.commandId, sequence, "accepted", {
+        commandType: "dispose",
+      }),
+    ];
   }
 }
 
@@ -571,18 +610,87 @@ it("uses one hardened container per session and deduplicates concurrent session 
   await manager.close();
 });
 
-it("resolves and caches the exact immutable runtime image digest", async () => {
+it("launches each session from the freshly resolved immutable runtime image digest", async () => {
   const { docker, manager } = await makeHarness();
-  const expected = `sha256:${"a".repeat(64)}`;
+  const firstDigest = `sha256:${"a".repeat(64)}`;
+  const secondDigest = `sha256:${"b".repeat(64)}`;
+  docker.imageDigests.push(firstDigest, secondDigest);
 
-  expect(await manager.resolveRuntimeImageDigest()).toBe(expected);
-  expect(await manager.resolveRuntimeImageDigest()).toBe(expected);
-  expect(docker.calls.filter((call) => call.args[0] === "image")).toEqual([
-    {
-      args: ["image", "inspect", "--format", "{{.Id}}", "lightfast/notebook-runtime:test"],
-    },
-  ]);
+  const resolvedFirst = await manager.resolveRuntimeImageDigest();
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+    runtimeImageDigest: resolvedFirst,
+  });
+  const resolvedSecond = await manager.resolveRuntimeImageDigest();
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-2",
+    commandId: "open-2",
+    kernelName: "python3",
+    runtimeImageDigest: resolvedSecond,
+  });
 
+  expect([resolvedFirst, resolvedSecond]).toEqual([firstDigest, secondDigest]);
+  expect(
+    docker.calls.filter((call) => call.args[0] === "image").map((call) => call.args.at(-1)),
+  ).toEqual(["lightfast/notebook-runtime:test", "lightfast/notebook-runtime:test"]);
+  expect(
+    docker.calls.filter((call) => call.args[0] === "run").map((call) => call.args.at(-1)),
+  ).toEqual([firstDigest, secondDigest]);
+
+  await manager.close();
+});
+
+it("force-removes a container and fails visibly when dispose resolves rejected", async () => {
+  const client = new RejectedDisposeRuntimeClient();
+  const { docker, manager } = await makeHarness({ createClient: () => client });
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+
+  await expect(
+    manager.dispose({
+      projectId: "project-1",
+      sessionId: "session-1",
+      commandId: "dispose-rejected",
+    }),
+  ).rejects.toMatchObject({ reason: "runtime-unavailable" });
+
+  expect(client.disposeCount).toBe(1);
+  expect(docker.activeContainers).toEqual(new Set());
+  expect(
+    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id-1"),
+  ).toHaveLength(1);
+  await manager.close();
+});
+
+it("force-removes a container and fails visibly when dispose is incomplete", async () => {
+  const client = new IncompleteDisposeRuntimeClient();
+  const { docker, manager } = await makeHarness({ createClient: () => client });
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+
+  await expect(
+    manager.dispose({
+      projectId: "project-1",
+      sessionId: "session-1",
+      commandId: "dispose-incomplete",
+    }),
+  ).rejects.toMatchObject({ reason: "runtime-unavailable" });
+  expect(docker.activeContainers).toEqual(new Set());
+  expect(
+    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id-1"),
+  ).toHaveLength(1);
   await manager.close();
 });
 

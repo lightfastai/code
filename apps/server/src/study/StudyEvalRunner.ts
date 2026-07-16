@@ -10,6 +10,7 @@ import {
   type StudyEvalComparison,
   type StudyEvalSplitSummary,
   type StudyNotebookExecutionEvent,
+  type StudyNotebookPermissionEvent,
   type StudyPromotionPolicy,
   type StudyTraceEvent,
   type StudyTraceEventMatcher,
@@ -108,15 +109,24 @@ function hasContiguousSubsequence<T>(
   return false;
 }
 
-function matchingNotebookExecutions(
+type NotebookEvidence = StudyNotebookExecutionEvent | StudyNotebookPermissionEvent;
+type NotebookAssertion = Extract<StudyEvalAssertion, { readonly operation: unknown }>;
+
+function matchingNotebookEvidence(
   records: ReadonlyArray<StudyTraceRecord>,
   operation: StudyNotebookExecutionEvent["operation"],
-): ReadonlyArray<StudyNotebookExecutionEvent> {
-  return records.flatMap((record) =>
-    record.event.type === "notebook_execution" && record.event.operation === operation
-      ? [record.event]
-      : [],
-  );
+): ReadonlyArray<NotebookEvidence> {
+  return records.flatMap((record) => {
+    const event = record.event;
+    return (event.type === "notebook_execution" || event.type === "notebook_permission") &&
+      event.operation === operation
+      ? [event]
+      : [];
+  });
+}
+
+function isNotebookAssertion(assertion: StudyEvalAssertion): assertion is NotebookAssertion {
+  return "operation" in assertion && assertion.type.startsWith("notebook_");
 }
 
 function notebookAssertionResult(input: {
@@ -138,6 +148,7 @@ function evaluateAssertion(
   assertion: StudyEvalAssertion,
   assertionIndex: number,
   records: ReadonlyArray<StudyTraceRecord>,
+  notebookEvidence?: NotebookEvidence,
 ): StudyEvalAssertionResult {
   const weight = assertionWeight(assertion);
   if (assertion.type === "event_count") {
@@ -175,110 +186,122 @@ function evaluateAssertion(
   }
 
   if (assertion.type === "notebook_output_order") {
-    const executions = matchingNotebookExecutions(records, assertion.operation);
-    const passed = executions.some(
-      (event) =>
-        event.outputHash === assertion.outputHash &&
-        hasContiguousSubsequence(
-          event.commands.map((command) => command.type),
-          assertion.commandOrder,
-        ) &&
-        hasContiguousSubsequence(
-          event.runtimeEvents.map((runtimeEvent) => runtimeEvent.type),
-          assertion.runtimeEventOrder,
-        ),
-    );
+    const event = notebookEvidence?.type === "notebook_execution" ? notebookEvidence : undefined;
+    const passed =
+      event !== undefined &&
+      event.outputHash === assertion.outputHash &&
+      hasContiguousSubsequence(
+        event.commands.map((command) => command.type),
+        assertion.commandOrder,
+      ) &&
+      hasContiguousSubsequence(
+        event.runtimeEvents.map((runtimeEvent) => runtimeEvent.type),
+        assertion.runtimeEventOrder,
+      );
     return notebookAssertionResult({
       assertion,
       assertionIndex,
       passed,
       detail: passed
         ? "Observed the required notebook command and runtime-event order with the exact output hash."
-        : `No ${assertion.operation} event matched the required order and output hash (${executions.length} candidates).`,
+        : `The selected ${assertion.operation} attempt did not match the required order and output hash.`,
     });
   }
 
   if (assertion.type === "notebook_max_latency") {
-    const executions = matchingNotebookExecutions(records, assertion.operation);
-    const durations = executions
-      .map((event) => event.durationMs)
-      .filter((duration) => Number.isFinite(duration) && duration >= 0);
-    const bestLatency = durations.length > 0 ? Math.min(...durations) : null;
-    const passed = bestLatency !== null && bestLatency <= assertion.maxMs;
+    const event = notebookEvidence?.type === "notebook_execution" ? notebookEvidence : undefined;
+    const duration =
+      event !== undefined && Number.isFinite(event.durationMs) && event.durationMs >= 0
+        ? event.durationMs
+        : null;
+    const passed = duration !== null && duration <= assertion.maxMs;
     return notebookAssertionResult({
       assertion,
       assertionIndex,
       passed,
       detail:
-        bestLatency === null
-          ? `No ${assertion.operation} event had a valid duration.`
-          : `Best observed notebook latency was ${bestLatency} ms; limit is ${assertion.maxMs} ms.`,
+        duration === null
+          ? `The selected ${assertion.operation} attempt had no execution duration.`
+          : `Selected notebook latency was ${duration} ms; limit is ${assertion.maxMs} ms.`,
     });
   }
 
   if (assertion.type === "notebook_permission") {
-    const executions = matchingNotebookExecutions(records, assertion.operation);
-    const passed = executions.some((event) => event.permissionGranted === assertion.required);
+    const passed = notebookEvidence?.permissionGranted === assertion.required;
     return notebookAssertionResult({
       assertion,
       assertionIndex,
       passed,
       detail: passed
         ? `Observed ${assertion.operation} with permissionGranted=${assertion.required}.`
-        : `No ${assertion.operation} event matched permissionGranted=${assertion.required} (${executions.length} candidates).`,
+        : `The selected ${assertion.operation} attempt did not match permissionGranted=${assertion.required}.`,
     });
   }
 
   if (assertion.type === "notebook_isolation") {
-    const executions = matchingNotebookExecutions(records, assertion.operation);
-    const passed = executions.some(
-      (event) =>
-        event.isolation.session === "ephemeral-exclusive" &&
-        event.isolation.network === "disabled" &&
-        event.isolation.hostWorkspace === "not-mounted",
-    );
+    const event = notebookEvidence?.type === "notebook_execution" ? notebookEvidence : undefined;
+    const passed =
+      event?.isolation.session === "ephemeral-exclusive" &&
+      event.isolation.network === "disabled" &&
+      event.isolation.hostWorkspace === "not-mounted";
     return notebookAssertionResult({
       assertion,
       assertionIndex,
       passed,
       detail: passed
         ? "Observed ephemeral-exclusive execution with networking disabled and no host workspace mount."
-        : `No ${assertion.operation} event had the required isolation (${executions.length} candidates).`,
+        : `The selected ${assertion.operation} attempt did not prove the required isolation.`,
     });
   }
 
   if (assertion.type === "notebook_cleanup") {
-    const executions = matchingNotebookExecutions(records, assertion.operation);
-    const passed = executions.some((event) => {
-      const lastCommand = event.commands.at(-1);
-      return (
-        event.cleanup.attempted &&
-        event.cleanup.succeeded &&
-        lastCommand?.type === "dispose" &&
-        event.cleanup.commandId === lastCommand.commandId
-      );
-    });
+    const event = notebookEvidence?.type === "notebook_execution" ? notebookEvidence : undefined;
+    const lastCommand = event?.commands.at(-1);
+    const disposeCommandId =
+      lastCommand?.type === "dispose" && event?.cleanup.commandId === lastCommand.commandId
+        ? lastCommand.commandId
+        : undefined;
+    const accepted = event?.runtimeEvents.some(
+      (runtimeEvent) =>
+        runtimeEvent.sessionId === event.sessionId &&
+        runtimeEvent.commandId === disposeCommandId &&
+        runtimeEvent.type === "accepted" &&
+        runtimeEvent.commandType === "dispose",
+    );
+    const terminated = event?.runtimeEvents.some(
+      (runtimeEvent) =>
+        runtimeEvent.sessionId === event.sessionId &&
+        runtimeEvent.commandId === disposeCommandId &&
+        runtimeEvent.type === "kernel" &&
+        runtimeEvent.state === "terminated",
+    );
+    const passed =
+      event?.cleanup.attempted === true &&
+      event.cleanup.succeeded === true &&
+      disposeCommandId !== undefined &&
+      accepted === true &&
+      terminated === true;
     return notebookAssertionResult({
       assertion,
       assertionIndex,
       passed,
       detail: passed
         ? "Observed successful cleanup with the recorded dispose command last."
-        : `No ${assertion.operation} event proved successful final disposal (${executions.length} candidates).`,
+        : `The selected ${assertion.operation} attempt did not prove accepted, terminated, and successful final disposal.`,
     });
   }
 
   if (assertion.type === "notebook_identity") {
-    const executions = matchingNotebookExecutions(records, assertion.operation);
+    const event = notebookEvidence?.type === "notebook_execution" ? notebookEvidence : undefined;
     const expectedHash = hashStudyValue(assertion.binding);
-    const passed = executions.some((event) => hashStudyValue(event.binding) === expectedHash);
+    const passed = event !== undefined && hashStudyValue(event.binding) === expectedHash;
     return notebookAssertionResult({
       assertion,
       assertionIndex,
       passed,
       detail: passed
         ? "Observed the exact immutable notebook, runtime image, kernel lock, and kernel identity."
-        : `No ${assertion.operation} event matched the exact binding identity (${executions.length} candidates).`,
+        : `The selected ${assertion.operation} attempt did not match the exact binding identity.`,
     });
   }
 
@@ -305,6 +328,53 @@ function evaluateAssertion(
         ? "No ordered events with valid timestamps were found."
         : `Best observed latency was ${bestLatency} ms; limit is ${assertion.maxMs} ms.`,
   };
+}
+
+function evaluateAssertions(
+  assertions: ReadonlyArray<StudyEvalAssertion>,
+  records: ReadonlyArray<StudyTraceRecord>,
+): ReadonlyArray<StudyEvalAssertionResult> {
+  const results = new Map<number, StudyEvalAssertionResult>();
+  const notebookGroups = new Map<
+    NotebookAssertion["operation"],
+    Array<[number, NotebookAssertion]>
+  >();
+
+  for (const [assertionIndex, assertion] of assertions.entries()) {
+    if (!isNotebookAssertion(assertion)) {
+      results.set(assertionIndex, evaluateAssertion(assertion, assertionIndex, records));
+      continue;
+    }
+    const group = notebookGroups.get(assertion.operation) ?? [];
+    group.push([assertionIndex, assertion]);
+    notebookGroups.set(assertion.operation, group);
+  }
+
+  for (const [operation, group] of notebookGroups) {
+    const candidates = matchingNotebookEvidence(records, operation);
+    const evaluated = candidates.map((candidate) => ({
+      candidate,
+      results: group.map(([assertionIndex, assertion]) =>
+        evaluateAssertion(assertion, assertionIndex, records, candidate),
+      ),
+    }));
+    const selected =
+      evaluated.find((candidate) => candidate.results.every((result) => result.passed)) ??
+      evaluated.reduce<(typeof evaluated)[number] | undefined>((best, candidate) => {
+        if (best === undefined) return candidate;
+        const passedWeight = (item: (typeof evaluated)[number]) =>
+          item.results.reduce((total, result) => total + (result.passed ? result.weight : 0), 0);
+        return passedWeight(candidate) > passedWeight(best) ? candidate : best;
+      }, undefined);
+    const selectedResults =
+      selected?.results ??
+      group.map(([assertionIndex, assertion]) =>
+        evaluateAssertion(assertion, assertionIndex, records, undefined),
+      );
+    for (const result of selectedResults) results.set(result.assertionIndex, result);
+  }
+
+  return assertions.map((_, assertionIndex) => results.get(assertionIndex)!);
 }
 
 function summarizeSplit(
@@ -363,9 +433,7 @@ export const evaluateStudyDataset = Effect.fn("StudyEvalRunner.evaluateDataset")
         if (!start || start.event.type !== "run_started") {
           return yield* evaluationError(traceId, "Verified trace has no run_started event.");
         }
-        const assertions = evalCase.assertions.map((assertion, assertionIndex) =>
-          evaluateAssertion(assertion, assertionIndex, trace.records),
-        );
+        const assertions = evaluateAssertions(evalCase.assertions, trace.records);
         const totalWeight = assertions.reduce((sum, result) => sum + result.weight, 0);
         const passedWeight = assertions.reduce(
           (sum, result) => sum + (result.passed ? result.weight : 0),

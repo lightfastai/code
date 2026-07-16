@@ -6,12 +6,15 @@ import {
   type NotebookExecutionEvent,
   type StudyNotebookCommand,
   type StudyNotebookExecutionEvent,
+  type StudyNotebookPermissionEvent,
+  type StudyTraceEvent,
   type StudyTraceRecord,
   type StudyTraceRunId,
 } from "@t3tools/contracts";
 import { NotebookCodeCell } from "@t3tools/lightfast-artifact-notebook/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 
 import type * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import { buildStudyTraceRecord, hashStudyValue } from "../study/StudyTraceStore.ts";
@@ -47,6 +50,10 @@ export interface NotebookAgentToolsDependencies {
     },
     NotebookAgentToolError
   >;
+  readonly withExecutionStart: <A, E, R>(
+    invocation: McpInvocationContext.McpInvocationScope,
+    start: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | NotebookAgentToolError, R>;
   readonly writeTrace: (
     runId: StudyTraceRunId,
     records: ReadonlyArray<StudyTraceRecord>,
@@ -69,18 +76,67 @@ const traceError = (): NotebookAgentToolError =>
 const timestamp = (milliseconds: number): string =>
   DateTime.formatIso(DateTime.makeUnsafe(milliseconds));
 
-const outputEvents = (events: ReadonlyArray<NotebookExecutionEvent>) =>
-  events.filter((event) => ["stream", "display", "result", "error", "limit"].includes(event.type));
+function semanticOutput(events: ReadonlyArray<NotebookExecutionEvent>): ReadonlyArray<unknown> {
+  const output: unknown[] = [];
+  for (const event of events) {
+    switch (event.type) {
+      case "stream":
+        output.push({ type: event.type, cellId: event.cellId, name: event.name, text: event.text });
+        break;
+      case "display":
+        output.push({
+          type: event.type,
+          cellId: event.cellId,
+          data: event.data,
+          metadata: event.metadata,
+        });
+        break;
+      case "result":
+        output.push({
+          type: event.type,
+          cellId: event.cellId,
+          data: event.data,
+          metadata: event.metadata,
+        });
+        break;
+      case "error":
+        output.push({
+          type: event.type,
+          cellId: event.cellId,
+          ename: event.ename,
+          evalue: event.evalue,
+          traceback: event.traceback,
+        });
+        break;
+      case "limit":
+        output.push({
+          type: event.type,
+          cellId: event.cellId,
+          kind: event.kind,
+          limit: event.limit,
+          message: event.message,
+        });
+        break;
+      default:
+        break;
+    }
+  }
+  return output;
+}
 
 function traceRecords(input: {
   readonly runId: StudyTraceRunId;
-  readonly timestamp: string;
-  readonly event: StudyNotebookExecutionEvent;
+  readonly operation: StudyNotebookExecutionEvent["operation"];
+  readonly startedAt: string;
+  readonly finishedAt: string;
+  readonly permission: StudyNotebookPermissionEvent;
+  readonly execution?: StudyNotebookExecutionEvent;
+  readonly finishedReason: "completed" | "cancelled" | "error";
 }): ReadonlyArray<StudyTraceRecord> {
   const start = buildStudyTraceRecord({
     runId: input.runId,
     sequence: 0,
-    timestamp: input.event.startedAt,
+    timestamp: input.startedAt,
     previousHash: null,
     event: {
       type: "run_started",
@@ -96,9 +152,7 @@ function traceRecords(input: {
         tools: [
           {
             name:
-              input.event.operation === "execute_cell"
-                ? "notebook_execute_cell"
-                : "notebook_execute_all",
+              input.operation === "execute_cell" ? "notebook_execute_cell" : "notebook_execute_all",
             version: "1",
           },
         ],
@@ -106,24 +160,33 @@ function traceRecords(input: {
       documentIds: [],
     },
   });
-  const execution = buildStudyTraceRecord({
-    runId: input.runId,
-    sequence: 1,
-    timestamp: input.timestamp,
-    previousHash: start.hash,
-    event: input.event,
+  const middleEvents: ReadonlyArray<StudyTraceEvent> = [
+    input.permission,
+    ...(input.execution === undefined ? [] : [input.execution]),
+  ];
+  let previousHash = start.hash;
+  const middle = middleEvents.map((event, index) => {
+    const record = buildStudyTraceRecord({
+      runId: input.runId,
+      sequence: index + 1,
+      timestamp: event.type === "notebook_permission" ? input.startedAt : input.finishedAt,
+      previousHash,
+      event,
+    });
+    previousHash = record.hash;
+    return record;
   });
   const finished = buildStudyTraceRecord({
     runId: input.runId,
-    sequence: 2,
-    timestamp: input.timestamp,
-    previousHash: execution.hash,
+    sequence: middle.length + 1,
+    timestamp: input.finishedAt,
+    previousHash,
     event: {
       type: "run_finished",
-      reason: input.event.outcome === "completed" ? "completed" : "error",
+      reason: input.finishedReason,
     },
   });
-  return [start, execution, finished];
+  return [start, ...middle, finished];
 }
 
 function requestedRevision(input: NotebookAgentExecuteAllInput | NotebookAgentExecuteCellInput) {
@@ -140,12 +203,6 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
     input: NotebookAgentExecuteAllInput | NotebookAgentExecuteCellInput,
     invocation: McpInvocationContext.McpInvocationScope,
   ) {
-    if (!invocation.allowNotebookExecution) {
-      return yield* toolError(
-        "permission-denied",
-        "This thread does not grant notebook execution to the agent.",
-      );
-    }
     if (input.scope.environmentId !== invocation.environmentId) {
       return yield* toolError(
         "scope-mismatch",
@@ -189,177 +246,251 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
     const uuid = dependencies.randomUUID().replace(/[^A-Za-z0-9_-]/g, "-");
     const runId = `notebook-${uuid}` as StudyTraceRunId;
     const sessionId = `notebook-agent-session-${uuid}`.slice(0, 128);
-    const startedAtMs = dependencies.now();
-    const startedAt = timestamp(startedAtMs);
-    const commands: StudyNotebookCommand[] = [];
-    const runtimeEvents: NotebookExecutionEvent[] = [];
-    const commandId = (kind: string, index?: number) =>
-      `notebook-${kind}-${uuid}${index === undefined ? "" : `-${index}`}`.slice(0, 256);
-    const openCommandId = commandId("open");
-    commands.push({
-      type: "open",
-      commandId: openCommandId,
-      startedAt: timestamp(dependencies.now()),
-    });
-
-    let executionFailure: NotebookAgentToolError | undefined;
-    let opened = false;
-    let cleanupAttempted = false;
-    let cleanupSucceeded = false;
-    let disposeCommandId: string | undefined;
-    const cleanup = Effect.fn("NotebookAgentTools.cleanup")(function* () {
-      if (!opened || cleanupAttempted) return;
-      cleanupAttempted = true;
-      disposeCommandId = commandId("dispose");
-      commands.push({
-        type: "dispose",
-        commandId: disposeCommandId,
-        startedAt: timestamp(dependencies.now()),
-      });
-      const disposeResult = yield* Effect.result(
-        Effect.tryPromise({
-          try: () =>
-            dependencies.runtimeManager.dispose({
-              projectId: input.scope.projectId,
-              sessionId,
-              commandId: disposeCommandId as string,
-            }),
-          catch: runtimeError,
-        }),
-      );
-      if (disposeResult._tag === "Success") {
-        cleanupSucceeded = true;
-        runtimeEvents.push(...disposeResult.success);
-      } else {
-        executionFailure ??= disposeResult.failure;
-      }
-    });
-
-    const openResult = yield* Effect.uninterruptible(
+    return yield* Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
-        const result = yield* Effect.result(
-          Effect.tryPromise({
-            try: () =>
-              dependencies.runtimeManager.open({
-                projectId: input.scope.projectId,
-                sessionId,
-                commandId: openCommandId,
-                kernelName: revision.kernel.name,
-              }),
-            catch: runtimeError,
-          }),
-        );
-        if (
-          result._tag === "Success" &&
-          result.success.some(
-            (event) => event.type === "accepted" && event.commandType === "open",
-          ) &&
-          result.success.some((event) => event.type === "kernel" && event.state === "idle")
-        ) {
-          opened = true;
-          yield* Effect.addFinalizer(() => cleanup().pipe(Effect.ignore));
-        }
-        return result;
-      }),
-    );
-    if (openResult._tag === "Success") {
-      runtimeEvents.push(...openResult.success);
-      if (!opened) {
-        executionFailure = runtimeError();
-      } else {
-        for (const [index, cell] of cells.entries()) {
-          const executeCommandId = commandId("execute", index);
-          const executionId = commandId("execution", index);
+        const startedAtMs = dependencies.now();
+        const startedAt = timestamp(startedAtMs);
+        const commands: StudyNotebookCommand[] = [];
+        const runtimeEvents: NotebookExecutionEvent[] = [];
+        const commandId = (kind: string, index?: number) =>
+          `notebook-${kind}-${uuid}${index === undefined ? "" : `-${index}`}`.slice(0, 256);
+        const openCommandId = commandId("open");
+        commands.push({
+          type: "open",
+          commandId: openCommandId,
+          startedAt: timestamp(dependencies.now()),
+        });
+
+        let permissionGranted = false;
+        let executionFailure: NotebookAgentToolError | undefined;
+        let opened = false;
+        let cleanupAttempted = false;
+        let cleanupSucceeded = false;
+        let disposeCommandId: string | undefined;
+        const cleanup = Effect.fn("NotebookAgentTools.cleanup")(function* () {
+          if (!opened || cleanupAttempted) return;
+          cleanupAttempted = true;
+          disposeCommandId = commandId("dispose");
           commands.push({
-            type: "execute",
-            commandId: executeCommandId,
-            executionId,
-            cellId: cell.id,
-            codeHash: hashStudyValue(cell.source),
+            type: "dispose",
+            commandId: disposeCommandId,
             startedAt: timestamp(dependencies.now()),
           });
-          const cellResult = yield* Effect.result(
+          const disposeResult = yield* Effect.result(
             Effect.tryPromise({
               try: () =>
-                Array.fromAsync(
-                  dependencies.runtimeManager.execute({
-                    projectId: input.scope.projectId,
-                    sessionId,
-                    commandId: executeCommandId,
-                    executionId,
-                    cellId: cell.id,
-                    code: cell.source,
-                  }),
-                ),
+                dependencies.runtimeManager.dispose({
+                  projectId: input.scope.projectId,
+                  sessionId,
+                  commandId: disposeCommandId as string,
+                }),
               catch: runtimeError,
             }),
           );
-          if (cellResult._tag === "Failure") {
-            executionFailure = cellResult.failure;
-            break;
+          if (disposeResult._tag === "Failure") {
+            executionFailure ??= disposeResult.failure;
+            return;
           }
-          runtimeEvents.push(...cellResult.success);
-          if (
-            cellResult.success.some((event) => ["rejected", "error", "limit"].includes(event.type))
-          ) {
-            executionFailure = runtimeError();
-            break;
-          }
-        }
-      }
-    } else {
-      executionFailure = openResult.failure;
-    }
+          runtimeEvents.push(...disposeResult.success);
+          const accepted = disposeResult.success.some(
+            (event) =>
+              event.sessionId === sessionId &&
+              event.commandId === disposeCommandId &&
+              event.type === "accepted" &&
+              event.commandType === "dispose",
+          );
+          const terminated = disposeResult.success.some(
+            (event) =>
+              event.sessionId === sessionId &&
+              event.commandId === disposeCommandId &&
+              event.type === "kernel" &&
+              event.state === "terminated",
+          );
+          cleanupSucceeded = accepted && terminated;
+          if (!cleanupSucceeded) executionFailure ??= runtimeError();
+        });
 
-    yield* cleanup();
+        const bodyExit = yield* Effect.exit(
+          restore(
+            Effect.gen(function* () {
+              const openResult = yield* Effect.uninterruptible(
+                Effect.gen(function* () {
+                  const result = yield* Effect.result(
+                    dependencies.withExecutionStart(
+                      invocation,
+                      Effect.sync(() => {
+                        permissionGranted = true;
+                      }).pipe(
+                        Effect.andThen(
+                          Effect.tryPromise({
+                            try: () =>
+                              dependencies.runtimeManager.open({
+                                projectId: input.scope.projectId,
+                                sessionId,
+                                commandId: openCommandId,
+                                kernelName: revision.kernel.name,
+                                runtimeImageDigest: identity.imageDigest,
+                              }),
+                            catch: runtimeError,
+                          }),
+                        ),
+                      ),
+                    ),
+                  );
+                  if (result._tag === "Success") {
+                    runtimeEvents.push(...result.success);
+                    opened =
+                      result.success.some(
+                        (event) =>
+                          event.sessionId === sessionId &&
+                          event.commandId === openCommandId &&
+                          event.type === "accepted" &&
+                          event.commandType === "open",
+                      ) &&
+                      result.success.some(
+                        (event) =>
+                          event.sessionId === sessionId &&
+                          event.commandId === openCommandId &&
+                          event.type === "kernel" &&
+                          event.state === "idle",
+                      );
+                  }
+                  return result;
+                }),
+              );
+              if (openResult._tag === "Failure") {
+                executionFailure = openResult.failure;
+                return;
+              }
+              if (!opened) {
+                executionFailure = runtimeError();
+                return;
+              }
 
-    const finishedAtMs = dependencies.now();
-    const finishedAt = timestamp(finishedAtMs);
-    const outputHash = hashStudyValue(outputEvents(runtimeEvents));
-    const event: StudyNotebookExecutionEvent = {
-      type: "notebook_execution",
-      operation,
-      outcome: executionFailure === undefined ? "completed" : "failed",
-      permissionGranted: true,
-      binding: {
-        documentId: revision.documentId,
-        revisionId: revision.revisionId,
-        contentHash: revision.contentHash,
-        runtimeImageDigest: identity.imageDigest,
-        kernelLockHash: identity.kernelLockHash,
-        kernelName: revision.kernel.name,
-      },
-      sessionId,
-      isolation: {
-        session: "ephemeral-exclusive",
-        network: "disabled",
-        hostWorkspace: "not-mounted",
-      },
-      commands,
-      runtimeEvents,
-      outputHash,
-      startedAt,
-      finishedAt,
-      durationMs: Math.max(0, finishedAtMs - startedAtMs),
-      cleanup: {
-        attempted: cleanupAttempted,
-        succeeded: cleanupSucceeded,
-        ...(disposeCommandId === undefined ? {} : { commandId: disposeCommandId }),
-      },
-    };
-    const records = traceRecords({ runId, timestamp: finishedAt, event });
-    const traceResult = yield* Effect.result(dependencies.writeTrace(runId, records));
-    if (traceResult._tag === "Failure") return yield* traceError();
-    if (executionFailure !== undefined) return yield* executionFailure;
+              for (const [index, cell] of cells.entries()) {
+                const executeCommandId = commandId("execute", index);
+                const executionId = commandId("execution", index);
+                commands.push({
+                  type: "execute",
+                  commandId: executeCommandId,
+                  executionId,
+                  cellId: cell.id,
+                  codeHash: hashStudyValue(cell.source),
+                  startedAt: timestamp(dependencies.now()),
+                });
+                const cellResult = yield* Effect.result(
+                  Effect.tryPromise({
+                    try: () =>
+                      Array.fromAsync(
+                        dependencies.runtimeManager.execute({
+                          projectId: input.scope.projectId,
+                          sessionId,
+                          commandId: executeCommandId,
+                          executionId,
+                          cellId: cell.id,
+                          code: cell.source,
+                        }),
+                      ),
+                    catch: runtimeError,
+                  }),
+                );
+                if (cellResult._tag === "Failure") {
+                  executionFailure = cellResult.failure;
+                  break;
+                }
+                runtimeEvents.push(...cellResult.success);
+                if (
+                  cellResult.success.some((event) =>
+                    ["rejected", "error", "limit"].includes(event.type),
+                  )
+                ) {
+                  executionFailure = runtimeError();
+                  break;
+                }
+              }
+            }),
+          ),
+        );
 
-    return {
-      documentId: revision.documentId,
-      revisionId: revision.revisionId,
-      contentHash: revision.contentHash,
-      traceRunId: runId,
-      outputHash,
-      durationMs: event.durationMs,
-    } satisfies NotebookAgentExecutionResult;
+        const interrupted = Exit.hasInterrupts(bodyExit);
+        yield* cleanup();
+
+        const finishedAtMs = dependencies.now();
+        const finishedAt = timestamp(finishedAtMs);
+        const outputHash = hashStudyValue(semanticOutput(runtimeEvents));
+        const permission: StudyNotebookPermissionEvent = {
+          type: "notebook_permission",
+          operation,
+          threadId: invocation.threadId,
+          providerSessionId: invocation.providerSessionId,
+          permissionGranted,
+        };
+        const event: StudyNotebookExecutionEvent | undefined = permissionGranted
+          ? {
+              type: "notebook_execution",
+              operation,
+              outcome: interrupted
+                ? "interrupted"
+                : executionFailure === undefined && bodyExit._tag === "Success"
+                  ? "completed"
+                  : "failed",
+              permissionGranted: true,
+              binding: {
+                documentId: revision.documentId,
+                revisionId: revision.revisionId,
+                contentHash: revision.contentHash,
+                runtimeImageDigest: identity.imageDigest,
+                kernelLockHash: identity.kernelLockHash,
+                kernelName: revision.kernel.name,
+              },
+              sessionId,
+              isolation: {
+                session: "ephemeral-exclusive",
+                network: "disabled",
+                hostWorkspace: "not-mounted",
+              },
+              commands,
+              runtimeEvents,
+              outputHash,
+              startedAt,
+              finishedAt,
+              durationMs: Math.max(0, finishedAtMs - startedAtMs),
+              cleanup: {
+                attempted: cleanupAttempted,
+                succeeded: cleanupSucceeded,
+                ...(disposeCommandId === undefined ? {} : { commandId: disposeCommandId }),
+              },
+            }
+          : undefined;
+        const records = traceRecords({
+          runId,
+          operation,
+          startedAt,
+          finishedAt,
+          permission,
+          ...(event === undefined ? {} : { execution: event }),
+          finishedReason: interrupted
+            ? "cancelled"
+            : executionFailure === undefined && bodyExit._tag === "Success"
+              ? "completed"
+              : "error",
+        });
+        const traceResult = yield* Effect.result(dependencies.writeTrace(runId, records));
+        if (traceResult._tag === "Failure") return yield* traceError();
+        if (bodyExit._tag === "Failure") return yield* Effect.failCause(bodyExit.cause);
+        if (executionFailure !== undefined) return yield* executionFailure;
+        if (event === undefined) return yield* runtimeError();
+
+        return {
+          documentId: revision.documentId,
+          revisionId: revision.revisionId,
+          contentHash: revision.contentHash,
+          traceRunId: runId,
+          outputHash,
+          durationMs: event.durationMs,
+        } satisfies NotebookAgentExecutionResult;
+      }),
+    );
   });
 
   return {

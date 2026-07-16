@@ -1,6 +1,12 @@
 import * as Schema from "effect/Schema";
 
-import { IsoDateTime, NonNegativeInt, PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  PositiveInt,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { StudyDocumentId } from "./study.ts";
 import { NotebookExecutionEvent } from "./notebook.ts";
 import {
@@ -60,6 +66,7 @@ export const StudyTraceEventType = Schema.Literals([
   "interruption",
   "environment_observation",
   "checkpoint",
+  "notebook_permission",
   "notebook_execution",
   "run_finished",
 ]);
@@ -104,10 +111,19 @@ export const StudyNotebookCommand = Schema.Struct({
 });
 export type StudyNotebookCommand = typeof StudyNotebookCommand.Type;
 
+export const StudyNotebookPermissionEvent = Schema.Struct({
+  type: Schema.Literal("notebook_permission"),
+  operation: StudyNotebookOperation,
+  threadId: ThreadId,
+  providerSessionId: BoundedName,
+  permissionGranted: Schema.Boolean,
+});
+export type StudyNotebookPermissionEvent = typeof StudyNotebookPermissionEvent.Type;
+
 export const StudyNotebookExecutionEvent = Schema.Struct({
   type: Schema.Literal("notebook_execution"),
   operation: StudyNotebookOperation,
-  outcome: Schema.Literals(["completed", "failed"]),
+  outcome: Schema.Literals(["completed", "failed", "interrupted"]),
   permissionGranted: Schema.Literal(true),
   binding: StudyNotebookBinding,
   sessionId: BoundedName,
@@ -187,6 +203,7 @@ export const StudyTraceEvent = Schema.Union([
     outcome: Schema.Literals(["accepted", "rejected", "corrected", "skipped"]),
     note: Schema.optional(Schema.String.check(Schema.isMaxLength(20_000))),
   }),
+  StudyNotebookPermissionEvent,
   StudyNotebookExecutionEvent,
   Schema.Struct({
     type: Schema.Literal("run_finished"),

@@ -17,6 +17,7 @@ import { NotebookRuntimeManagerService } from "../../../notebook/NotebookRuntime
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import * as McpSessionRegistry from "../../McpSessionRegistry.ts";
 
 const sharedDependencies = [
   McpInvocationContext.McpInvocationContext,
@@ -44,6 +45,7 @@ const executionDependencies = [
   ServerConfig.ServerConfig,
   FileSystem.FileSystem,
   Path.Path,
+  McpSessionRegistry.McpSessionRegistry,
 ];
 
 export const ExecuteNotebookCellTool = Tool.make("notebook_execute_cell", {

@@ -1,6 +1,7 @@
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  NotebookAgentToolError,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -70,8 +71,34 @@ const revisionStore: NotebookRevisionStoreShape = {
   exportIpynb: () => Effect.die("unused"),
 };
 
-it.effect("rejects agent execution without the thread grant before touching the runtime", () => {
+const allowExecutionStart = <A, E, R>(
+  _invocation: McpInvocationContext.McpInvocationScope,
+  start: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> => start;
+
+const disposeEvents = (
+  input: { readonly sessionId: string; readonly commandId: string },
+  sequence: number,
+) => [
+  {
+    type: "accepted" as const,
+    sessionId: input.sessionId,
+    commandId: input.commandId,
+    sequence,
+    commandType: "dispose" as const,
+  },
+  {
+    type: "kernel" as const,
+    sessionId: input.sessionId,
+    commandId: input.commandId,
+    sequence: sequence + 1,
+    state: "terminated" as const,
+  },
+];
+
+it.effect("revalidates authoritative permission before open and traces a denied attempt", () => {
   const calls: string[] = [];
+  const traces: StudyTraceRecord[][] = [];
   const tools = makeNotebookAgentTools({
     revisionStore,
     runtimeManager: {
@@ -102,7 +129,14 @@ it.effect("rejects agent execution without the thread grant before touching the 
     },
     runtimeIdentity: () =>
       Effect.succeed({ imageDigest: `sha256:${"b".repeat(64)}`, kernelLockHash: "c".repeat(64) }),
-    writeTrace: () => Effect.void,
+    withExecutionStart: () =>
+      Effect.fail(
+        new NotebookAgentToolError({
+          reason: "permission-denied",
+          message: "Permission was revoked.",
+        }),
+      ),
+    writeTrace: (_runId, records) => Effect.sync(() => traces.push([...records])),
     randomUUID: () => "denied",
     now: () => Date.parse("2026-07-17T00:00:00.000Z"),
   });
@@ -116,12 +150,24 @@ it.effect("rejects agent execution without the thread grant before touching the 
           revisionId: revision.revisionId,
           cellId: "cell-1",
         },
-        invocation(false),
+        invocation(true),
       )
       .pipe(Effect.flip);
 
     expect(error).toMatchObject({ reason: "permission-denied" });
     expect(calls).toEqual([]);
+    expect(traces).toHaveLength(1);
+    expect(traces[0]?.map(({ event }) => event.type)).toEqual([
+      "run_started",
+      "notebook_permission",
+      "run_finished",
+    ]);
+    expect(traces[0]?.[1]?.event).toMatchObject({
+      type: "notebook_permission",
+      operation: "execute_cell",
+      threadId: invocation(true).threadId,
+      permissionGranted: false,
+    });
   });
 });
 
@@ -140,7 +186,7 @@ it.effect(
       revisionStore,
       runtimeManager: {
         open: async (input) => {
-          calls.push(`open:${input.kernelName}`);
+          calls.push(`open:${input.kernelName}:${input.runtimeImageDigest ?? "mutable"}`);
           return [
             { ...eventBase(input.commandId), type: "accepted", commandType: "open" },
             { ...eventBase(input.commandId), type: "kernel", state: "idle" },
@@ -177,6 +223,7 @@ it.effect(
       },
       runtimeIdentity: () =>
         Effect.succeed({ imageDigest: `sha256:${"b".repeat(64)}`, kernelLockHash: "c".repeat(64) }),
+      withExecutionStart: allowExecutionStart,
       writeTrace: (_runId, records) => Effect.sync(() => traces.push([...records])),
       randomUUID: () => "run-1",
       now: (() => {
@@ -196,7 +243,11 @@ it.effect(
         invocation(true),
       );
 
-      expect(calls).toEqual(["open:python3", "execute:cell-1:print('one')", "dispose"]);
+      expect(calls).toEqual([
+        `open:python3:sha256:${"b".repeat(64)}`,
+        "execute:cell-1:print('one')",
+        "dispose",
+      ]);
       expect(result).toMatchObject({
         documentId: revision.documentId,
         revisionId: revision.revisionId,
@@ -271,13 +322,14 @@ it.effect(
             yield* [];
           },
         }),
-        dispose: async () => {
+        dispose: async (input) => {
           calls.push("dispose");
-          return [];
+          return disposeEvents(input, 3);
         },
       },
       runtimeIdentity: () =>
         Effect.succeed({ imageDigest: `sha256:${"b".repeat(64)}`, kernelLockHash: "c".repeat(64) }),
+      withExecutionStart: allowExecutionStart,
       writeTrace: (_runId, records) => Effect.sync(() => traces.push([...records])),
       randomUUID: () => "run-failure",
       now: () => Date.parse("2026-07-17T00:00:00.000Z"),
@@ -344,13 +396,14 @@ it.effect("treats runtime rejection as failure and still disposes the isolated s
           };
         },
       }),
-      dispose: async () => {
+      dispose: async (input) => {
         calls.push("dispose");
-        return [];
+        return disposeEvents(input, 4);
       },
     },
     runtimeIdentity: () =>
       Effect.succeed({ imageDigest: `sha256:${"b".repeat(64)}`, kernelLockHash: "c".repeat(64) }),
+    withExecutionStart: allowExecutionStart,
     writeTrace: () => Effect.void,
     randomUUID: () => "run-rejected",
     now: () => Date.parse("2026-07-17T00:00:00.000Z"),
@@ -374,8 +427,9 @@ it.effect("treats runtime rejection as failure and still disposes the isolated s
   });
 });
 
-it.effect("disposes the isolated session when agent execution is interrupted", () => {
+it.effect("persists an interrupted trace before propagating interruption", () => {
   const calls: string[] = [];
+  const traces: StudyTraceRecord[][] = [];
   let markStarted!: () => void;
   const started = new Promise<void>((resolve) => {
     markStarted = resolve;
@@ -410,14 +464,15 @@ it.effect("disposes the isolated session when agent execution is interrupted", (
           yield* [];
         },
       }),
-      dispose: async () => {
+      dispose: async (input) => {
         calls.push("dispose");
-        return [];
+        return disposeEvents(input, 3);
       },
     },
     runtimeIdentity: () =>
       Effect.succeed({ imageDigest: `sha256:${"b".repeat(64)}`, kernelLockHash: "c".repeat(64) }),
-    writeTrace: () => Effect.void,
+    withExecutionStart: allowExecutionStart,
+    writeTrace: (_runId, records) => Effect.sync(() => traces.push([...records])),
     randomUUID: () => "run-interrupted",
     now: () => Date.parse("2026-07-17T00:00:00.000Z"),
   });
@@ -438,5 +493,268 @@ it.effect("disposes the isolated session when agent execution is interrupted", (
     yield* Fiber.interrupt(fiber);
 
     expect(calls).toEqual(["open", "execute", "dispose"]);
+    expect(traces).toHaveLength(1);
+    const execution = traces[0]?.find(({ event }) => event.type === "notebook_execution")?.event;
+    expect(execution).toMatchObject({
+      type: "notebook_execution",
+      outcome: "interrupted",
+      cleanup: { attempted: true, succeeded: true },
+    });
+    expect(traces[0]?.at(-1)?.event).toMatchObject({
+      type: "run_finished",
+      reason: "cancelled",
+    });
+    expect(
+      traces[0]
+        ?.slice(1)
+        .every((record, index) => record.previousHash === traces[0]?.[index]?.hash),
+    ).toBe(true);
+  });
+});
+
+it.effect("waits for an interrupted open to establish ownership before cleanup", () => {
+  const calls: string[] = [];
+  const traces: StudyTraceRecord[][] = [];
+  let markOpenStarted!: () => void;
+  let releaseOpen!: () => void;
+  const openStarted = new Promise<void>((resolve) => {
+    markOpenStarted = resolve;
+  });
+  const openReleased = new Promise<void>((resolve) => {
+    releaseOpen = resolve;
+  });
+  const tools = makeNotebookAgentTools({
+    revisionStore,
+    runtimeManager: {
+      open: async (input) => {
+        calls.push("open");
+        markOpenStarted();
+        await openReleased;
+        return [
+          {
+            type: "accepted",
+            sessionId: input.sessionId,
+            commandId: input.commandId,
+            sequence: 1,
+            commandType: "open",
+          },
+          {
+            type: "kernel",
+            sessionId: input.sessionId,
+            commandId: input.commandId,
+            sequence: 2,
+            state: "idle",
+          },
+        ];
+      },
+      execute: () => ({ async *[Symbol.asyncIterator]() {} }),
+      dispose: async (input) => {
+        calls.push("dispose");
+        return disposeEvents(input, 3);
+      },
+    },
+    runtimeIdentity: () =>
+      Effect.succeed({ imageDigest: `sha256:${"b".repeat(64)}`, kernelLockHash: "c".repeat(64) }),
+    withExecutionStart: allowExecutionStart,
+    writeTrace: (_runId, records) => Effect.sync(() => traces.push([...records])),
+    randomUUID: () => "run-open-interrupted",
+    now: () => Date.parse("2026-07-17T00:00:00.000Z"),
+  });
+
+  return Effect.gen(function* () {
+    const execution = yield* Effect.forkChild(
+      tools.executeCell(
+        {
+          scope,
+          documentId: revision.documentId,
+          revisionId: revision.revisionId,
+          cellId: "cell-1",
+        },
+        invocation(true),
+      ),
+    );
+    yield* Effect.promise(() => openStarted);
+    const interruption = yield* Effect.forkChild(Fiber.interrupt(execution));
+    yield* Effect.yieldNow;
+    releaseOpen();
+    yield* Fiber.join(interruption);
+
+    expect(calls).toEqual(["open", "dispose"]);
+    expect(
+      traces[0]?.find(({ event }) => event.type === "notebook_execution")?.event,
+    ).toMatchObject({
+      type: "notebook_execution",
+      outcome: "interrupted",
+      cleanup: { attempted: true, succeeded: true },
+    });
+  });
+});
+
+it.effect("fails cleanup truth when a resolved dispose response is rejected", () => {
+  const traces: StudyTraceRecord[][] = [];
+  const tools = makeNotebookAgentTools({
+    revisionStore,
+    runtimeManager: {
+      open: async (input) => [
+        {
+          type: "accepted",
+          sessionId: input.sessionId,
+          commandId: input.commandId,
+          sequence: 1,
+          commandType: "open",
+        },
+        {
+          type: "kernel",
+          sessionId: input.sessionId,
+          commandId: input.commandId,
+          sequence: 2,
+          state: "idle",
+        },
+      ],
+      execute: (input) => ({
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: "accepted" as const,
+            sessionId: input.sessionId,
+            commandId: input.commandId,
+            executionId: input.executionId,
+            cellId: input.cellId,
+            sequence: 3,
+            commandType: "execute" as const,
+          };
+          yield {
+            type: "kernel" as const,
+            sessionId: input.sessionId,
+            commandId: input.commandId,
+            executionId: input.executionId,
+            cellId: input.cellId,
+            sequence: 4,
+            state: "idle" as const,
+          };
+        },
+      }),
+      dispose: async (input) => [
+        {
+          type: "rejected",
+          sessionId: input.sessionId,
+          commandId: input.commandId,
+          sequence: 5,
+          reason: "dispose-rejected",
+          message: "The runtime rejected disposal.",
+        },
+      ],
+    },
+    runtimeIdentity: () =>
+      Effect.succeed({ imageDigest: `sha256:${"b".repeat(64)}`, kernelLockHash: "c".repeat(64) }),
+    withExecutionStart: allowExecutionStart,
+    writeTrace: (_runId, records) => Effect.sync(() => traces.push([...records])),
+    randomUUID: () => "run-cleanup-rejected",
+    now: () => Date.parse("2026-07-17T00:00:00.000Z"),
+  });
+
+  return Effect.gen(function* () {
+    const result = yield* Effect.result(
+      tools.executeCell(
+        {
+          scope,
+          documentId: revision.documentId,
+          revisionId: revision.revisionId,
+          cellId: "cell-1",
+        },
+        invocation(true),
+      ),
+    );
+
+    expect(result._tag).toBe("Failure");
+    expect(
+      traces[0]?.find(({ event }) => event.type === "notebook_execution")?.event,
+    ).toMatchObject({
+      type: "notebook_execution",
+      outcome: "failed",
+      cleanup: { attempted: true, succeeded: false },
+    });
+  });
+});
+
+it.effect("hashes semantic output independently of transport identity", () => {
+  const execute = (uuid: string, text: string) => {
+    const tools = makeNotebookAgentTools({
+      revisionStore,
+      runtimeManager: {
+        open: async (input) => [
+          {
+            type: "accepted",
+            sessionId: input.sessionId,
+            commandId: input.commandId,
+            sequence: 10,
+            commandType: "open",
+          },
+          {
+            type: "kernel",
+            sessionId: input.sessionId,
+            commandId: input.commandId,
+            sequence: 20,
+            state: "idle",
+          },
+        ],
+        execute: (input) => ({
+          async *[Symbol.asyncIterator]() {
+            yield {
+              type: "accepted" as const,
+              sessionId: input.sessionId,
+              commandId: input.commandId,
+              executionId: input.executionId,
+              cellId: input.cellId,
+              sequence: 30,
+              commandType: "execute" as const,
+            };
+            yield {
+              type: "stream" as const,
+              sessionId: input.sessionId,
+              commandId: input.commandId,
+              executionId: input.executionId,
+              cellId: input.cellId,
+              sequence: 40,
+              name: "stdout" as const,
+              text,
+            };
+            yield {
+              type: "kernel" as const,
+              sessionId: input.sessionId,
+              commandId: input.commandId,
+              executionId: input.executionId,
+              cellId: input.cellId,
+              sequence: 50,
+              state: "idle" as const,
+            };
+          },
+        }),
+        dispose: async (input) => disposeEvents(input, 60),
+      },
+      runtimeIdentity: () =>
+        Effect.succeed({ imageDigest: `sha256:${"b".repeat(64)}`, kernelLockHash: "c".repeat(64) }),
+      withExecutionStart: allowExecutionStart,
+      writeTrace: () => Effect.void,
+      randomUUID: () => uuid,
+      now: () => Date.parse("2026-07-17T00:00:00.000Z"),
+    });
+    return tools.executeCell(
+      {
+        scope,
+        documentId: revision.documentId,
+        revisionId: revision.revisionId,
+        cellId: "cell-1",
+      },
+      invocation(true),
+    );
+  };
+
+  return Effect.gen(function* () {
+    const first = yield* execute("semantic-one", "same\n");
+    const second = yield* execute("semantic-two", "same\n");
+    const changed = yield* execute("semantic-three", "changed\n");
+
+    expect(first.outputHash).toBe(second.outputHash);
+    expect(changed.outputHash).not.toBe(first.outputHash);
   });
 });

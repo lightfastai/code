@@ -256,6 +256,7 @@ export interface NotebookManagerSessionOpenInput {
   readonly commandId: string;
   readonly kernelName: string;
   readonly bookPaths?: ReadonlyArray<string>;
+  readonly runtimeImageDigest?: string;
 }
 
 export interface NotebookManagerExecuteInput extends RuntimeExecuteRequest {
@@ -297,7 +298,6 @@ export class NotebookRuntimeManager {
   readonly #disposeTombstones = new Map<string, DisposeTombstone>();
   #disposeTombstoneBytes = 0;
   #closing = false;
-  #runtimeImageDigest: Promise<string> | undefined;
 
   constructor(options: NotebookRuntimeManagerOptions) {
     this.#docker = options.docker ?? new DockerCliCommandRunner();
@@ -360,7 +360,7 @@ export class NotebookRuntimeManager {
     this.#assertCanStart();
     this.#assertAdmissionAvailable(input.projectId, sessionKey);
     const project = this.#selectProject(input.projectId, input.bookPaths ?? []);
-    const runtime = await this.#ensureSession(project, input.sessionId);
+    const runtime = await this.#ensureSession(project, input.sessionId, input.runtimeImageDigest);
     project.lastUsedAt = this.#now();
     try {
       const events = await this.#runCached(
@@ -384,7 +384,7 @@ export class NotebookRuntimeManager {
   }
 
   resolveRuntimeImageDigest(): Promise<string> {
-    this.#runtimeImageDigest ??= this.#docker
+    return this.#docker
       .run(["image", "inspect", "--format", "{{.Id}}", this.#image])
       .then(({ stdout }) => {
         const digest = stdout.trim();
@@ -395,12 +395,7 @@ export class NotebookRuntimeManager {
           });
         }
         return digest;
-      })
-      .catch((cause) => {
-        this.#runtimeImageDigest = undefined;
-        throw cause;
       });
-    return this.#runtimeImageDigest;
   }
 
   execute(input: NotebookManagerExecuteInput): AsyncIterable<NotebookExecutionEvent> {
@@ -548,9 +543,15 @@ export class NotebookRuntimeManager {
     const { project, runtime, session } = this.#getSession(input, true);
     return this.#startSessionDisposal(sessionKey, runtime, fingerprint, async () => {
       project.lastUsedAt = this.#now();
-      const events = await this.#runCached(session, input.commandId, fingerprint, "dispose", () =>
-        runtime.client.dispose(input),
-      );
+      let events: ReadonlyArray<NotebookExecutionEvent>;
+      try {
+        events = await this.#runCached(session, input.commandId, fingerprint, "dispose", () =>
+          runtime.client.dispose(input),
+        );
+      } catch (error) {
+        await this.#removeContainer(runtime);
+        throw error;
+      }
       if (this.#commandResultState(events, input.commandId, "dispose") === "accepted-terminal") {
         session.disposed = true;
         this.#cacheDisposeTombstone(
@@ -561,8 +562,13 @@ export class NotebookRuntimeManager {
           events,
         );
         await this.#removeContainer(runtime);
+        return events;
       }
-      return events;
+      await this.#removeContainer(runtime);
+      throw new NotebookRuntimeManagerError({
+        reason: "runtime-unavailable",
+        message: "Notebook disposal was rejected before verified termination.",
+      });
     });
   }
 
@@ -1024,7 +1030,11 @@ export class NotebookRuntimeManager {
     }
   }
 
-  async #ensureSession(project: ProjectState, sessionId: string): Promise<SessionRuntime> {
+  async #ensureSession(
+    project: ProjectState,
+    sessionId: string,
+    runtimeImageDigest?: string,
+  ): Promise<SessionRuntime> {
     this.#assertCanStart();
     const sessionKey = this.#sessionKey(project.projectId, sessionId);
     const existing = this.#sessions.get(sessionKey);
@@ -1040,7 +1050,7 @@ export class NotebookRuntimeManager {
         const racedSession = this.#sessions.get(sessionKey);
         if (racedSession !== undefined) return racedSession;
       }
-      return this.#startSession(project, sessionId, sessionKey);
+      return this.#startSession(project, sessionId, sessionKey, runtimeImageDigest);
     });
     this.#sessionStarts.set(sessionKey, { projectId: project.projectId, promise });
     try {
@@ -1055,6 +1065,7 @@ export class NotebookRuntimeManager {
     project: ProjectState,
     sessionId: string,
     sessionKey: string,
+    runtimeImageDigest?: string,
   ): Promise<SessionRuntime> {
     const projectId = project.projectId;
     const projectHash = NodeCrypto.createHash("sha256")
@@ -1107,7 +1118,13 @@ export class NotebookRuntimeManager {
     for (const [index, book] of project.books.entries()) {
       args.push("--mount", `type=bind,src=${book},dst=/books/book-${index},readonly`);
     }
-    args.push(this.#image);
+    if (runtimeImageDigest !== undefined && !/^sha256:[0-9a-f]{64}$/.test(runtimeImageDigest)) {
+      throw new NotebookRuntimeManagerError({
+        reason: "runtime-unavailable",
+        message: "Notebook runtime launch requires an exact immutable image digest.",
+      });
+    }
+    args.push(runtimeImageDigest ?? this.#image);
 
     let ownedContainer: OwnedSessionContainer | undefined;
     try {

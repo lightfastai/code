@@ -162,6 +162,43 @@ function notebookRecords(input: {
   });
 }
 
+function traceRecordsForEvents(
+  runId: StudyTraceRunId,
+  middleEvents: ReadonlyArray<StudyTraceEvent>,
+) {
+  const events: ReadonlyArray<{ readonly timestamp: string; readonly event: StudyTraceEvent }> = [
+    {
+      timestamp: "2026-07-17T00:00:00.000Z",
+      event: {
+        type: "run_started",
+        skill: { name: "notebook-agent-tools", version: "1", contentHash: "e".repeat(64) },
+        runtime: {
+          adapter: { id: "mcp/notebook", version: "1" },
+          model: { provider: "test", name: "deterministic" },
+          tools: [{ name: "notebook_execute_cell", version: "1" }],
+        },
+        documentIds: [],
+        caseId: "notebook-safety",
+      },
+    },
+    ...middleEvents.map((event, index) => ({
+      timestamp: `2026-07-17T00:00:00.${String(50 + index).padStart(3, "0")}Z`,
+      event,
+    })),
+    {
+      timestamp: "2026-07-17T00:00:00.100Z",
+      event: { type: "run_finished", reason: "error" },
+    },
+  ];
+
+  let previousHash: string | null = null;
+  return events.map(({ timestamp, event }, sequence) => {
+    const record = buildStudyTraceRecord({ runId, sequence, timestamp, previousHash, event });
+    previousHash = record.hash;
+    return record;
+  });
+}
+
 const dataset: StudyEvalDataset = {
   version: 1,
   id: "notebook-agent-v1",
@@ -280,6 +317,92 @@ it.layer(NodeServices.layer)("NotebookStudyEval", (it) => {
         assert.isFalse(candidate.passed);
         assert.isFalse(comparison.promotable);
         assert.include(comparison.reasons.join(" "), "Candidate does not pass");
+      }),
+    ),
+  );
+
+  it.effect("requires every notebook assertion to match one coherent execution", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const temp = yield* fileSystem.makeTempDirectoryScoped({ prefix: "notebook-coherent-" });
+        const paths = yield* resolveStudyLoopPaths(yield* resolveStudyLibraryPaths(temp));
+        const runId = "notebook-partial-events" as StudyTraceRunId;
+        const source = notebookRecords({ runId, cleanupSucceeded: true })[1]?.event;
+        if (source?.type !== "notebook_execution") throw new Error("missing notebook execution");
+        const outputOnly = {
+          ...source,
+          binding: { ...source.binding, revisionId: "9".repeat(64) },
+          cleanup: { ...source.cleanup, succeeded: false },
+        } as const;
+        const cleanupOnly = {
+          ...source,
+          outputHash: "0".repeat(64),
+          durationMs: 500,
+        } as const;
+        yield* writeStudyTraceFile({
+          tracePath: yield* studyTracePath(paths, runId),
+          records: traceRecordsForEvents(runId, [outputOnly, cleanupOnly]),
+        });
+
+        const report = yield* evaluateStudyDataset({
+          paths,
+          dataset,
+          traceBindings: { "notebook-safety": runId },
+          reportId: "notebook-coherent-report",
+          evaluatedAt: "2026-07-17T00:01:00.000Z",
+        });
+
+        assert.isFalse(report.passed);
+        assert.isTrue(report.cases[0]?.assertions.some(({ passed }) => !passed));
+      }),
+    ),
+  );
+
+  it.effect("accepts explicit denied-attempt evidence for permission required false", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const temp = yield* fileSystem.makeTempDirectoryScoped({ prefix: "notebook-denied-" });
+        const paths = yield* resolveStudyLoopPaths(yield* resolveStudyLibraryPaths(temp));
+        const runId = "notebook-denied-attempt" as StudyTraceRunId;
+        yield* writeStudyTraceFile({
+          tracePath: yield* studyTracePath(paths, runId),
+          records: traceRecordsForEvents(runId, [
+            {
+              type: "notebook_permission",
+              operation: "execute_cell",
+              threadId: "thread-denied",
+              providerSessionId: "provider-session-denied",
+              permissionGranted: false,
+            } as StudyTraceEvent,
+          ]),
+        });
+        const deniedDataset: StudyEvalDataset = {
+          version: 1,
+          id: "notebook-denied-v1",
+          title: "Notebook execution denial",
+          cases: [
+            {
+              id: "notebook-safety",
+              title: "Notebook execution is denied",
+              split: "holdout",
+              assertions: [
+                { type: "notebook_permission", operation: "execute_cell", required: false },
+              ],
+            },
+          ],
+        };
+
+        const report = yield* evaluateStudyDataset({
+          paths,
+          dataset: deniedDataset,
+          traceBindings: { "notebook-safety": runId },
+          reportId: "notebook-denied-report",
+          evaluatedAt: "2026-07-17T00:01:00.000Z",
+        });
+
+        assert.isTrue(report.passed);
       }),
     ),
   );

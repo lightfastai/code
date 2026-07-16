@@ -31,6 +31,7 @@ import {
   writeStudyTraceFile,
 } from "../../../study/StudyTraceStore.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import * as McpSessionRegistry from "../../McpSessionRegistry.ts";
 import { NotebookToolkit } from "./tools.ts";
 
 const publicationError = (): ArtifactPublishError =>
@@ -116,7 +117,8 @@ const withAgentTools = Effect.fn("NotebookToolkit.withAgentTools")(function* <A>
     tools: ReturnType<typeof makeNotebookAgentTools>,
   ) => Effect.Effect<A, NotebookAgentToolError>,
 ) {
-  const invocation = yield* McpInvocationContext.requireNotebookExecution();
+  const invocation = yield* McpInvocationContext.McpInvocationContext;
+  const sessions = yield* McpSessionRegistry.McpSessionRegistry;
   const store = yield* NotebookRevisionStore;
   const runtime = yield* NotebookRuntimeManagerService;
   const config = yield* ServerConfig.ServerConfig;
@@ -141,6 +143,7 @@ const withAgentTools = Effect.fn("NotebookToolkit.withAgentTools")(function* <A>
           kernelLockHash: NOTEBOOK_RUNTIME_KERNEL_LOCK_HASH,
         })),
       ),
+    withExecutionStart: (scope, start) => sessions.withNotebookExecutionStart(scope, start),
     writeTrace: (runId, records) =>
       Effect.gen(function* () {
         const tracePath = yield* studyTracePath(loopPaths, runId);
