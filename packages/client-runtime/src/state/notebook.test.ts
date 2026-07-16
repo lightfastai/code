@@ -2,6 +2,7 @@ import type { NotebookExecutionEvent } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  NOTEBOOK_RUNTIME_MAX_CELLS,
   NOTEBOOK_RUNTIME_OUTPUT_MAX_BYTES_PER_CELL,
   NOTEBOOK_RUNTIME_OUTPUT_MAX_BYTES_PER_SESSION,
   NOTEBOOK_RUNTIME_OUTPUT_MAX_ENTRIES_PER_CELL,
@@ -13,6 +14,7 @@ import {
   createNotebookRuntimeState,
   failNotebookCellExecution,
   failNotebookRuntime,
+  pruneNotebookRuntimeCell,
 } from "./notebook.ts";
 
 type EventInput<T = NotebookExecutionEvent> = T extends NotebookExecutionEvent
@@ -573,12 +575,11 @@ describe("notebook runtime client state", () => {
     expect(state.runningCellIds.has("code-counted")).toBe(true);
   });
 
-  it("keeps execution identity state bounded by cells across long-running sessions", () => {
-    const cellIds = ["code-0", "code-1", "code-2", "code-3"] as const;
+  it("bounds every runtime cell index across 2,000 unique accepted executions", () => {
     const events: NotebookExecutionEvent[] = [];
     let sequence = 0;
     for (let index = 0; index < 2_000; index += 1) {
-      const cellId = cellIds[index % cellIds.length] ?? "code-0";
+      const cellId = `code-${index}`;
       const executionId = `execution-${index}`;
       events.push(
         event(++sequence, {
@@ -599,8 +600,94 @@ describe("notebook runtime client state", () => {
     const state = applyNotebookExecutionEvents(createNotebookRuntimeState(), events);
 
     expect(state.activeExecutionIdByCell.size).toBe(0);
-    expect(state.latestExecutionIdByCell.size).toBe(cellIds.length);
     expect(state.runningCellIds.size).toBe(0);
+    expect(state.latestExecutionIdByCell.size).toBeLessThanOrEqual(NOTEBOOK_RUNTIME_MAX_CELLS);
+    expect(state.executionCountByCell.size).toBeLessThanOrEqual(NOTEBOOK_RUNTIME_MAX_CELLS);
+    expect(state.outputsByCell.size).toBeLessThanOrEqual(NOTEBOOK_RUNTIME_MAX_CELLS);
+    expect(state.outputKeysByCell.size).toBeLessThanOrEqual(NOTEBOOK_RUNTIME_MAX_CELLS);
+    expect(state.outputEntryBytesByCell.size).toBeLessThanOrEqual(NOTEBOOK_RUNTIME_MAX_CELLS);
+    expect(state.outputBytesByCell.size).toBeLessThanOrEqual(NOTEBOOK_RUNTIME_MAX_CELLS);
+    expect(state.outputRetentionByCell.size).toBeLessThanOrEqual(NOTEBOOK_RUNTIME_MAX_CELLS);
+    expect(state.outputCellRecency).toHaveLength(NOTEBOOK_RUNTIME_MAX_CELLS);
+    expect(state.runtimeCellRecency).toHaveLength(NOTEBOOK_RUNTIME_MAX_CELLS);
+    expect(state.latestExecutionIdByCell.has("code-0")).toBe(false);
+    expect(state.latestExecutionIdByCell.get("code-1999")).toBe("execution-1999");
+  });
+
+  it("never evicts active cells and deterministically evicts the oldest inactive cell", () => {
+    let state = beginNotebookCellExecution(
+      createNotebookRuntimeState(),
+      "code-active",
+      "execution-active",
+    );
+    let sequence = 0;
+    for (let index = 0; index < NOTEBOOK_RUNTIME_MAX_CELLS; index += 1) {
+      state = applyNotebookExecutionEvents(state, [
+        event(++sequence, {
+          type: "accepted",
+          commandType: "execute",
+          executionId: `execution-${index}`,
+          cellId: `code-${index}`,
+        }),
+        event(++sequence, {
+          type: "kernel",
+          executionId: `execution-${index}`,
+          cellId: `code-${index}`,
+          state: "idle",
+        }),
+      ]);
+    }
+
+    expect(state.activeExecutionIdByCell.get("code-active")).toBe("execution-active");
+    expect(state.runningCellIds.has("code-active")).toBe(true);
+    expect(state.latestExecutionIdByCell.has("code-active")).toBe(true);
+    expect(state.latestExecutionIdByCell.has("code-0")).toBe(false);
+    expect(state.latestExecutionIdByCell.has(`code-${NOTEBOOK_RUNTIME_MAX_CELLS - 1}`)).toBe(true);
+    expect(state.runtimeCellRecency).toHaveLength(NOTEBOOK_RUNTIME_MAX_CELLS);
+  });
+
+  it("prunes every runtime index and accounting entry for a removed cell", () => {
+    const cellId = "code-removed";
+    const executionId = "execution-removed";
+    const events: NotebookExecutionEvent[] = [
+      event(1, { type: "accepted", commandType: "execute", executionId, cellId }),
+      event(2, { type: "execution", executionId, cellId, executionCount: 7 }),
+    ];
+    for (let index = 0; index <= NOTEBOOK_RUNTIME_OUTPUT_MAX_ENTRIES_PER_CELL; index += 1) {
+      events.push(
+        event(events.length + 1, {
+          type: "display",
+          executionId,
+          cellId,
+          data: { "text/plain": `output-${index}` },
+          metadata: {},
+        }),
+      );
+    }
+    events.push(
+      event(events.length + 1, {
+        type: "kernel",
+        executionId,
+        cellId,
+        state: "idle",
+      }),
+    );
+    const populated = applyNotebookExecutionEvents(createNotebookRuntimeState(), events);
+    expect(populated.outputRetentionByCell.has(cellId)).toBe(true);
+
+    const state = pruneNotebookRuntimeCell(populated, cellId);
+
+    expect(state.activeExecutionIdByCell.has(cellId)).toBe(false);
+    expect(state.latestExecutionIdByCell.has(cellId)).toBe(false);
+    expect(state.executionCountByCell.has(cellId)).toBe(false);
+    expect(state.runningCellIds.has(cellId)).toBe(false);
+    expect(state.outputsByCell.has(cellId)).toBe(false);
+    expect(state.outputKeysByCell.has(cellId)).toBe(false);
+    expect(state.outputEntryBytesByCell.has(cellId)).toBe(false);
+    expect(state.outputBytesByCell.has(cellId)).toBe(false);
+    expect(state.outputRetentionByCell.has(cellId)).toBe(false);
+    expect(state.outputCellRecency).not.toContain(cellId);
+    expect(state.runtimeCellRecency).not.toContain(cellId);
   });
 
   it("bounds output entries and bytes per cell and per session with stable retained keys", () => {

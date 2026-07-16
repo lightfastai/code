@@ -58,6 +58,7 @@ const controller = (overrides: Partial<NotebookArtifactController>): NotebookArt
     connect: vi.fn(),
     recover: vi.fn(),
     executeCell: vi.fn(),
+    removeCell: vi.fn(),
     interrupt: vi.fn(),
     restart: vi.fn(),
     dispose: vi.fn(),

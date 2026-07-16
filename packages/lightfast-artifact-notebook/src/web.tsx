@@ -104,6 +104,7 @@ export interface NotebookArtifactController {
   readonly executeCell: (
     request: RuntimeRequest & { readonly cellId: string; readonly code: string },
   ) => Promise<void>;
+  readonly removeCell: (request: RuntimeRequest & { readonly cellId: string }) => void;
   readonly interrupt: (request: RuntimeRequest) => Promise<void>;
   readonly restart: (request: RuntimeRequest) => Promise<void>;
   readonly dispose: (request: RuntimeRequest) => Promise<void>;

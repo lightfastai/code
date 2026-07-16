@@ -19,6 +19,7 @@ import {
 import {
   appendNotebookCellOutput,
   createNotebookOutputState,
+  pruneNotebookOutputCell,
   resetNotebookCellOutputs,
   type NotebookOutputState,
   type NotebookRuntimeOutput,
@@ -41,11 +42,15 @@ export type NotebookKernelStatus =
   | "restarted"
   | "terminated";
 
+// Keep this aligned with the immutable notebook document's NOTEBOOK_MAX_CELLS.
+export const NOTEBOOK_RUNTIME_MAX_CELLS = 1_000;
+
 export interface NotebookRuntimeState extends NotebookOutputState {
   readonly kernelStatus: NotebookKernelStatus;
   readonly lastSequence: number;
   readonly recoveryAfterSequence: number | null;
   readonly pendingEvents: ReadonlyMap<number, NotebookExecutionEvent>;
+  readonly runtimeCellRecency: ReadonlyArray<string>;
   readonly activeExecutionIdByCell: ReadonlyMap<string, string>;
   readonly latestExecutionIdByCell: ReadonlyMap<string, string>;
   readonly executionCountByCell: ReadonlyMap<string, number | null>;
@@ -59,6 +64,7 @@ export function createNotebookRuntimeState(): NotebookRuntimeState {
     lastSequence: 0,
     recoveryAfterSequence: null,
     pendingEvents: new Map(),
+    runtimeCellRecency: [],
     activeExecutionIdByCell: new Map(),
     latestExecutionIdByCell: new Map(),
     ...createNotebookOutputState(),
@@ -67,6 +73,51 @@ export function createNotebookRuntimeState(): NotebookRuntimeState {
     error: null,
   };
 }
+
+export function pruneNotebookRuntimeCell(
+  state: NotebookRuntimeState,
+  cellId: string,
+): NotebookRuntimeState {
+  const activeExecutionIdByCell = new Map(state.activeExecutionIdByCell);
+  const latestExecutionIdByCell = new Map(state.latestExecutionIdByCell);
+  const executionCountByCell = new Map(state.executionCountByCell);
+  const runningCellIds = new Set(state.runningCellIds);
+  activeExecutionIdByCell.delete(cellId);
+  latestExecutionIdByCell.delete(cellId);
+  executionCountByCell.delete(cellId);
+  runningCellIds.delete(cellId);
+  return {
+    ...state,
+    ...pruneNotebookOutputCell(state, cellId),
+    activeExecutionIdByCell,
+    latestExecutionIdByCell,
+    executionCountByCell,
+    runningCellIds,
+    runtimeCellRecency: state.runtimeCellRecency.filter((candidate) => candidate !== cellId),
+  };
+}
+
+const retainNotebookRuntimeCell = (
+  state: NotebookRuntimeState,
+  cellId: string,
+): NotebookRuntimeState => {
+  let next: NotebookRuntimeState = {
+    ...state,
+    runtimeCellRecency: [
+      ...state.runtimeCellRecency.filter((candidate) => candidate !== cellId),
+      cellId,
+    ],
+  };
+  while (next.runtimeCellRecency.length > NOTEBOOK_RUNTIME_MAX_CELLS) {
+    const victim = next.runtimeCellRecency.find(
+      (candidate) =>
+        !next.activeExecutionIdByCell.has(candidate) && !next.runningCellIds.has(candidate),
+    );
+    if (victim === undefined) break;
+    next = pruneNotebookRuntimeCell(next, victim);
+  }
+  return next;
+};
 
 export function beginNotebookCellExecution(
   state: NotebookRuntimeState,
@@ -79,14 +130,17 @@ export function beginNotebookCellExecution(
   latestExecutionIdByCell.set(cellId, executionId);
   const runningCellIds = new Set(state.runningCellIds);
   runningCellIds.add(cellId);
-  return {
-    ...state,
-    activeExecutionIdByCell,
-    latestExecutionIdByCell,
-    kernelStatus: "busy",
-    runningCellIds,
-    error: null,
-  };
+  return retainNotebookRuntimeCell(
+    {
+      ...state,
+      activeExecutionIdByCell,
+      latestExecutionIdByCell,
+      kernelStatus: "busy",
+      runningCellIds,
+      error: null,
+    },
+    cellId,
+  );
 }
 
 const appendOutput = (
@@ -158,7 +212,7 @@ const finishAllExecutions = (
   runningCellIds: new Set(),
 });
 
-const applyOrderedEvent = (
+const applyOrderedEventWithoutCellBounds = (
   state: NotebookRuntimeState,
   event: NotebookExecutionEvent,
 ): NotebookRuntimeState => {
@@ -262,6 +316,16 @@ const applyOrderedEvent = (
     event.sequence,
   );
   return finishExecution(erroredState, event, "idle");
+};
+
+const applyOrderedEvent = (
+  state: NotebookRuntimeState,
+  event: NotebookExecutionEvent,
+): NotebookRuntimeState => {
+  const next = applyOrderedEventWithoutCellBounds(state, event);
+  return next === state || event.executionId === undefined
+    ? next
+    : retainNotebookRuntimeCell(next, event.cellId);
 };
 
 export function applyNotebookExecutionEvents(

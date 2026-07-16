@@ -95,6 +95,30 @@ export const createNotebookOutputState = (): NotebookOutputState => ({
   outputRetentionByCell: new Map(),
 });
 
+export const pruneNotebookOutputCell = (
+  state: NotebookOutputState,
+  cellId: string,
+): NotebookOutputState => {
+  const outputsByCell = new Map(state.outputsByCell);
+  const outputKeysByCell = new Map(state.outputKeysByCell);
+  const outputEntryBytesByCell = new Map(state.outputEntryBytesByCell);
+  const outputBytesByCell = new Map(state.outputBytesByCell);
+  const outputRetentionByCell = new Map(state.outputRetentionByCell);
+  outputsByCell.delete(cellId);
+  outputKeysByCell.delete(cellId);
+  outputEntryBytesByCell.delete(cellId);
+  outputBytesByCell.delete(cellId);
+  outputRetentionByCell.delete(cellId);
+  return {
+    outputsByCell,
+    outputKeysByCell,
+    outputEntryBytesByCell,
+    outputBytesByCell,
+    outputCellRecency: state.outputCellRecency.filter((candidate) => candidate !== cellId),
+    outputRetentionByCell,
+  };
+};
+
 export const resetNotebookCellOutputs = (
   state: NotebookOutputState,
   cellId: string,

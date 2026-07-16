@@ -14,7 +14,6 @@ import {
   isNotebookWorkingCopyDirty,
   moveNotebookCell,
   openLatestNotebookRevision,
-  removeNotebookCell,
   updateNotebookCellSource,
   viewReferencedNotebookRevision,
   type NotebookWorkingCopy,
@@ -29,6 +28,7 @@ import {
   replaceNotebookWorkingCopyRuntime,
 } from "./runtime-lifecycle.ts";
 import { NotebookCell } from "./NotebookCell.tsx";
+import { removeNotebookCellFromRenderer } from "./notebook-cell-removal.ts";
 import { planNotebookOutputRendering } from "./notebook-output-rendering.ts";
 import { type NotebookRuntimeView, useNotebookWebBindings } from "./web.tsx";
 
@@ -549,7 +549,18 @@ export function NotebookArtifactEnvelopeRenderer({
                   onDuplicate={() =>
                     setWorking(duplicateNotebookCell(working, cell.id, () => nextId("cell")))
                   }
-                  onRemove={() => setWorking(removeNotebookCell(working, cell.id))}
+                  onRemove={() =>
+                    setWorking(
+                      removeNotebookCellFromRenderer(working, cell.id, (cellId) =>
+                        bindings.controller.removeCell({
+                          scope: bindings.scope,
+                          sessionId,
+                          cellId,
+                          onState: onRuntimeState,
+                        }),
+                      ),
+                    )
+                  }
                 />
               );
             })}

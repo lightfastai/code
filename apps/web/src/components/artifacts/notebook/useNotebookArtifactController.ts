@@ -21,6 +21,7 @@ import {
   executeNotebookCellWithState,
   notebookExecutionFailureMessage,
 } from "./notebookExecutionController";
+import { removeNotebookCellRuntimeWithState } from "./notebookCellController";
 import { NotebookRuntimeCache } from "./notebookRuntimeCache";
 
 const runtimeStates = new NotebookRuntimeCache<NotebookRuntimeState>();
@@ -269,6 +270,12 @@ export function useNotebookArtifactController(): NotebookArtifactController {
           recover: () => recoverSession(request),
         });
       },
+      removeCell: (request) =>
+        removeNotebookCellRuntimeWithState({
+          cellId: request.cellId,
+          current: () => current(request),
+          publish: (state) => publish(request, state),
+        }),
       interrupt: (request) => control(request, "interrupt", interrupt),
       restart: (request) => control(request, "restart", restart),
       dispose: (request) => control(request, "dispose", dispose),
