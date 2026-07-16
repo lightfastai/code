@@ -206,6 +206,35 @@ class DeferredHealthRuntimeClient extends FakeRuntimeClient {
   }
 }
 
+class DeferredDisposeRuntimeClient extends FakeRuntimeClient {
+  readonly disposeStarted: Promise<void>;
+  readonly #markDisposeStarted: () => void;
+  readonly #disposeReleased: Promise<void>;
+  readonly releaseDispose: () => void;
+
+  constructor() {
+    super();
+    let markDisposeStarted!: () => void;
+    let releaseDispose!: () => void;
+    this.disposeStarted = new Promise((resolve) => {
+      markDisposeStarted = resolve;
+    });
+    this.#disposeReleased = new Promise((resolve) => {
+      releaseDispose = resolve;
+    });
+    this.#markDisposeStarted = markDisposeStarted;
+    this.releaseDispose = releaseDispose;
+  }
+
+  override async dispose(
+    input: RuntimeSessionCommandRequest,
+  ): Promise<readonly NotebookExecutionEvent[]> {
+    this.#markDisposeStarted();
+    await this.#disposeReleased;
+    return super.dispose(input);
+  }
+}
+
 class PartialFailureRuntimeClient extends FakeRuntimeClient {
   readonly recoveryMode: "events" | "replay";
   eventsAfterCount = 0;
@@ -669,6 +698,61 @@ it("waits for session removal before reopening in a new container", async () => 
   expect(clients).toHaveLength(2);
   expect(clients.map((client) => client.openedSessionIds)).toEqual([["session-1"], ["session-1"]]);
   await manager.close();
+});
+
+it("waits for held sidecar disposal and removal before reopening", async () => {
+  const heldClient = new DeferredDisposeRuntimeClient();
+  let clientIndex = 0;
+  const { clients, docker, manager } = await makeHarness({
+    createClient: () => {
+      clientIndex += 1;
+      return clientIndex === 1 ? heldClient : new FakeRuntimeClient();
+    },
+  });
+  const firstOpen = {
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  } as const;
+  const disposeInput = {
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "dispose-1",
+  } as const;
+  await manager.open(firstOpen);
+  const disposing = manager.dispose(disposeInput);
+  await heldClient.disposeStarted;
+  const duplicateDisposing = manager.dispose(disposeInput);
+  let reopenSettled = false;
+  const reopening = manager.open(firstOpen).then((events) => {
+    reopenSettled = true;
+    return events;
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  const settledBeforeDispose = reopenSettled;
+  heldClient.releaseDispose();
+  const [disposed, duplicateDisposed, reopened] = await Promise.all([
+    disposing,
+    duplicateDisposing,
+    reopening,
+  ]);
+
+  try {
+    expect(settledBeforeDispose).toBe(false);
+    expect(duplicateDisposed).toEqual(disposed);
+    expect(heldClient.disposeCount).toBe(1);
+    expect(reopened.at(-1)).toMatchObject({ type: "kernel", state: "idle" });
+    expect(docker.runCount).toBe(2);
+    expect(clients).toHaveLength(2);
+    expect(clients.map((client) => client.openedSessionIds)).toEqual([
+      ["session-1"],
+      ["session-1"],
+    ]);
+  } finally {
+    await manager.close();
+  }
 });
 
 it("rejects non-monotonic sidecar events", async () => {

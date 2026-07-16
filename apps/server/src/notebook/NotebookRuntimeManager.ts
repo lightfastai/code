@@ -131,6 +131,7 @@ interface CommandCacheEntry {
 
 interface DisposeTombstone {
   readonly fingerprint: string;
+  readonly containerId: string;
   readonly events: ReadonlyArray<NotebookExecutionEvent>;
   readonly expiresAt: number;
   readonly retainedBytes: number;
@@ -179,6 +180,13 @@ interface ProjectState {
 interface SessionStart {
   readonly projectId: string;
   readonly promise: Promise<SessionRuntime>;
+}
+
+interface SessionDisposal {
+  readonly projectId: string;
+  readonly containerId: string;
+  readonly fingerprint: string;
+  readonly promise: Promise<ReadonlyArray<NotebookExecutionEvent>>;
 }
 
 class ExecutionEventQueue implements AsyncIterable<NotebookExecutionEvent> {
@@ -283,6 +291,7 @@ export class NotebookRuntimeManager {
   readonly #sessions = new Map<string, SessionRuntime>();
   readonly #containers = new Map<string, OwnedSessionContainer>();
   readonly #sessionStarts = new Map<string, SessionStart>();
+  readonly #sessionDisposals = new Map<string, SessionDisposal>();
   readonly #sessionRemovals = new Map<string, Promise<void>>();
   readonly #projectRemovals = new Map<string, Promise<void>>();
   readonly #disposeTombstones = new Map<string, DisposeTombstone>();
@@ -343,6 +352,8 @@ export class NotebookRuntimeManager {
     const activeRemoval = this.#projectRemovals.get(input.projectId);
     if (activeRemoval !== undefined) await activeRemoval;
     const sessionKey = this.#sessionKey(input.projectId, input.sessionId);
+    const activeDisposal = this.#sessionDisposals.get(sessionKey);
+    if (activeDisposal !== undefined) await activeDisposal.promise;
     const activeSessionRemoval = this.#sessionRemovals.get(sessionKey);
     if (activeSessionRemoval !== undefined) await activeSessionRemoval;
     this.#assertCanStart();
@@ -500,22 +511,36 @@ export class NotebookRuntimeManager {
     if (tombstone !== undefined) {
       this.#assertFingerprint(tombstone, fingerprint);
       const disposedRuntime = this.#sessions.get(sessionKey);
-      if (disposedRuntime?.session.disposed === true) {
-        await this.#removeContainer(disposedRuntime);
+      if (
+        disposedRuntime?.session.disposed === true &&
+        disposedRuntime.containerId === tombstone.containerId
+      ) {
+        return this.#startSessionDisposal(sessionKey, disposedRuntime, fingerprint, async () => {
+          await this.#removeContainer(disposedRuntime);
+          return tombstone.events;
+        });
       }
       return tombstone.events;
     }
     const { project, runtime, session } = this.#getSession(input, true);
-    project.lastUsedAt = this.#now();
-    const events = await this.#runCached(session, input.commandId, fingerprint, "dispose", () =>
-      runtime.client.dispose(input),
-    );
-    if (this.#commandResultState(events, input.commandId, "dispose") === "accepted-terminal") {
-      session.disposed = true;
-      this.#cacheDisposeTombstone(sessionKey, input.commandId, fingerprint, events);
-      await this.#removeContainer(runtime);
-    }
-    return events;
+    return this.#startSessionDisposal(sessionKey, runtime, fingerprint, async () => {
+      project.lastUsedAt = this.#now();
+      const events = await this.#runCached(session, input.commandId, fingerprint, "dispose", () =>
+        runtime.client.dispose(input),
+      );
+      if (this.#commandResultState(events, input.commandId, "dispose") === "accepted-terminal") {
+        session.disposed = true;
+        this.#cacheDisposeTombstone(
+          sessionKey,
+          input.commandId,
+          fingerprint,
+          runtime.containerId,
+          events,
+        );
+        await this.#removeContainer(runtime);
+      }
+      return events;
+    });
   }
 
   eventsAfter(
@@ -535,6 +560,9 @@ export class NotebookRuntimeManager {
 
   async close(): Promise<void> {
     this.#closing = true;
+    await Promise.allSettled(
+      [...this.#sessionDisposals.values()].map((disposal) => disposal.promise),
+    );
     await Promise.allSettled([...this.#sessionStarts.values()].map((start) => start.promise));
     await this.#removeContainers([...this.#containers.values()]);
     this.#disposeTombstones.clear();
@@ -799,6 +827,39 @@ export class NotebookRuntimeManager {
     return NodeCrypto.createHash("sha256").update(JSON.stringify({ command, input })).digest("hex");
   }
 
+  async #startSessionDisposal(
+    sessionKey: string,
+    runtime: SessionRuntime,
+    fingerprint: string,
+    run: () => Promise<ReadonlyArray<NotebookExecutionEvent>>,
+  ): Promise<ReadonlyArray<NotebookExecutionEvent>> {
+    const activeDisposal = this.#sessionDisposals.get(sessionKey);
+    if (activeDisposal !== undefined) {
+      if (activeDisposal.containerId !== runtime.containerId) {
+        throw new NotebookRuntimeManagerError({
+          reason: "runtime-unavailable",
+          message: "A different notebook session generation is being disposed.",
+        });
+      }
+      this.#assertFingerprint(activeDisposal, fingerprint);
+      return activeDisposal.promise;
+    }
+    const promise = Promise.resolve().then(run);
+    this.#sessionDisposals.set(sessionKey, {
+      projectId: runtime.projectId,
+      containerId: runtime.containerId,
+      fingerprint,
+      promise,
+    });
+    try {
+      return await promise;
+    } finally {
+      if (this.#sessionDisposals.get(sessionKey)?.promise === promise) {
+        this.#sessionDisposals.delete(sessionKey);
+      }
+    }
+  }
+
   #disposeTombstoneKey(sessionKey: string, commandId: string): string {
     return JSON.stringify([sessionKey, commandId]);
   }
@@ -812,6 +873,7 @@ export class NotebookRuntimeManager {
     sessionKey: string,
     commandId: string,
     fingerprint: string,
+    containerId: string,
     events: ReadonlyArray<NotebookExecutionEvent>,
   ): void {
     this.#pruneDisposeTombstones();
@@ -819,10 +881,11 @@ export class NotebookRuntimeManager {
     this.#deleteDisposeTombstone(key);
     const retainedEvents = [...events];
     const retainedBytes = Buffer.byteLength(
-      JSON.stringify({ key, fingerprint, events: retainedEvents }),
+      JSON.stringify({ key, fingerprint, containerId, events: retainedEvents }),
     );
     this.#disposeTombstones.set(key, {
       fingerprint,
+      containerId,
       events: retainedEvents,
       expiresAt: this.#now() + this.#disposeTombstoneTtlMs,
       retainedBytes,
@@ -1123,6 +1186,10 @@ export class NotebookRuntimeManager {
   }
 
   async #removeProjectOnce(project: ProjectState): Promise<void> {
+    const disposals = [...this.#sessionDisposals.values()]
+      .filter((disposal) => disposal.projectId === project.projectId)
+      .map((disposal) => disposal.promise);
+    await Promise.allSettled(disposals);
     const starts = [...this.#sessionStarts.values()]
       .filter((start) => start.projectId === project.projectId)
       .map((start) => start.promise);
