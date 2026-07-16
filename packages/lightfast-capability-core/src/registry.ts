@@ -14,6 +14,16 @@ export const defineArtifact = <const Kind extends string, Payload>(
   definition: ArtifactDefinition<Kind, Payload>,
 ) => definition;
 
+export type ArtifactRegistrationIdentity = {
+  readonly kind: string;
+  readonly schemaVersion: number;
+};
+
+export const artifactRegistrationKey = ({
+  kind,
+  schemaVersion,
+}: ArtifactRegistrationIdentity): string => `${kind}@${schemaVersion}`;
+
 export class ArtifactRegistryError extends Schema.TaggedErrorClass<ArtifactRegistryError>()(
   "ArtifactRegistryError",
   {

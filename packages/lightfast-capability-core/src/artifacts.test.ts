@@ -3,7 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { ARTIFACT_PAYLOAD_MAX_BYTES, type ArtifactEnvelope } from "./artifacts.ts";
-import { ArtifactRegistry, defineArtifact } from "./registry.ts";
+import { artifactRegistrationKey, ArtifactRegistry, defineArtifact } from "./registry.ts";
 
 const cardDefinition = defineArtifact({
   kind: "example.card",
@@ -26,6 +26,10 @@ const card = (overrides: Partial<ArtifactEnvelope> = {}): ArtifactEnvelope => ({
 });
 
 describe("ArtifactRegistry", () => {
+  it("builds one stable kind and schema-version registration key", () => {
+    expect(artifactRegistrationKey(cardDefinition)).toBe("example.card@1");
+  });
+
   it.effect("validates registered payloads and namespaced capabilities", () =>
     Effect.gen(function* () {
       const resolved = yield* registry.decodeForClient(card());
@@ -38,9 +42,9 @@ describe("ArtifactRegistry", () => {
 
   it.effect("rejects invalid registered payloads", () =>
     Effect.gen(function* () {
-      const result = yield* Effect.exit(registry.decodeForClient(card({ payload: { body: 42 } })));
+      const error = yield* Effect.flip(registry.decodeForClient(card({ payload: { body: 42 } })));
 
-      assert.strictEqual(result._tag, "Failure");
+      assert.strictEqual(error.reason, "invalid-payload");
     }),
   );
 
@@ -61,29 +65,29 @@ describe("ArtifactRegistry", () => {
 
   it.effect("rejects unknown server publications", () =>
     Effect.gen(function* () {
-      const result = yield* Effect.exit(
+      const error = yield* Effect.flip(
         registry.decodeForPublication(card({ kind: "vendor.future" })),
       );
 
-      assert.strictEqual(result._tag, "Failure");
+      assert.strictEqual(error.reason, "unknown-kind");
     }),
   );
 
   it.effect("rejects unsupported versions of registered kinds", () =>
     Effect.gen(function* () {
-      const result = yield* Effect.exit(registry.decodeForClient(card({ schemaVersion: 2 })));
+      const error = yield* Effect.flip(registry.decodeForClient(card({ schemaVersion: 2 })));
 
-      assert.strictEqual(result._tag, "Failure");
+      assert.strictEqual(error.reason, "unsupported-version");
     }),
   );
 
   it.effect("rejects capabilities not declared by the registered definition", () =>
     Effect.gen(function* () {
-      const result = yield* Effect.exit(
+      const error = yield* Effect.flip(
         registry.decodeForPublication(card({ capabilities: ["example.card:edit"] })),
       );
 
-      assert.strictEqual(result._tag, "Failure");
+      assert.strictEqual(error.reason, "unsupported-capability");
     }),
   );
 });
@@ -91,21 +95,21 @@ describe("ArtifactRegistry", () => {
 describe("ArtifactEnvelope", () => {
   it.effect("rejects payloads above the serialized size limit", () =>
     Effect.gen(function* () {
-      const result = yield* Effect.exit(
+      const error = yield* Effect.flip(
         registry.decodeForClient(
           card({ payload: { body: "x".repeat(ARTIFACT_PAYLOAD_MAX_BYTES + 1) } }),
         ),
       );
 
-      assert.strictEqual(result._tag, "Failure");
+      assert.strictEqual(error.reason, "invalid-envelope");
     }),
   );
 
   it.effect("rejects oversized common metadata", () =>
     Effect.gen(function* () {
-      const result = yield* Effect.exit(registry.decodeForClient(card({ title: "x".repeat(256) })));
+      const error = yield* Effect.flip(registry.decodeForClient(card({ title: "x".repeat(256) })));
 
-      assert.strictEqual(result._tag, "Failure");
+      assert.strictEqual(error.reason, "invalid-envelope");
     }),
   );
 

@@ -1,4 +1,5 @@
 import type { ChatArtifactAttachment } from "@t3tools/contracts";
+import { artifactRegistrationKey } from "@t3tools/lightfast-capability-core/registry";
 import { lazy, Suspense } from "react";
 
 import { lightfastWebCapabilities } from "~/lightfast/register";
@@ -10,13 +11,13 @@ type ArtifactRendererProps = {
 const artifactRenderers = new Map(
   [...lightfastWebCapabilities.artifactRenderers].map(([key, registration]) => [
     key,
-    lazy(registration.load),
+    lazy(registration.loadRenderer),
   ]),
 );
 
 export function hasArtifactRenderer(kind: string): boolean {
   return [...lightfastWebCapabilities.artifactRenderers.values()].some(
-    (registration) => registration.kind === kind,
+    (registration) => registration.artifactDefinition.kind === kind,
   );
 }
 
@@ -29,9 +30,7 @@ function UnsupportedArtifact({ artifact }: ArtifactRendererProps) {
 }
 
 export function ArtifactRenderer({ artifact }: ArtifactRendererProps) {
-  const Renderer = artifactRenderers.get(
-    lightfastWebCapabilities.artifactRendererKey(artifact.kind, artifact.schemaVersion),
-  );
+  const Renderer = artifactRenderers.get(artifactRegistrationKey(artifact));
   if (Renderer === undefined) return <UnsupportedArtifact artifact={artifact} />;
 
   return (

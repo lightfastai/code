@@ -7,6 +7,10 @@
       "types": "./src/contracts.ts",
       "import": "./src/contracts.ts"
     },
+    "./mobile": {
+      "types": "./src/mobile.ts",
+      "import": "./src/mobile.ts"
+    },
     "./server": {
       "types": "./src/server.ts",
       "import": "./src/server.ts"
