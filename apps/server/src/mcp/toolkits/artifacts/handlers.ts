@@ -10,6 +10,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 
+import { lightfastServerCapabilities } from "../../../lightfast/register.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ArtifactToolkit } from "./tools.ts";
@@ -25,22 +26,16 @@ const publishScene = (input: PublishScene3DArtifactInput) =>
     const artifactId = `artifact-${id}`;
     const messageId = `artifact-message-${id}`;
     const createdAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+    const artifact = yield* lightfastServerCapabilities.artifactRegistry.decodeForPublication(
+      lightfastServerCapabilities.scene3D.makeArtifact(artifactId, input),
+    );
 
     yield* orchestration.dispatch({
       type: "thread.message.artifact.publish",
       commandId: CommandId.make(`artifact-command-${id}`),
       threadId: invocation.threadId,
       messageId: MessageId.make(messageId),
-      artifact: {
-        type: "artifact",
-        id: artifactId,
-        kind: "3d-scene",
-        schemaVersion: 1,
-        title: input.title,
-        payload: input.payload,
-        ...(input.provenance !== undefined ? { provenance: input.provenance } : {}),
-        capabilities: input.capabilities ?? ["orbit", "pan", "zoom", "reset-camera"],
-      },
+      artifact: artifact.artifact,
       createdAt,
     });
 

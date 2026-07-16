@@ -25,6 +25,8 @@
     "test": "vp test run"
   },
   "dependencies": {
+    "@t3tools/lightfast-artifact-3d": "workspace:*",
+    "@t3tools/lightfast-capability-core": "workspace:*",
     "effect": "catalog:"
   },
   "devDependencies": {

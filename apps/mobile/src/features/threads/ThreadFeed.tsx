@@ -98,6 +98,7 @@ import {
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 import { ThreadWorkGroupToggle, ThreadWorkLog } from "./thread-work-log";
 import { useMarkdownCodeHighlight } from "./markdownCodeHighlightState";
+import { describeMobileArtifact } from "../../lightfast/register";
 import { useAssetUrl } from "../../state/assets";
 import { resolveWorkspaceRelativeFilePath } from "../files/filePath";
 
@@ -1012,9 +1013,7 @@ function MessageArtifactCard({ artifact }: { readonly artifact: ChatArtifactAtta
           {artifact.title}
         </Text>
       </View>
-      <Text className="text-xs text-foreground-muted">
-        Interactive 3D scene · open on Mac or web to rotate and explore
-      </Text>
+      <Text className="text-xs text-foreground-muted">{describeMobileArtifact(artifact)}</Text>
     </View>
   );
 }

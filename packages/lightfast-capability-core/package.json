@@ -1,0 +1,26 @@
+{
+  "name": "@t3tools/lightfast-capability-core",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./artifacts": {
+      "types": "./src/artifacts.ts",
+      "import": "./src/artifacts.ts"
+    },
+    "./registry": {
+      "types": "./src/registry.ts",
+      "import": "./src/registry.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsgo --noEmit",
+    "test": "vp test run"
+  },
+  "dependencies": {
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}

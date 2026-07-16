@@ -1,7 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { ChatArtifactAttachment } from "./artifacts.ts";
+import { ChatArtifactAttachment, ChatScene3DArtifact } from "./artifacts.ts";
 
 import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
@@ -52,6 +52,7 @@ const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationComma
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
 const decodeChatArtifactAttachment = Schema.decodeUnknownEffect(ChatArtifactAttachment);
+const decodeChatScene3DArtifact = Schema.decodeUnknownEffect(ChatScene3DArtifact);
 const decodeOrchestrationMessage = Schema.decodeUnknownEffect(OrchestrationMessage);
 
 it.effect("decodes a versioned semantic 3D scene artifact", () =>
@@ -92,25 +93,25 @@ it.effect("decodes a versioned semantic 3D scene artifact", () =>
       },
     });
 
-    assert.strictEqual(artifact.kind, "3d-scene");
-    assert.strictEqual(artifact.payload.objects.length, 2);
+    const scene = yield* decodeChatScene3DArtifact(artifact);
+    assert.strictEqual(scene.kind, "3d-scene");
+    assert.strictEqual(scene.payload.objects.length, 2);
   }),
 );
 
-it.effect("rejects unversioned executable artifact payloads", () =>
+it.effect("preserves open envelopes while strict artifact schemas reject executable payloads", () =>
   Effect.gen(function* () {
-    const result = yield* Effect.exit(
-      decodeChatArtifactAttachment({
-        type: "artifact",
-        id: "artifact-script",
-        kind: "3d-scene",
-        schemaVersion: 1,
-        title: "Unsafe scene",
-        payload: {
-          objects: [{ type: "javascript", id: "script", source: "alert(1)" }],
-        },
-      }),
-    );
+    const artifact = yield* decodeChatArtifactAttachment({
+      type: "artifact",
+      id: "artifact-script",
+      kind: "3d-scene",
+      schemaVersion: 1,
+      title: "Unsafe scene",
+      payload: {
+        objects: [{ type: "javascript", id: "script", source: "alert(1)" }],
+      },
+    });
+    const result = yield* Effect.exit(decodeChatScene3DArtifact(artifact));
 
     assert.strictEqual(result._tag, "Failure");
   }),
