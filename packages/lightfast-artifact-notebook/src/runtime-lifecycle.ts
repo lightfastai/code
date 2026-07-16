@@ -40,6 +40,15 @@ type LifecycleRequest = {
   readonly isActive?: () => boolean;
 };
 
+const guardedRuntimeState = (request: LifecycleRequest) => (state: NotebookRuntimeView) => {
+  if (request.isActive?.() ?? true) request.onState(state);
+};
+
+export const isNotebookRevisionSwitchDisabled = (
+  pendingAction: string | null,
+  runningCellIds: ReadonlySet<string>,
+): boolean => pendingAction !== null || runningCellIds.size > 0;
+
 export async function loadNotebookRevisionAndConnect(
   request: LifecycleRequest & {
     readonly documentId: string;
@@ -62,7 +71,7 @@ export async function loadNotebookRevisionAndConnect(
     await request.controller.connect({
       scope: request.scope,
       ...target,
-      onState: request.onState,
+      onState: guardedRuntimeState(request),
     });
     return isActive() ? working : null;
   } catch (cause) {
@@ -73,6 +82,36 @@ export async function loadNotebookRevisionAndConnect(
 
 const targetsEqual = (left: NotebookRuntimeTarget, right: NotebookRuntimeTarget): boolean =>
   left.sessionId === right.sessionId && left.kernelName === right.kernelName;
+
+export async function replaceNotebookWorkingCopyRuntime(
+  request: LifecycleRequest & {
+    readonly working: NotebookWorkingCopy;
+    readonly nextWorking: NotebookWorkingCopy;
+  },
+): Promise<NotebookWorkingCopy | null> {
+  const isActive = request.isActive ?? (() => true);
+  const previousTarget = notebookRuntimeTarget(request.working);
+  const nextTarget = notebookRuntimeTarget(request.nextWorking);
+  const identityChanged = !targetsEqual(previousTarget, nextTarget);
+  const onState = guardedRuntimeState(request);
+
+  if (identityChanged) {
+    await request.controller.dispose({
+      scope: request.scope,
+      sessionId: previousTarget.sessionId,
+      onState,
+    });
+  }
+  if (!isActive()) return null;
+
+  request.onWorkingCopy(request.nextWorking);
+  await request.controller.connect({
+    scope: request.scope,
+    ...nextTarget,
+    onState,
+  });
+  return isActive() ? request.nextWorking : null;
+}
 
 export async function importNotebookRevisionAndReplaceRuntime(
   request: LifecycleRequest & {
@@ -87,23 +126,8 @@ export async function importNotebookRevisionAndReplaceRuntime(
   );
   if (!isActive()) return null;
 
-  const next = applyImportedNotebookRevision(request.working, revision);
-  const previousTarget = notebookRuntimeTarget(request.working);
-  const nextTarget = notebookRuntimeTarget(next);
-  if (!targetsEqual(previousTarget, nextTarget)) {
-    await request.controller.dispose({
-      scope: request.scope,
-      sessionId: previousTarget.sessionId,
-      onState: request.onState,
-    });
-  }
-  if (!isActive()) return null;
-
-  request.onWorkingCopy(next);
-  await request.controller.connect({
-    scope: request.scope,
-    ...nextTarget,
-    onState: request.onState,
+  return replaceNotebookWorkingCopyRuntime({
+    ...request,
+    nextWorking: applyImportedNotebookRevision(request.working, revision),
   });
-  return isActive() ? next : null;
 }

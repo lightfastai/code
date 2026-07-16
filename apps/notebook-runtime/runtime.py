@@ -793,6 +793,18 @@ class RuntimeService:
         session = self._get_session(session_id)
         return [event for event in session.events if event["sequence"] > after_sequence]
 
+    def event_replay(self, session_id: str, after_sequence: int) -> dict[str, Any]:
+        session = self._get_session(session_id)
+        baseline_sequence = (
+            session.events[0]["sequence"] - 1 if session.events else session.sequence
+        )
+        return {
+            "baselineSequence": baseline_sequence,
+            "events": [
+                event for event in session.events if event["sequence"] > after_sequence
+            ],
+        }
+
     async def close(self) -> None:
         sessions = list(self.sessions.values())
         self.sessions.clear()
@@ -916,10 +928,10 @@ def create_app(*, service: RuntimeService, token: str, bootstrap_enabled: bool =
         }
 
     @app.get("/v1/sessions/{session_id}/events", dependencies=[auth])
-    async def events_endpoint(session_id: str, afterSequence: int = 0) -> dict[str, list[Event]]:
+    async def events_endpoint(session_id: str, afterSequence: int = 0) -> dict[str, Any]:
         if afterSequence < 0:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid afterSequence.")
-        return {"events": service.events_after(session_id, afterSequence)}
+        return service.event_replay(session_id, afterSequence)
 
     return app
 

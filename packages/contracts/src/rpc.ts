@@ -148,6 +148,7 @@ import {
   NotebookExecutionControlInput,
   NotebookExecutionEvent,
   NotebookExecutionEvents,
+  NotebookExecutionReplay,
   NotebookRevisionCreateInput,
   NotebookRevisionExportResult,
   NotebookRevisionImportInput,
@@ -522,7 +523,7 @@ export const WsNotebookSessionDisposeRpc = Rpc.make(WS_METHODS.notebookSessionDi
 
 export const WsNotebookSessionEventsRpc = Rpc.make(WS_METHODS.notebookSessionEvents, {
   payload: NotebookSessionEventsInput,
-  success: NotebookExecutionEvents,
+  success: NotebookExecutionReplay,
   error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
 });
 

@@ -1,5 +1,6 @@
 import {
   applyNotebookExecutionEvents,
+  applyNotebookExecutionReplay,
   beginNotebookCellExecution,
   clearNotebookRuntimeError,
   createNotebookRuntimeState,
@@ -17,8 +18,9 @@ import { useMemo } from "react";
 
 import { notebookEnvironment } from "~/state/notebook";
 import { useAtomCommand } from "~/state/use-atom-command";
+import { NotebookRuntimeCache } from "./notebookRuntimeCache";
 
-const runtimeStates = new Map<string, NotebookRuntimeState>();
+const runtimeStates = new NotebookRuntimeCache<NotebookRuntimeState>();
 const connectionAttempts = new Map<string, Promise<void>>();
 
 let commandSequence = 0;
@@ -95,6 +97,10 @@ export function useNotebookArtifactController(): NotebookArtifactController {
       request: RuntimeRequest,
       nextEvents: Parameters<typeof applyNotebookExecutionEvents>[1],
     ) => publish(request, applyNotebookExecutionEvents(current(request), nextEvents));
+    const applyReplay = (
+      request: RuntimeRequest,
+      replay: Parameters<typeof applyNotebookExecutionReplay>[1],
+    ) => publish(request, applyNotebookExecutionReplay(current(request), replay));
     const fail = (request: RuntimeRequest, cause: unknown): never => {
       const message = cause instanceof Error ? cause.message : String(cause);
       publish(request, failNotebookRuntime(current(request), message));
@@ -111,7 +117,7 @@ export function useNotebookArtifactController(): NotebookArtifactController {
           },
         }),
       );
-      apply(request, recovered);
+      applyReplay(request, recovered);
     };
     const control = async (
       request: RuntimeRequest,
@@ -134,6 +140,11 @@ export function useNotebookArtifactController(): NotebookArtifactController {
         );
       } catch (cause) {
         fail(request, cause);
+      }
+      if (type === "dispose") {
+        const key = runtimeKey(request.scope, request.sessionId);
+        runtimeStates.delete(key);
+        connectionAttempts.delete(key);
       }
     };
 

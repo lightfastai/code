@@ -4,7 +4,9 @@ import * as NodeHttp from "node:http";
 
 import {
   NotebookExecutionEvent,
+  NotebookExecutionReplay,
   type NotebookExecutionEvent as ExecutionEvent,
+  type NotebookExecutionReplay as ExecutionReplay,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
@@ -13,6 +15,7 @@ const NDJSON_LINE_LIMIT_BYTES = 1024 * 1024;
 const NDJSON_AGGREGATE_LIMIT_BYTES = 16 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 130_000;
 const decodeEvent = Schema.decodeUnknownSync(NotebookExecutionEvent);
+const decodeReplay = Schema.decodeUnknownSync(NotebookExecutionReplay);
 
 export interface RuntimeSessionOpenRequest {
   readonly sessionId: string;
@@ -42,10 +45,7 @@ export interface NotebookRuntimeClientLike {
   ) => Promise<ReadonlyArray<ExecutionEvent>>;
   readonly restart: (input: RuntimeSessionCommandRequest) => Promise<ReadonlyArray<ExecutionEvent>>;
   readonly dispose: (input: RuntimeSessionCommandRequest) => Promise<ReadonlyArray<ExecutionEvent>>;
-  readonly eventsAfter: (
-    sessionId: string,
-    afterSequence: number,
-  ) => Promise<ReadonlyArray<ExecutionEvent>>;
+  readonly eventsAfter: (sessionId: string, afterSequence: number) => Promise<ExecutionReplay>;
 }
 
 export class NotebookRuntimeClientError extends Error {
@@ -181,11 +181,24 @@ export class NotebookRuntimeClient implements NotebookRuntimeClientLike {
     );
   }
 
-  eventsAfter(sessionId: string, afterSequence: number): Promise<ReadonlyArray<ExecutionEvent>> {
-    return this.#eventRequest(
+  eventsAfter(sessionId: string, afterSequence: number): Promise<ExecutionReplay> {
+    return this.#replayRequest(
       "GET",
       `/v1/sessions/${encodeURIComponent(sessionId)}/events?afterSequence=${afterSequence}`,
     );
+  }
+
+  async #replayRequest(method: "GET", path: string): Promise<ExecutionReplay> {
+    const response = await this.#request(method, path);
+    const payload = await this.#readJson(response);
+    try {
+      return decodeReplay(payload);
+    } catch {
+      throw new NotebookRuntimeClientError({
+        reason: "protocol",
+        message: "Notebook runtime returned an invalid replay response.",
+      });
+    }
   }
 
   async #eventRequest(
@@ -386,11 +399,23 @@ export class DockerExecNotebookRuntimeClient implements NotebookRuntimeClientLik
     );
   }
 
-  eventsAfter(sessionId: string, afterSequence: number): Promise<ReadonlyArray<ExecutionEvent>> {
-    return this.#eventRequest(
+  eventsAfter(sessionId: string, afterSequence: number): Promise<ExecutionReplay> {
+    return this.#replayRequest(
       "GET",
       `/v1/sessions/${encodeURIComponent(sessionId)}/events?afterSequence=${afterSequence}`,
     );
+  }
+
+  async #replayRequest(method: "GET", path: string): Promise<ExecutionReplay> {
+    const chunks = await this.#readResponse(method, path);
+    try {
+      return decodeReplay(JSON.parse(Buffer.concat(chunks).toString()));
+    } catch {
+      throw new NotebookRuntimeClientError({
+        reason: "protocol",
+        message: "Notebook runtime returned an invalid replay response.",
+      });
+    }
   }
 
   async #eventRequest(
@@ -398,6 +423,20 @@ export class DockerExecNotebookRuntimeClient implements NotebookRuntimeClientLik
     path: string,
     body?: unknown,
   ): Promise<ReadonlyArray<ExecutionEvent>> {
+    const chunks = await this.#readResponse(method, path, body);
+    try {
+      const decoded = JSON.parse(Buffer.concat(chunks).toString()) as { readonly events?: unknown };
+      if (!Array.isArray(decoded.events)) throw new Error("missing events");
+      return decoded.events.map((event) => decodeEvent(event));
+    } catch {
+      throw new NotebookRuntimeClientError({
+        reason: "protocol",
+        message: "Notebook runtime returned malformed execution data.",
+      });
+    }
+  }
+
+  async #readResponse(method: "GET" | "POST", path: string, body?: unknown): Promise<Buffer[]> {
     const chunks: Buffer[] = [];
     let total = 0;
     for await (const chunk of this.#request(method, path, body)) {
@@ -410,16 +449,7 @@ export class DockerExecNotebookRuntimeClient implements NotebookRuntimeClientLik
       }
       chunks.push(Buffer.from(chunk));
     }
-    try {
-      const decoded = JSON.parse(Buffer.concat(chunks).toString()) as { readonly events?: unknown };
-      if (!Array.isArray(decoded.events)) throw new Error("missing events");
-      return decoded.events.map((event) => decodeEvent(event));
-    } catch {
-      throw new NotebookRuntimeClientError({
-        reason: "protocol",
-        message: "Notebook runtime returned malformed execution data.",
-      });
-    }
+    return chunks;
   }
 
   #decodeEvent(line: string): ExecutionEvent {

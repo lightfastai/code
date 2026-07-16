@@ -90,10 +90,12 @@ describe("notebook working copy", () => {
     expect(isNotebookWorkingCopyDirty(saved)).toBe(false);
 
     const referencedView = viewReferencedNotebookRevision(saved);
+    expect(referencedView.documentId).toBe(original.documentId);
     expect(referencedView.document.cells[1]?.source).toBe("print(1)");
     expect(referencedView.latestRevision?.revisionId).toBe(hash("c"));
 
     const latestView = openLatestNotebookRevision(referencedView);
+    expect(latestView.documentId).toBe(savedRevision.documentId);
     expect(latestView.document.cells[1]?.source).toBe("print('saved')");
   });
 });

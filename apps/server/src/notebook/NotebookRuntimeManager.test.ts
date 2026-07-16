@@ -3,7 +3,7 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
-import type { NotebookExecutionEvent } from "@t3tools/contracts";
+import type { NotebookExecutionEvent, NotebookExecutionReplay } from "@t3tools/contracts";
 import { afterEach, expect, it } from "vite-plus/test";
 
 import type {
@@ -152,11 +152,8 @@ class FakeRuntimeClient implements NotebookRuntimeClientLike {
     return this.control(input, "dispose", "terminated");
   }
 
-  async eventsAfter(
-    _sessionId: string,
-    _afterSequence: number,
-  ): Promise<readonly NotebookExecutionEvent[]> {
-    return [];
+  async eventsAfter(_sessionId: string, afterSequence: number): Promise<NotebookExecutionReplay> {
+    return { baselineSequence: afterSequence, events: [] };
   }
 
   private control(
@@ -281,18 +278,61 @@ class PartialFailureRuntimeClient extends FakeRuntimeClient {
 
   override async eventsAfter(
     _sessionId: string,
-    _afterSequence: number,
-  ): Promise<readonly NotebookExecutionEvent[]> {
+    afterSequence: number,
+  ): Promise<NotebookExecutionReplay> {
     this.eventsAfterCount += 1;
     if (this.recoveryMode === "events") {
-      return [
-        event("session-1", "execute-recover", 6, "kernel", {
-          executionId: "execution-recover",
+      return {
+        baselineSequence: afterSequence,
+        events: [
+          event("session-1", "execute-recover", 6, "kernel", {
+            executionId: "execution-recover",
+            state: "idle",
+          }),
+        ],
+      };
+    }
+    return { baselineSequence: afterSequence, events: [] };
+  }
+}
+
+class TrimmedReplayRuntimeClient extends FakeRuntimeClient {
+  eventsAfterCount = 0;
+  sideEffectCount = 0;
+
+  override async *execute(input: RuntimeExecuteRequest): AsyncIterable<NotebookExecutionEvent> {
+    this.executeCount += 1;
+    this.sideEffectCount += 1;
+    yield event(input.sessionId, input.commandId, 6, "accepted", {
+      executionId: input.executionId,
+      cellId: input.cellId,
+      commandType: "execute",
+    });
+    throw new NotebookRuntimeClientError({
+      reason: "transport",
+      message: "injected transport failure after history trimming",
+    });
+  }
+
+  override async eventsAfter(
+    sessionId: string,
+    _afterSequence: number,
+  ): Promise<NotebookExecutionReplay> {
+    this.eventsAfterCount += 1;
+    return {
+      baselineSequence: 5,
+      events: [
+        event(sessionId, "execute-trimmed", 6, "accepted", {
+          executionId: "execution-trimmed",
+          cellId: "cell-trimmed",
+          commandType: "execute",
+        }),
+        event(sessionId, "execute-trimmed", 7, "kernel", {
+          executionId: "execution-trimmed",
           state: "idle",
         }),
-      ];
-    }
-    return [];
+      ],
+    };
   }
 }
 
@@ -307,6 +347,7 @@ const event = (
 
 const makeHarness = async (options?: {
   readonly idleTimeoutMs?: number;
+  readonly eventHistoryLimit?: number;
   readonly eventHistoryLimitBytes?: number;
   readonly commandCacheLimitBytes?: number;
   readonly disposeTombstoneLimit?: number;
@@ -337,6 +378,9 @@ const makeHarness = async (options?: {
     now: options?.now ?? (() => now),
     idleTimeoutMs: options?.idleTimeoutMs ?? 60_000,
     readinessTimeoutMs: options?.readinessTimeoutMs ?? 50,
+    ...(options?.eventHistoryLimit === undefined
+      ? {}
+      : { eventHistoryLimit: options.eventHistoryLimit }),
     ...(options?.eventHistoryLimitBytes === undefined
       ? {}
       : { eventHistoryLimitBytes: options.eventHistoryLimitBytes }),
@@ -443,9 +487,9 @@ it("streams in sequence and replays completed command IDs without re-execution",
   expect(first[0]).toMatchObject({ type: "accepted", cellId: "cell-1" });
   expect(replay).toEqual(first);
   expect(clients[0]?.executeCount).toBe(1);
-  expect(manager.eventsAfter("project-1", "session-1", 4).map((item) => item.sequence)).toEqual([
-    5, 6,
-  ]);
+  expect(
+    manager.eventsAfter("project-1", "session-1", 4).events.map((item) => item.sequence),
+  ).toEqual([5, 6]);
   await manager.close();
 });
 
@@ -809,13 +853,38 @@ it("bounds retained event history and command results by serialized bytes", asyn
   } as const;
 
   await Array.fromAsync(manager.execute(request));
-  const retained = manager.eventsAfter("project-1", "session-1", 0);
+  const retained = manager.eventsAfter("project-1", "session-1", 0).events;
   expect(
     retained.reduce((bytes, item) => bytes + Buffer.byteLength(JSON.stringify(item)), 0),
   ).toBeLessThanOrEqual(eventLimit);
 
   await Array.fromAsync(manager.execute(request));
   expect(clients[0]?.executeCount).toBe(2);
+  await manager.close();
+});
+
+it("reports the authoritative baseline when event history retained only a suffix", async () => {
+  const { manager } = await makeHarness({ eventHistoryLimit: 3 });
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+  await Array.fromAsync(
+    manager.execute({
+      projectId: "project-1",
+      sessionId: "session-1",
+      commandId: "execute-1",
+      executionId: "execution-1",
+      cellId: "cell-1",
+      code: "print('ok')",
+    }),
+  );
+
+  const replay = manager.eventsAfter("project-1", "session-1", 0);
+  expect(replay.baselineSequence).toBe(3);
+  expect(replay.events.map((item) => item.sequence)).toEqual([4, 5, 6]);
   await manager.close();
 });
 
@@ -1099,6 +1168,38 @@ it("finishes a partial execution directly from queried sidecar history", async (
   expect(client.eventsAfterCount).toBe(1);
   expect(client.executeCount).toBe(1);
   expect(client.sideEffectCount).toBe(1);
+  await manager.close();
+});
+
+it("rebases manager sequence state when sidecar history retained only a suffix", async () => {
+  const client = new TrimmedReplayRuntimeClient();
+  const { manager } = await makeHarness({ createClient: () => client });
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+
+  const events = await Array.fromAsync(
+    manager.execute({
+      projectId: "project-1",
+      sessionId: "session-1",
+      commandId: "execute-trimmed",
+      executionId: "execution-trimmed",
+      cellId: "cell-trimmed",
+      code: "side_effect()",
+    }),
+  );
+
+  expect(events.map((item) => item.sequence)).toEqual([6, 7]);
+  expect(client.eventsAfterCount).toBe(1);
+  expect(client.executeCount).toBe(1);
+  expect(client.sideEffectCount).toBe(1);
+  expect(manager.eventsAfter("project-1", "session-1", 0)).toMatchObject({
+    baselineSequence: 5,
+    events: [{ sequence: 6 }, { sequence: 7 }],
+  });
   await manager.close();
 });
 

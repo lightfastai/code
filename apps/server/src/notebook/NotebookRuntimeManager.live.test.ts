@@ -198,7 +198,7 @@ liveIt(
       );
 
       const beforeDisconnect = await primaryRuntime.client.eventsAfter("live-session", 0);
-      const afterSequence = beforeDisconnect.at(-1)?.sequence ?? 0;
+      const afterSequence = beforeDisconnect.events.at(-1)?.sequence ?? 0;
       const disconnectRequest = {
         sessionId: "live-session",
         commandId: "disconnect-live",
@@ -216,7 +216,7 @@ liveIt(
         "live-session",
         afterSequence,
       );
-      expect(recoveredEvents).toEqual(
+      expect(recoveredEvents.events).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ commandId: "disconnect-live", type: "result" }),
           expect.objectContaining({ commandId: "disconnect-live", type: "kernel", state: "idle" }),

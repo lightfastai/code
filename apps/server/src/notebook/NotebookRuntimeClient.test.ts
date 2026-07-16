@@ -91,7 +91,9 @@ it("supports session lifecycle and resume endpoints", async () => {
         body: Buffer.concat(chunks).toString(),
       });
       response.writeHead(200, { "content-type": "application/json" });
-      response.end('{"events":[]}');
+      response.end(
+        request.url?.includes("/events?") ? '{"baselineSequence":12,"events":[]}' : '{"events":[]}',
+      );
     });
   });
   const client = new NotebookRuntimeClient({ baseUrl, token: "token" });
@@ -99,7 +101,7 @@ it("supports session lifecycle and resume endpoints", async () => {
   await client.open({ sessionId: "session-1", commandId: "open-1", kernelName: "python3" });
   await client.interrupt({ sessionId: "session-1", commandId: "interrupt-1" });
   await client.restart({ sessionId: "session-1", commandId: "restart-1" });
-  await client.eventsAfter("session-1", 12);
+  const replay = await client.eventsAfter("session-1", 12);
   await client.dispose({ sessionId: "session-1", commandId: "dispose-1" });
 
   expect(requests.map(({ method, url }) => `${method} ${url}`)).toEqual([
@@ -109,6 +111,7 @@ it("supports session lifecycle and resume endpoints", async () => {
     "GET /v1/sessions/session-1/events?afterSequence=12",
     "POST /v1/sessions/session-1/dispose",
   ]);
+  expect(replay).toEqual({ baselineSequence: 12, events: [] });
 });
 
 it("returns bounded protocol errors without response bodies or tokens", async () => {

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   applyNotebookExecutionEvents,
+  applyNotebookExecutionReplay,
   beginNotebookCellExecution,
   clearNotebookRuntimeError,
   createNotebookRuntimeState,
@@ -22,6 +23,54 @@ const event = (sequence: number, value: EventInput): NotebookExecutionEvent =>
   }) as NotebookExecutionEvent;
 
 describe("notebook runtime client state", () => {
+  it("rebases a trimmed replay suffix while preserving later live gap detection", () => {
+    let state = applyNotebookExecutionReplay(createNotebookRuntimeState(), {
+      baselineSequence: 3,
+      events: [
+        event(4, {
+          type: "accepted",
+          commandType: "execute",
+          executionId: "execution-1",
+          cellId: "code-1",
+        }),
+        event(5, {
+          type: "stream",
+          executionId: "execution-1",
+          name: "stdout",
+          text: "replayed ",
+        }),
+      ],
+    });
+
+    expect(state.lastSequence).toBe(5);
+    expect(state.outputsByCell.get("code-1")?.[0]).toMatchObject({ text: "replayed " });
+
+    state = applyNotebookExecutionEvents(state, [
+      event(7, {
+        type: "stream",
+        executionId: "execution-1",
+        name: "stdout",
+        text: "last",
+      }),
+    ]);
+    expect(state.lastSequence).toBe(5);
+    expect(state.recoveryAfterSequence).toBe(5);
+
+    state = applyNotebookExecutionEvents(state, [
+      event(6, {
+        type: "stream",
+        executionId: "execution-1",
+        name: "stdout",
+        text: "then ",
+      }),
+    ]);
+    expect(state.lastSequence).toBe(7);
+    expect(state.recoveryAfterSequence).toBeNull();
+    expect(state.outputsByCell.get("code-1")?.[0]).toMatchObject({
+      text: "replayed then last",
+    });
+  });
+
   it("reconstructs execution-to-cell identity from replayed accepted events", () => {
     const state = applyNotebookExecutionEvents(createNotebookRuntimeState(), [
       event(1, {

@@ -3,11 +3,21 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import type { NotebookRevision } from "./contracts.ts";
 import {
   importNotebookRevisionAndReplaceRuntime,
+  isNotebookRevisionSwitchDisabled,
   loadNotebookRevisionAndConnect,
   notebookRuntimeTarget,
+  replaceNotebookWorkingCopyRuntime,
 } from "./runtime-lifecycle.ts";
-import { createNotebookWorkingCopy } from "./working-copy.ts";
-import type { NotebookArtifactController, NotebookProjectScope } from "./web.tsx";
+import {
+  createNotebookWorkingCopy,
+  openLatestNotebookRevision,
+  viewReferencedNotebookRevision,
+} from "./working-copy.ts";
+import type {
+  NotebookArtifactController,
+  NotebookProjectScope,
+  NotebookRuntimeView,
+} from "./web.tsx";
 
 const hash = (character: string) => character.repeat(64);
 const revision = (
@@ -91,11 +101,11 @@ describe("notebook runtime lifecycle", () => {
       scope,
       sessionId: "notebook-original-doc",
       kernelName: "python3",
-      onState,
+      onState: expect.any(Function),
     });
   });
 
-  it("disposes the previous runtime and connects using imported document identity", async () => {
+  it("transitions import to referenced revision and back to latest through matching runtimes", async () => {
     const original = revision("original-doc", {
       name: "python3",
       displayName: "Python 3",
@@ -117,18 +127,45 @@ describe("notebook runtime lifecycle", () => {
       }),
     });
 
-    const next = await importNotebookRevisionAndReplaceRuntime({
+    let current = createNotebookWorkingCopy(original);
+    const importedWorking = await importNotebookRevisionAndReplaceRuntime({
       controller: bindings,
       scope,
-      working: createNotebookWorkingCopy(original),
+      working: current,
       ipynbJson: "{}",
       onState,
-      onWorkingCopy: (working) => order.push(`working:${working.documentId}`),
+      onWorkingCopy: (working) => {
+        current = working;
+        order.push(`working:${working.documentId}`);
+      },
     });
 
-    expect(next).not.toBeNull();
-    if (next === null) throw new Error("Expected imported notebook working copy.");
-    expect(notebookRuntimeTarget(next)).toEqual({
+    expect(importedWorking).not.toBeNull();
+    if (importedWorking === null) throw new Error("Expected imported notebook working copy.");
+    await replaceNotebookWorkingCopyRuntime({
+      controller: bindings,
+      scope,
+      working: current,
+      nextWorking: viewReferencedNotebookRevision(current),
+      onState,
+      onWorkingCopy: (working) => {
+        current = working;
+        order.push(`working:${working.documentId}`);
+      },
+    });
+    await replaceNotebookWorkingCopyRuntime({
+      controller: bindings,
+      scope,
+      working: current,
+      nextWorking: openLatestNotebookRevision(current),
+      onState,
+      onWorkingCopy: (working) => {
+        current = working;
+        order.push(`working:${working.documentId}`);
+      },
+    });
+
+    expect(notebookRuntimeTarget(current)).toEqual({
       sessionId: "notebook-imported-doc",
       kernelName: "julia-1.11",
     });
@@ -136,6 +173,66 @@ describe("notebook runtime lifecycle", () => {
       "dispose:notebook-original-doc",
       "working:imported-doc",
       "connect:notebook-imported-doc:julia-1.11",
+      "dispose:notebook-imported-doc",
+      "working:original-doc",
+      "connect:notebook-original-doc:python3",
+      "dispose:notebook-original-doc",
+      "working:imported-doc",
+      "connect:notebook-imported-doc:julia-1.11",
     ]);
+  });
+
+  it("blocks revision switches during an action or cell execution", () => {
+    expect(isNotebookRevisionSwitchDisabled(null, new Set())).toBe(false);
+    expect(isNotebookRevisionSwitchDisabled("import", new Set())).toBe(true);
+    expect(isNotebookRevisionSwitchDisabled(null, new Set(["code-1"]))).toBe(true);
+  });
+
+  it("drops stale runtime callbacks after a load generation is invalidated", async () => {
+    const loaded = revision("original-doc", {
+      name: "python3",
+      displayName: "Python 3",
+      language: "python",
+    });
+    let active = true;
+    let connectedRequest: Parameters<NotebookArtifactController["connect"]>[0] | undefined;
+    let releaseConnect!: () => void;
+    const connectReleased = new Promise<void>((resolve) => {
+      releaseConnect = resolve;
+    });
+    const states: NotebookRuntimeView[] = [];
+    const bindings = controller({
+      readRevision: vi.fn(async () => loaded),
+      connect: vi.fn(async (request) => {
+        connectedRequest = request;
+        await connectReleased;
+      }),
+    });
+    const loading = loadNotebookRevisionAndConnect({
+      controller: bindings,
+      scope,
+      documentId: loaded.documentId,
+      revisionId: loaded.revisionId,
+      onState: (state) => states.push(state),
+      onLoadError: vi.fn(),
+      onWorkingCopy: vi.fn(),
+      isActive: () => active,
+    });
+
+    await vi.waitFor(() => expect(connectedRequest).toBeDefined());
+    active = false;
+    connectedRequest?.onState({
+      kernelStatus: "idle",
+      lastSequence: 10,
+      recoveryAfterSequence: null,
+      outputsByCell: new Map(),
+      executionCountByCell: new Map(),
+      runningCellIds: new Set(),
+      error: null,
+    });
+    releaseConnect();
+    await loading;
+
+    expect(states).toEqual([]);
   });
 });

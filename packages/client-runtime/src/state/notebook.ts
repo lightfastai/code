@@ -1,6 +1,7 @@
 import {
   type NotebookCellExecuteInput,
   type NotebookExecutionEvent,
+  type NotebookExecutionReplay,
   type NotebookRevision,
   WS_METHODS,
 } from "@t3tools/contracts";
@@ -201,6 +202,28 @@ export function applyNotebookExecutionEvents(
     pendingEvents: pending,
     recoveryAfterSequence: pending.size > 0 ? lastSequence : null,
   };
+}
+
+export function applyNotebookExecutionReplay(
+  state: NotebookRuntimeState,
+  replay: NotebookExecutionReplay,
+): NotebookRuntimeState {
+  if (replay.baselineSequence <= state.lastSequence) {
+    return applyNotebookExecutionEvents(state, replay.events);
+  }
+
+  const pendingEvents = new Map(
+    [...state.pendingEvents].filter(([sequence]) => sequence > replay.baselineSequence),
+  );
+  return applyNotebookExecutionEvents(
+    {
+      ...state,
+      lastSequence: replay.baselineSequence,
+      pendingEvents,
+      recoveryAfterSequence: pendingEvents.size > 0 ? replay.baselineSequence : null,
+    },
+    replay.events,
+  );
 }
 
 export function failNotebookRuntime(

@@ -131,6 +131,12 @@ export type NotebookSessionEventsInput = typeof NotebookSessionEventsInput.Type;
 export const NotebookExecutionEvents = Schema.Array(NotebookExecutionEvent);
 export type NotebookExecutionEvents = typeof NotebookExecutionEvents.Type;
 
+export const NotebookExecutionReplay = Schema.Struct({
+  baselineSequence: NonNegativeInt,
+  events: NotebookExecutionEvents,
+});
+export type NotebookExecutionReplay = typeof NotebookExecutionReplay.Type;
+
 export class NotebookRuntimeError extends Schema.TaggedErrorClass<NotebookRuntimeError>()(
   "NotebookRuntimeError",
   {

@@ -615,6 +615,25 @@ async def test_resume_returns_only_events_after_sequence(service: RuntimeService
     assert [event["sequence"] for event in events] == [4, 5]
 
 
+async def test_resume_api_reports_trimmed_history_baseline(service: RuntimeService) -> None:
+    service.event_history_limit = 2
+    await open_session(service)
+    await service.interrupt("session-1", "interrupt-resume")
+    app = create_app(service=service, token="test-token")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runtime") as client:
+        response = await client.get(
+            "/v1/sessions/session-1/events?afterSequence=0",
+            headers={"authorization": "Bearer test-token"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "baselineSequence": 3,
+        "events": service.events_after("session-1", 0),
+    }
+
+
 async def test_api_requires_bearer_authentication(service: RuntimeService) -> None:
     app = create_app(service=service, token="test-token")
     transport = httpx.ASGITransport(app=app)

@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
-import { NotebookCellExecuteInput, NotebookExecutionEvent } from "./notebook.ts";
+import {
+  NotebookCellExecuteInput,
+  NotebookExecutionEvent,
+  NotebookExecutionReplay,
+} from "./notebook.ts";
 
 const decodeExecuteInput = Schema.decodeUnknownSync(NotebookCellExecuteInput);
 const decodeExecutionEvent = Schema.decodeUnknownSync(NotebookExecutionEvent);
+const decodeExecutionReplay = Schema.decodeUnknownSync(NotebookExecutionReplay);
 
 describe("notebook execution contracts", () => {
   it("requires a cell ID on execute requests and accepted execute events", () => {
@@ -40,5 +45,24 @@ describe("notebook execution contracts", () => {
       const { cellId: _, ...missingCellId } = acceptedEvent;
       decodeExecutionEvent(missingCellId);
     }).toThrow();
+  });
+
+  it("requires an explicit retained-history baseline on replay responses", () => {
+    const replay = decodeExecutionReplay({
+      baselineSequence: 3,
+      events: [
+        {
+          type: "kernel",
+          sessionId: "session-1",
+          commandId: "command-4",
+          sequence: 4,
+          state: "idle",
+        },
+      ],
+    });
+
+    expect(replay.baselineSequence).toBe(3);
+    expect(replay.events[0]?.sequence).toBe(4);
+    expect(() => decodeExecutionReplay({ events: replay.events })).toThrow();
   });
 });

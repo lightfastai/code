@@ -6,7 +6,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeProcess from "node:process";
 
-import type { NotebookExecutionEvent } from "@t3tools/contracts";
+import type { NotebookExecutionEvent, NotebookExecutionReplay } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -444,7 +444,8 @@ export class NotebookRuntimeManager {
         try {
           try {
             const resumed = await runtime.client.eventsAfter(input.sessionId, session.lastSequence);
-            for (const event of resumed) recordEvent(event, true);
+            this.#applyReplayBaseline(session, resumed);
+            for (const event of resumed.events) recordEvent(event, true);
           } catch (error) {
             failure = error;
           }
@@ -548,9 +549,15 @@ export class NotebookRuntimeManager {
     projectId: string,
     sessionId: string,
     afterSequence: number,
-  ): ReadonlyArray<NotebookExecutionEvent> {
+  ): NotebookExecutionReplay {
     const { session } = this.#getSession({ projectId, sessionId });
-    return session.events.filter((event) => event.sequence > afterSequence);
+    return {
+      baselineSequence:
+        session.events[0]?.sequence === undefined
+          ? session.lastSequence
+          : session.events[0].sequence - 1,
+      events: session.events.filter((event) => event.sequence > afterSequence),
+    };
   }
 
   async reapIdle(): Promise<void> {
@@ -756,6 +763,43 @@ export class NotebookRuntimeManager {
     const bytes = Buffer.byteLength(JSON.stringify(event));
     session.pendingEvents.set(event.sequence, { event, bytes });
     session.pendingEventBytes += bytes;
+    this.#flushPendingEvents(session);
+    if (session.pendingEventBytes > this.#eventHistoryLimitBytes) {
+      const pending = session.pendingEvents.get(event.sequence);
+      if (pending !== undefined) {
+        session.pendingEvents.delete(event.sequence);
+        session.pendingEventBytes -= pending.bytes;
+      }
+      throw new NotebookRuntimeManagerError({
+        reason: "invalid-sequence",
+        message: "Notebook runtime pending events exceeded the retention limit.",
+      });
+    }
+    return true;
+  }
+
+  #applyReplayBaseline(session: SessionState, replay: NotebookExecutionReplay): void {
+    if (replay.events.some((event) => event.sequence <= replay.baselineSequence)) {
+      throw new NotebookRuntimeManagerError({
+        reason: "invalid-sequence",
+        message: "Notebook runtime returned an invalid replay baseline.",
+      });
+    }
+    if (replay.baselineSequence <= session.lastSequence) return;
+
+    session.events.length = 0;
+    session.eventSizes.length = 0;
+    session.eventHistoryBytes = 0;
+    for (const [sequence, pending] of session.pendingEvents) {
+      if (sequence > replay.baselineSequence) continue;
+      session.pendingEvents.delete(sequence);
+      session.pendingEventBytes -= pending.bytes;
+    }
+    session.lastSequence = replay.baselineSequence;
+    this.#flushPendingEvents(session);
+  }
+
+  #flushPendingEvents(session: SessionState): void {
     while (true) {
       const next = session.pendingEvents.get(session.lastSequence + 1);
       if (next === undefined) break;
@@ -773,18 +817,6 @@ export class NotebookRuntimeManager {
         session.eventHistoryBytes -= session.eventSizes.shift() ?? 0;
       }
     }
-    if (session.pendingEventBytes > this.#eventHistoryLimitBytes) {
-      const pending = session.pendingEvents.get(event.sequence);
-      if (pending !== undefined) {
-        session.pendingEvents.delete(event.sequence);
-        session.pendingEventBytes -= pending.bytes;
-      }
-      throw new NotebookRuntimeManagerError({
-        reason: "invalid-sequence",
-        message: "Notebook runtime pending events exceeded the retention limit.",
-      });
-    }
-    return true;
   }
 
   #commandResultState(
