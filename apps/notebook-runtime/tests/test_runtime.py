@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import deque
 from typing import Any
 
 import httpx
 import pytest
 
-from runtime import RuntimeService, create_app
+from runtime import RuntimeService, build_app_from_environment, create_app
 
 
 def message(
@@ -29,6 +30,9 @@ class FakeKernelClient:
         self.execute_count = 0
         self.channels_started = False
         self.channels_stopped = False
+        self.active = False
+        self.delivered_messages: list[dict[str, Any]] = []
+        self.readiness_error: BaseException | None = None
 
     def start_channels(self) -> None:
         self.channels_started = True
@@ -38,10 +42,15 @@ class FakeKernelClient:
 
     async def wait_for_ready(self, timeout: float) -> None:
         assert timeout > 0
+        if self.readiness_error is not None:
+            raise self.readiness_error
 
     def execute(self, code: str, *, allow_stdin: bool, stop_on_error: bool) -> str:
         assert allow_stdin is False
         assert stop_on_error is True
+        if self.active:
+            raise RuntimeError("A new execution raced a kernel that was still active.")
+        self.active = True
         self.execute_count += 1
         msg_id = f"execute-{self.execute_count}"
         if code == "ordered":
@@ -94,7 +103,14 @@ class FakeKernelClient:
 
     async def get_iopub_msg(self, timeout: float) -> dict[str, Any]:
         if self.messages:
-            return self.messages.popleft()
+            item = self.messages.popleft()
+            self.delivered_messages.append(item)
+            if (
+                item.get("header", {}).get("msg_type") == "status"
+                and item.get("content", {}).get("execution_state") == "idle"
+            ):
+                self.active = False
+            return item
         await asyncio.sleep(min(timeout, 0.01))
         raise TimeoutError
 
@@ -108,24 +124,38 @@ class FakeKernelManager:
         self.restart_count = 0
         self.shutdown_count = 0
         self.cwd: str | None = None
+        self.env: dict[str, str] | None = None
+        self.idle_on_interrupt = False
 
-    async def start_kernel(self, *, cwd: str) -> None:
+    async def start_kernel(self, *, cwd: str, env: dict[str, str] | None = None) -> None:
         self.started = True
         self.cwd = cwd
+        self.env = env
 
     def client(self) -> FakeKernelClient:
         return self.client_instance
 
     async def interrupt_kernel(self) -> None:
         self.interrupt_count += 1
+        if self.idle_on_interrupt:
+            self.client_instance.messages.append(
+                message(
+                    "status",
+                    {"execution_state": "idle"},
+                    parent_id=f"execute-{self.client_instance.execute_count}",
+                )
+            )
 
     async def restart_kernel(self, *, now: bool) -> None:
         assert now is True
         self.restart_count += 1
+        self.client_instance.messages.clear()
+        self.client_instance.active = False
 
     async def shutdown_kernel(self, *, now: bool) -> None:
         assert now is True
         self.shutdown_count += 1
+        self.client_instance.active = False
 
 
 @pytest.fixture
@@ -135,6 +165,7 @@ def service(tmp_path: Any) -> RuntimeService:
         workspace_root=tmp_path,
         output_limit_bytes=1024,
         execution_timeout_seconds=0.03,
+        timeout_idle_grace_seconds=0.03,
     )
 
 
@@ -143,6 +174,45 @@ async def open_session(service: RuntimeService) -> tuple[FakeKernelManager, list
     manager = service.sessions["session-1"].manager
     assert isinstance(manager, FakeKernelManager)
     return manager, events
+
+
+async def test_runtime_token_is_private_and_kernel_environment_is_sanitized(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NOTEBOOK_RUNTIME_TOKEN", "kernel-must-not-see-this")
+    monkeypatch.setenv("UNSAFE_HOST_SECRET", "kernel-must-not-see-this-either")
+    service = RuntimeService(kernel_factory=FakeKernelManager, workspace_root=tmp_path)
+
+    manager, _ = await open_session(service)
+
+    assert manager.env is not None
+    assert "NOTEBOOK_RUNTIME_TOKEN" not in manager.env
+    assert "UNSAFE_HOST_SECRET" not in manager.env
+
+    build_app_from_environment()
+    assert "NOTEBOOK_RUNTIME_TOKEN" not in __import__("os").environ
+
+
+async def test_open_failure_shuts_down_started_kernel_and_removes_session(
+    tmp_path: Any,
+) -> None:
+    created: list[FakeKernelManager] = []
+
+    def factory(kernel_name: str) -> FakeKernelManager:
+        manager = FakeKernelManager(kernel_name)
+        manager.client_instance.readiness_error = RuntimeError("readiness failed")
+        created.append(manager)
+        return manager
+
+    service = RuntimeService(kernel_factory=factory, workspace_root=tmp_path)
+
+    with pytest.raises(RuntimeError, match="readiness failed"):
+        await service.open_session("failed-session", "failed-open")
+
+    assert "failed-session" not in service.sessions
+    assert created[0].started is True
+    assert created[0].client_instance.channels_stopped is True
+    assert created[0].shutdown_count == 1
 
 
 async def test_orders_matching_iopub_messages_through_idle(service: RuntimeService) -> None:
@@ -185,6 +255,59 @@ async def test_normalizes_kernel_errors(service: RuntimeService) -> None:
         "evalue": "boom",
         "traceback": ["trace"],
     }
+
+
+async def test_bounds_complete_events_and_all_untrusted_kernel_fields(
+    service: RuntimeService,
+) -> None:
+    service.output_limit_bytes = 10 * 1024 * 1024
+    manager, _ = await open_session(service)
+    huge = "x" * (2 * 1024 * 1024)
+    manager.client_instance.messages.extend(
+        [
+            message("status", {"execution_state": "busy"}),
+            message(
+                "display_data",
+                {"data": {"text/plain": "ok"}, "metadata": {"attacker": huge}},
+            ),
+            message("status", {"execution_state": "idle"}),
+        ]
+    )
+    display_events = [
+        event
+        async for event in service.execute(
+            "session-1", "bounded-metadata", "bounded-metadata-execution", "bounded-metadata"
+        )
+    ]
+    manager.client_instance.messages.extend(
+        [
+            message("status", {"execution_state": "busy"}, parent_id="execute-2"),
+            message(
+                "error",
+                {"ename": huge, "evalue": huge, "traceback": [huge, huge]},
+                parent_id="execute-2",
+            ),
+            message("status", {"execution_state": "idle"}, parent_id="execute-2"),
+        ]
+    )
+    error_events = [
+        event
+        async for event in service.execute(
+            "session-1", "bounded-error", "bounded-error-execution", "bounded-error"
+        )
+    ]
+    events = [*display_events, *error_events]
+
+    display = next(event for event in events if event["type"] == "display")
+    error = next(event for event in events if event["type"] == "error")
+    assert display["metadata"] != {"attacker": huge}
+    assert error["ename"] != huge
+    assert error["evalue"] != huge
+    assert error["traceback"] != [huge, huge]
+    assert all(
+        len(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode()) <= 1024 * 1024
+        for event in events
+    )
 
 
 async def test_duplicate_command_replays_without_executing_twice(service: RuntimeService) -> None:
@@ -251,6 +374,55 @@ async def test_output_and_time_limits_emit_structured_events(service: RuntimeSer
     ]
     assert any(event["type"] == "limit" and event["kind"] == "time" for event in timed_out)
     assert manager.interrupt_count == 1
+
+
+async def test_timeout_waits_for_real_idle_or_restarts_before_next_execution(
+    service: RuntimeService,
+) -> None:
+    service.timeout_idle_grace_seconds = 0.02
+    manager, _ = await open_session(service)
+    manager.idle_on_interrupt = True
+
+    drained = [
+        event
+        async for event in service.execute(
+            "session-1", "timeout-drain", "timeout-drain-execution", "wait"
+        )
+    ]
+
+    assert drained[-1] == {
+        **drained[-1],
+        "type": "kernel",
+        "state": "idle",
+    }
+    assert any(
+        item.get("parent_header", {}).get("msg_id") == "execute-1"
+        and item.get("content", {}).get("execution_state") == "idle"
+        for item in manager.client_instance.delivered_messages
+    )
+    assert manager.restart_count == 0
+
+    manager.idle_on_interrupt = False
+    recovered = [
+        event
+        async for event in service.execute(
+            "session-1", "timeout-restart", "timeout-restart-execution", "wait"
+        )
+    ]
+    assert [event.get("state") for event in recovered if event["type"] == "kernel"][-3:] == [
+        "starting",
+        "restarted",
+        "idle",
+    ]
+    assert manager.restart_count == 1
+
+    following = [
+        event
+        async for event in service.execute(
+            "session-1", "after-recovery", "after-recovery-execution", "ordered"
+        )
+    ]
+    assert any(event["type"] == "stream" and event["text"] == "one\n" for event in following)
 
 
 async def test_resume_returns_only_events_after_sequence(service: RuntimeService) -> None:

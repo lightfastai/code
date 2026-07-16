@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off - Opt-in Docker integration test exercises host isolation.
+// @effect-diagnostics nodeBuiltinImport:off globalDate:off - Opt-in Docker test measures real process timing.
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
@@ -10,11 +10,31 @@ import * as NodeUtil from "node:util";
 import type { NotebookExecutionEvent } from "@t3tools/contracts";
 import { expect, it } from "vite-plus/test";
 
-import { NotebookRuntimeManager } from "./NotebookRuntimeManager.ts";
+import {
+  DockerCliCommandRunner,
+  type DockerCommandRunner,
+  NotebookRuntimeManager,
+} from "./NotebookRuntimeManager.ts";
 
 const execFilePromise = NodeUtil.promisify(NodeChildProcess.execFile);
 const liveIt = NodeProcess.env.NOTEBOOK_RUNTIME_LIVE === "1" ? it : it.skip;
 const image = NodeProcess.env.NOTEBOOK_RUNTIME_IMAGE ?? "lightfast/notebook-runtime:task5";
+
+class FailFirstRemoveDocker implements DockerCommandRunner {
+  readonly #delegate = new DockerCliCommandRunner();
+  #failRemove = true;
+
+  run(
+    args: readonly string[],
+    options?: { readonly env?: Readonly<Record<string, string>> },
+  ): Promise<{ readonly stdout: string }> {
+    if (args[0] === "rm" && this.#failRemove) {
+      this.#failRemove = false;
+      return Promise.reject(new Error("injected live remove failure"));
+    }
+    return this.#delegate.run(args, options);
+  }
+}
 
 const execute = (
   manager: NotebookRuntimeManager,
@@ -46,9 +66,12 @@ liveIt(
     const bookPath = NodePath.join(root, "book.txt");
     await NodeFSP.writeFile(bookPath, "readonly-book", { mode: 0o444 });
     const manager = new NotebookRuntimeManager({
+      docker: new FailFirstRemoveDocker(),
       image,
       runtimeRoot: NodePath.join(root, "control"),
       readinessTimeoutMs: 30_000,
+      executionTimeoutSeconds: 1,
+      timeoutIdleGraceSeconds: 2,
     });
     try {
       await manager.open({
@@ -58,6 +81,18 @@ liveIt(
         kernelName: "python3",
         bookPaths: [bookPath],
       });
+
+      const tokenIsolation = await execute(
+        manager,
+        0,
+        "import os\nimport urllib.error\nimport urllib.request\ntoken = os.environ.get('NOTEBOOK_RUNTIME_TOKEN')\nprint(f'token-present={token is not None}')\nrequest = urllib.request.Request('http://127.0.0.1:8080/v1/health', headers={'Authorization': f'Bearer {token or \"\"}'})\ntry:\n response = urllib.request.urlopen(request, timeout=1)\n print(f'loopback-status={response.status}')\nexcept urllib.error.HTTPError as error:\n print(f'loopback-status={error.code}')",
+        "token-isolation-live",
+      );
+      const tokenOutput = tokenIsolation
+        .filter((event) => event.type === "stream")
+        .map((event) => (event.type === "stream" ? event.text : ""))
+        .join("");
+      expect(tokenOutput).toContain("token-present=False\nloopback-status=401\n");
 
       await execute(manager, 1, "value = 40");
       expect(textResult(await execute(manager, 2, "value + 2"))).toBe("42");
@@ -78,6 +113,34 @@ liveIt(
         expect.arrayContaining([expect.objectContaining({ type: "error", ename: "ValueError" })]),
       );
 
+      const hugeMetadata = await execute(
+        manager,
+        41,
+        "from IPython.display import display\ndisplay({'text/plain': 'bounded'}, raw=True, metadata={'attacker': 'x' * (2 * 1024 * 1024)})",
+      );
+      const hugeError = await execute(manager, 42, "raise ValueError('x' * (2 * 1024 * 1024))");
+      for (const item of [...hugeMetadata, ...hugeError]) {
+        expect(Buffer.byteLength(JSON.stringify(item))).toBeLessThanOrEqual(1024 * 1024);
+      }
+      expect(hugeMetadata).toEqual(
+        expect.arrayContaining([expect.objectContaining({ type: "display", metadata: {} })]),
+      );
+      expect(hugeError).toEqual(
+        expect.arrayContaining([expect.objectContaining({ type: "error", ename: "ValueError" })]),
+      );
+
+      const unwindStartedAt = Date.now();
+      const unwind = await execute(
+        manager,
+        43,
+        "import time\ntry:\n time.sleep(2)\nexcept KeyboardInterrupt:\n time.sleep(0.75)\n unwind_marker = 'done'",
+      );
+      expect(unwind).toEqual(
+        expect.arrayContaining([expect.objectContaining({ type: "limit", kind: "time" })]),
+      );
+      expect(Date.now() - unwindStartedAt).toBeGreaterThanOrEqual(1_400);
+      expect(textResult(await execute(manager, 44, "unwind_marker"))).toBe("'done'");
+
       const longExecution = execute(manager, 5, "import time\ntime.sleep(30)");
       await NodeTimersPromises.setTimeout(500);
       const interrupted = await manager.interrupt({
@@ -90,18 +153,11 @@ liveIt(
         expect.arrayContaining([expect.objectContaining({ type: "kernel", state: "idle" })]),
       );
 
-      await execute(
-        manager,
-        6,
-        "counter = globals().get('counter', 0) + 1\ncounter",
-        "duplicate-live",
-      );
-      const duplicate = await execute(
-        manager,
-        6,
-        "counter = globals().get('counter', 0) + 1\ncounter",
-        "duplicate-live",
-      );
+      const [firstDuplicate, duplicate] = await Promise.all([
+        execute(manager, 6, "counter = globals().get('counter', 0) + 1\ncounter", "duplicate-live"),
+        execute(manager, 6, "counter = globals().get('counter', 0) + 1\ncounter", "duplicate-live"),
+      ]);
+      expect(textResult(firstDuplicate)).toBe("1");
       expect(textResult(duplicate)).toBe("1");
       expect(textResult(await execute(manager, 7, "counter"))).toBe("1");
 
@@ -186,12 +242,36 @@ liveIt(
       expect(mounts[0]?.Source).toBe(bookPath);
       expect(mounts.some((mount) => /docker\.sock|workspace/i.test(mount.Source))).toBe(false);
 
-      await manager.close();
+      await expect(manager.close()).rejects.toThrow("injected live remove failure");
       await expect(
         execFilePromise("docker", ["inspect", containerId.trim()]),
-      ).rejects.toBeDefined();
-    } finally {
+      ).resolves.toBeDefined();
       await manager.close();
+      const { stdout: containerAfterRetry } = await execFilePromise("docker", [
+        "ps",
+        "-q",
+        "--filter",
+        `id=${containerId.trim()}`,
+      ]);
+      expect(containerAfterRetry.trim()).toBe("");
+      const { stdout: remainingContainers } = await execFilePromise("docker", [
+        "ps",
+        "-aq",
+        "--filter",
+        "label=lightfast.notebook.project=5b5cd5d2405ffcf3",
+      ]);
+      expect(remainingContainers.trim()).toBe("");
+    } finally {
+      await manager.close().catch(() => undefined);
+      const { stdout: leakedContainers } = await execFilePromise("docker", [
+        "ps",
+        "-aq",
+        "--filter",
+        "label=lightfast.notebook.project=5b5cd5d2405ffcf3",
+      ]);
+      if (leakedContainers.trim()) {
+        await execFilePromise("docker", ["rm", "--force", ...leakedContainers.trim().split(/\s+/)]);
+      }
       await NodeFSP.rm(root, { force: true, recursive: true });
     }
   },

@@ -10,7 +10,7 @@ import re
 import sys
 from collections import deque
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty
@@ -23,9 +23,28 @@ from jupyter_client import AsyncKernelManager
 
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 DEFAULT_OUTPUT_LIMIT_BYTES = 10 * 1024 * 1024
+DEFAULT_EVENT_LIMIT_BYTES = 1024 * 1024
 DEFAULT_EXECUTION_TIMEOUT_SECONDS = 120.0
+DEFAULT_TIMEOUT_IDLE_GRACE_SECONDS = 5.0
 DEFAULT_EVENT_HISTORY_LIMIT = 4096
 DEFAULT_COMMAND_CACHE_LIMIT = 512
+METADATA_LIMIT_BYTES = 64 * 1024
+ERROR_NAME_LIMIT_BYTES = 4 * 1024
+ERROR_VALUE_LIMIT_BYTES = 128 * 1024
+TRACEBACK_LIMIT_BYTES = 512 * 1024
+TRACEBACK_LINE_LIMIT_BYTES = 16 * 1024
+KERNEL_ENVIRONMENT_ALLOWLIST = (
+    "IPYTHONDIR",
+    "JUPYTER_RUNTIME_DIR",
+    "LANG",
+    "LC_ALL",
+    "MPLCONFIGDIR",
+    "PATH",
+    "PYTHONDONTWRITEBYTECODE",
+    "PYTHONHASHSEED",
+    "PYTHONUNBUFFERED",
+    "TZ",
+)
 
 Event = dict[str, Any]
 
@@ -43,7 +62,7 @@ class KernelClient(Protocol):
 
 
 class KernelManager(Protocol):
-    async def start_kernel(self, *, cwd: str) -> None: ...
+    async def start_kernel(self, *, cwd: str, env: dict[str, str]) -> None: ...
 
     def client(self) -> KernelClient: ...
 
@@ -98,6 +117,55 @@ def _require_code(body: dict[str, Any]) -> str:
     return value
 
 
+def _json_size(value: Any) -> int | None:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
+    except (TypeError, ValueError):
+        return None
+
+
+def _truncate_json_string(value: Any, limit_bytes: int) -> str:
+    text = str(value)
+    if (_json_size(text) or limit_bytes + 1) <= limit_bytes:
+        return text
+    low = 0
+    high = len(text)
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        size = _json_size(text[:midpoint])
+        if size is not None and size <= limit_bytes:
+            low = midpoint
+        else:
+            high = midpoint - 1
+    return text[:low]
+
+
+def _bounded_traceback(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value[:1000]:
+        line = _truncate_json_string(item, TRACEBACK_LINE_LIMIT_BYTES)
+        candidate = [*result, line]
+        size = _json_size(candidate)
+        if size is None or size > TRACEBACK_LIMIT_BYTES:
+            break
+        result.append(line)
+    return result
+
+
+def _kernel_environment() -> dict[str, str]:
+    environment = {
+        name: value
+        for name in KERNEL_ENVIRONMENT_ALLOWLIST
+        if (value := os.environ.get(name)) is not None
+    }
+    environment["HOME"] = os.environ.get("HOME", str(Path.home()))
+    environment["PATH"] = environment.get("PATH", os.defpath)
+    environment["PYTHONNOUSERSITE"] = "1"
+    return environment
+
+
 class RuntimeService:
     def __init__(
         self,
@@ -105,14 +173,18 @@ class RuntimeService:
         kernel_factory: Callable[..., KernelManager] = AsyncKernelManager,
         workspace_root: str | Path = "/workspace",
         output_limit_bytes: int = DEFAULT_OUTPUT_LIMIT_BYTES,
+        event_limit_bytes: int = DEFAULT_EVENT_LIMIT_BYTES,
         execution_timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+        timeout_idle_grace_seconds: float = DEFAULT_TIMEOUT_IDLE_GRACE_SECONDS,
         event_history_limit: int = DEFAULT_EVENT_HISTORY_LIMIT,
         command_cache_limit: int = DEFAULT_COMMAND_CACHE_LIMIT,
     ) -> None:
         self.kernel_factory = kernel_factory
         self.workspace_root = Path(workspace_root)
         self.output_limit_bytes = output_limit_bytes
+        self.event_limit_bytes = event_limit_bytes
         self.execution_timeout_seconds = execution_timeout_seconds
+        self.timeout_idle_grace_seconds = timeout_idle_grace_seconds
         self.event_history_limit = event_history_limit
         self.command_cache_limit = command_cache_limit
         self.sessions: dict[str, KernelSession] = {}
@@ -142,6 +214,9 @@ class RuntimeService:
             "sequence": session.sequence,
             **fields,
         }
+        event_size = _json_size(event)
+        if event_size is None or event_size > self.event_limit_bytes:
+            raise RuntimeError("Notebook runtime attempted to emit an oversized event.")
         session.events.append(event)
         while len(session.events) > self.event_history_limit:
             session.events.popleft()
@@ -246,7 +321,7 @@ class RuntimeService:
                 self._event(session, command_id, "kernel", state="starting"),
             ]
             try:
-                await manager.start_kernel(cwd=str(workspace))
+                await manager.start_kernel(cwd=str(workspace), env=_kernel_environment())
                 client = manager.client()
                 client.start_channels()
                 await client.wait_for_ready(timeout=30)
@@ -255,9 +330,11 @@ class RuntimeService:
                 self._complete(record, events)
                 return events
             except BaseException:
-                self.sessions.pop(session_id, None)
                 if client is not None:
                     client.stop_channels()
+                with suppress(BaseException):
+                    await manager.shutdown_kernel(now=True)
+                self.sessions.pop(session_id, None)
                 record.completed.set()
                 raise
 
@@ -313,26 +390,85 @@ class RuntimeService:
                 ),
             )
 
+        def event_size(event_type: str, **fields: Any) -> int | None:
+            return _json_size(
+                {
+                    "type": event_type,
+                    "sessionId": session.session_id,
+                    "commandId": command_id,
+                    "executionId": execution_id,
+                    "sequence": session.sequence + 1,
+                    **fields,
+                }
+            )
+
+        def event_fits(event_type: str, **fields: Any) -> bool:
+            size = event_size(event_type, **fields)
+            return size is not None and size <= self.event_limit_bytes
+
+        def bounded_stream_text(name: str, text: str) -> tuple[str, bool]:
+            if event_fits("stream", name=name, text=text):
+                return text, False
+            low = 0
+            high = len(text)
+            while low < high:
+                midpoint = (low + high + 1) // 2
+                size = event_size("stream", name=name, text=text[:midpoint])
+                if size is not None and size <= self.event_limit_bytes:
+                    low = midpoint
+                else:
+                    high = midpoint - 1
+            return text[:low], True
+
         yield emit("accepted", commandType="execute")
         try:
             async with session.lock:
                 msg_id = session.client.execute(code, allow_stdin=False, stop_on_error=True)
                 loop = asyncio.get_running_loop()
                 deadline = loop.time() + self.execution_timeout_seconds
+                timed_out = False
                 while True:
                     remaining = deadline - loop.time()
                     if remaining <= 0:
-                        await session.manager.interrupt_kernel()
-                        yield emit(
-                            "limit",
-                            kind="time",
-                            limit=self.execution_timeout_seconds,
-                            message=(
-                                "Execution exceeded "
-                                f"{self.execution_timeout_seconds:g} seconds and was interrupted."
-                            ),
-                        )
-                        yield emit("kernel", state="interrupted")
+                        if not timed_out:
+                            await session.manager.interrupt_kernel()
+                            yield emit(
+                                "limit",
+                                kind="time",
+                                limit=self.execution_timeout_seconds,
+                                message=(
+                                    "Execution exceeded "
+                                    f"{self.execution_timeout_seconds:g} seconds and was "
+                                    "interrupted."
+                                ),
+                            )
+                            yield emit("kernel", state="interrupted")
+                            timed_out = True
+                            deadline = loop.time() + self.timeout_idle_grace_seconds
+                            continue
+
+                        yield emit("kernel", state="starting")
+                        try:
+                            await session.manager.restart_kernel(now=True)
+                            await session.client.wait_for_ready(timeout=30)
+                        except BaseException:
+                            session.client.stop_channels()
+                            with suppress(BaseException):
+                                await session.manager.shutdown_kernel(now=True)
+                            if self.sessions.get(session_id) is session:
+                                self.sessions.pop(session_id)
+                            yield emit(
+                                "error",
+                                ename="RuntimeRecoveryError",
+                                evalue=(
+                                    "The kernel did not become idle after interruption and "
+                                    "recovery failed."
+                                ),
+                                traceback=[],
+                            )
+                            yield emit("kernel", state="terminated")
+                            break
+                        yield emit("kernel", state="restarted")
                         yield emit("kernel", state="idle")
                         break
                     try:
@@ -346,7 +482,8 @@ class RuntimeService:
                     if msg_type == "status":
                         state = content.get("execution_state")
                         if state in {"busy", "idle"}:
-                            yield emit("kernel", state=state)
+                            if state == "idle" or not timed_out:
+                                yield emit("kernel", state=state)
                             if state == "idle":
                                 break
                     elif msg_type == "stream" and not output_limited:
@@ -357,13 +494,21 @@ class RuntimeService:
                         encoded = text.encode()
                         remaining_bytes = max(0, self.output_limit_bytes - output_bytes)
                         if len(encoded) <= remaining_bytes:
-                            output_bytes += len(encoded)
-                            yield emit("stream", name=name, text=text)
+                            bounded_text, event_truncated = bounded_stream_text(name, text)
+                            if bounded_text:
+                                output_bytes += len(bounded_text.encode())
+                                yield emit("stream", name=name, text=bounded_text)
+                            if event_truncated:
+                                limit_event = emit_output_limit()
+                                if limit_event is not None:
+                                    yield limit_event
                         else:
                             truncated = encoded[:remaining_bytes].decode(errors="ignore")
                             if truncated:
-                                output_bytes += len(truncated.encode())
-                                yield emit("stream", name=name, text=truncated)
+                                bounded_text, _ = bounded_stream_text(name, truncated)
+                                if bounded_text:
+                                    output_bytes += len(bounded_text.encode())
+                                    yield emit("stream", name=name, text=bounded_text)
                             limit_event = emit_output_limit()
                             if limit_event is not None:
                                 yield limit_event
@@ -372,10 +517,32 @@ class RuntimeService:
                         metadata = content.get("metadata", {})
                         if not isinstance(data, dict) or not isinstance(metadata, dict):
                             continue
-                        encoded_size = len(
-                            json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
-                        )
+                        metadata_size = _json_size(metadata)
+                        if metadata_size is None or metadata_size > METADATA_LIMIT_BYTES:
+                            metadata = {}
+                            metadata_size = 2
+                        data_size = _json_size(data)
+                        if data_size is None:
+                            continue
+                        encoded_size = data_size + metadata_size
                         if output_bytes + encoded_size > self.output_limit_bytes:
+                            limit_event = emit_output_limit()
+                            if limit_event is not None:
+                                yield limit_event
+                            continue
+                        execution_count = content.get("execution_count")
+                        if (
+                            not isinstance(execution_count, int)
+                            or isinstance(execution_count, bool)
+                            or execution_count < 0
+                        ):
+                            execution_count = None
+                        fields = {"data": data, "metadata": metadata}
+                        if msg_type == "execute_result":
+                            fields["executionCount"] = execution_count
+                        if not event_fits(
+                            "display" if msg_type == "display_data" else "result", **fields
+                        ):
                             limit_event = emit_output_limit()
                             if limit_event is not None:
                                 yield limit_event
@@ -388,15 +555,29 @@ class RuntimeService:
                                 "result",
                                 data=data,
                                 metadata=metadata,
-                                executionCount=content.get("execution_count"),
+                                executionCount=execution_count,
                             )
                     elif msg_type == "error" and not output_limited:
-                        yield emit(
-                            "error",
-                            ename=str(content.get("ename", "Error")),
-                            evalue=str(content.get("evalue", "")),
-                            traceback=[str(line) for line in content.get("traceback", [])],
-                        )
+                        error_fields = {
+                            "ename": _truncate_json_string(
+                                content.get("ename", "Error"), ERROR_NAME_LIMIT_BYTES
+                            ),
+                            "evalue": _truncate_json_string(
+                                content.get("evalue", ""), ERROR_VALUE_LIMIT_BYTES
+                            ),
+                            "traceback": _bounded_traceback(content.get("traceback", [])),
+                        }
+                        encoded_size = _json_size(error_fields)
+                        if (
+                            encoded_size is None
+                            or output_bytes + encoded_size > self.output_limit_bytes
+                        ):
+                            limit_event = emit_output_limit()
+                            if limit_event is not None:
+                                yield limit_event
+                            continue
+                        output_bytes += encoded_size
+                        yield emit("error", **error_fields)
         finally:
             self._complete(record, emitted)
 
@@ -583,16 +764,23 @@ def _positive_float_env(name: str, default: float) -> float:
 
 
 def build_app_from_environment() -> FastAPI:
+    token = os.environ.pop("NOTEBOOK_RUNTIME_TOKEN", "")
     service = RuntimeService(
         workspace_root=os.environ.get("NOTEBOOK_WORKSPACE_ROOT", "/workspace"),
         output_limit_bytes=_positive_int_env(
             "NOTEBOOK_OUTPUT_LIMIT_BYTES", DEFAULT_OUTPUT_LIMIT_BYTES
         ),
+        event_limit_bytes=_positive_int_env(
+            "NOTEBOOK_EVENT_LIMIT_BYTES", DEFAULT_EVENT_LIMIT_BYTES
+        ),
         execution_timeout_seconds=_positive_float_env(
             "NOTEBOOK_EXECUTION_TIMEOUT_SECONDS", DEFAULT_EXECUTION_TIMEOUT_SECONDS
         ),
+        timeout_idle_grace_seconds=_positive_float_env(
+            "NOTEBOOK_TIMEOUT_IDLE_GRACE_SECONDS", DEFAULT_TIMEOUT_IDLE_GRACE_SECONDS
+        ),
     )
-    return create_app(service=service, token=os.environ.get("NOTEBOOK_RUNTIME_TOKEN", ""))
+    return create_app(service=service, token=token)
 
 
 def serve() -> None:

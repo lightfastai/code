@@ -112,3 +112,65 @@ it("returns bounded protocol errors without response bodies or tokens", async ()
   expect(String(error)).toContain("HTTP 500");
   expect(String(error)).not.toMatch(/do-not-leak|secret diagnostics|xxxx/);
 });
+
+it("rejects oversized NDJSON lines and aggregate execution bytes", async () => {
+  const oversizedLineUrl = await listen((_request, response) => {
+    response.writeHead(200, { "content-type": "application/x-ndjson" });
+    response.end(
+      `${JSON.stringify({
+        type: "stream",
+        sessionId: "session-1",
+        commandId: "command-line",
+        executionId: "execution-line",
+        sequence: 1,
+        name: "stdout",
+        text: "x".repeat(2 * 1024 * 1024),
+      })}\n`,
+    );
+  });
+  const lineClient = new NotebookRuntimeClient({ baseUrl: oversizedLineUrl, token: "token" });
+  const lineError = await Array.fromAsync(
+    lineClient.execute({
+      sessionId: "session-1",
+      commandId: "command-line",
+      executionId: "execution-line",
+      code: "line",
+    }),
+  ).catch((cause: unknown) => cause);
+
+  expect(lineError).toBeInstanceOf(NotebookRuntimeClientError);
+  expect(String(lineError)).toContain("execution frame exceeded");
+
+  const oversizedAggregateUrl = await listen((_request, response) => {
+    response.writeHead(200, { "content-type": "application/x-ndjson" });
+    for (let sequence = 1; sequence <= 300; sequence += 1) {
+      response.write(
+        `${JSON.stringify({
+          type: "stream",
+          sessionId: "session-1",
+          commandId: "command-aggregate",
+          executionId: "execution-aggregate",
+          sequence,
+          name: "stdout",
+          text: "x".repeat(64 * 1024),
+        })}\n`,
+      );
+    }
+    response.end();
+  });
+  const aggregateClient = new NotebookRuntimeClient({
+    baseUrl: oversizedAggregateUrl,
+    token: "token",
+  });
+  const aggregateError = await Array.fromAsync(
+    aggregateClient.execute({
+      sessionId: "session-1",
+      commandId: "command-aggregate",
+      executionId: "execution-aggregate",
+      code: "aggregate",
+    }),
+  ).catch((cause: unknown) => cause);
+
+  expect(aggregateError).toBeInstanceOf(NotebookRuntimeClientError);
+  expect(String(aggregateError)).toContain("execution stream exceeded");
+});

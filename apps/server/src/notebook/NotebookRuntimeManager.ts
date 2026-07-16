@@ -13,14 +13,19 @@ import * as Layer from "effect/Layer";
 
 import {
   DockerExecNotebookRuntimeClient,
+  NotebookRuntimeClientError,
   type NotebookRuntimeClientLike,
   type RuntimeExecuteRequest,
 } from "./NotebookRuntimeClient.ts";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_READINESS_TIMEOUT_MS = 30_000;
+const DEFAULT_EXECUTION_TIMEOUT_SECONDS = 120;
+const DEFAULT_TIMEOUT_IDLE_GRACE_SECONDS = 5;
 const DEFAULT_EVENT_HISTORY_LIMIT = 4096;
 const DEFAULT_COMMAND_CACHE_LIMIT = 512;
+const DEFAULT_EVENT_HISTORY_LIMIT_BYTES = 16 * 1024 * 1024;
+const DEFAULT_COMMAND_CACHE_LIMIT_BYTES = 16 * 1024 * 1024;
 const DOCKER_OUTPUT_LIMIT_BYTES = 1024 * 1024;
 
 export interface DockerCommandRunner {
@@ -115,6 +120,13 @@ interface CommandResult {
 interface CommandCacheEntry {
   readonly fingerprint: string;
   readonly completion: Promise<CommandResult>;
+  retainedBytes: number;
+  completed: boolean;
+}
+
+interface PendingEvent {
+  readonly event: NotebookExecutionEvent;
+  readonly bytes: number;
 }
 
 interface SessionState {
@@ -122,7 +134,11 @@ interface SessionState {
   readonly events: NotebookExecutionEvent[];
   readonly commands: Map<string, CommandCacheEntry>;
   readonly commandOrder: string[];
-  readonly pendingEvents: Map<number, NotebookExecutionEvent>;
+  readonly eventSizes: number[];
+  readonly pendingEvents: Map<number, PendingEvent>;
+  eventHistoryBytes: number;
+  commandCacheBytes: number;
+  pendingEventBytes: number;
   lastSequence: number;
   disposed: boolean;
 }
@@ -187,6 +203,10 @@ export interface NotebookRuntimeManagerOptions {
   readonly readinessTimeoutMs?: number;
   readonly eventHistoryLimit?: number;
   readonly commandCacheLimit?: number;
+  readonly eventHistoryLimitBytes?: number;
+  readonly commandCacheLimitBytes?: number;
+  readonly executionTimeoutSeconds?: number;
+  readonly timeoutIdleGraceSeconds?: number;
 }
 
 export interface NotebookManagerSessionOpenInput {
@@ -217,8 +237,13 @@ export class NotebookRuntimeManager {
   readonly #readinessTimeoutMs: number;
   readonly #eventHistoryLimit: number;
   readonly #commandCacheLimit: number;
+  readonly #eventHistoryLimitBytes: number;
+  readonly #commandCacheLimitBytes: number;
+  readonly #executionTimeoutSeconds: number;
+  readonly #timeoutIdleGraceSeconds: number;
   readonly #projects = new Map<string, ProjectRuntime>();
   readonly #projectStarts = new Map<string, Promise<ProjectRuntime>>();
+  readonly #projectRemovals = new Map<string, Promise<void>>();
 
   constructor(options: NotebookRuntimeManagerOptions) {
     this.#docker = options.docker ?? new DockerCliCommandRunner();
@@ -234,6 +259,17 @@ export class NotebookRuntimeManager {
     this.#readinessTimeoutMs = options.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
     this.#eventHistoryLimit = options.eventHistoryLimit ?? DEFAULT_EVENT_HISTORY_LIMIT;
     this.#commandCacheLimit = options.commandCacheLimit ?? DEFAULT_COMMAND_CACHE_LIMIT;
+    this.#eventHistoryLimitBytes =
+      options.eventHistoryLimitBytes ?? DEFAULT_EVENT_HISTORY_LIMIT_BYTES;
+    this.#commandCacheLimitBytes =
+      options.commandCacheLimitBytes ?? DEFAULT_COMMAND_CACHE_LIMIT_BYTES;
+    this.#executionTimeoutSeconds =
+      options.executionTimeoutSeconds ?? DEFAULT_EXECUTION_TIMEOUT_SECONDS;
+    this.#timeoutIdleGraceSeconds =
+      options.timeoutIdleGraceSeconds ?? DEFAULT_TIMEOUT_IDLE_GRACE_SECONDS;
+    if (this.#executionTimeoutSeconds <= 0 || this.#timeoutIdleGraceSeconds <= 0) {
+      throw new Error("Notebook runtime timeout settings must be positive.");
+    }
   }
 
   async open(
@@ -249,8 +285,12 @@ export class NotebookRuntimeManager {
           message: "Notebook session has already been disposed.",
         });
       }
-      return this.#runCached(existing, input.commandId, this.#fingerprint("open", input), () =>
-        project.client.open(input),
+      return this.#runCached(
+        existing,
+        input.commandId,
+        this.#fingerprint("open", input),
+        "open",
+        () => project.client.open(input),
       );
     }
     const session: SessionState = {
@@ -258,15 +298,27 @@ export class NotebookRuntimeManager {
       events: [],
       commands: new Map(),
       commandOrder: [],
+      eventSizes: [],
       pendingEvents: new Map(),
+      eventHistoryBytes: 0,
+      commandCacheBytes: 0,
+      pendingEventBytes: 0,
       lastSequence: 0,
       disposed: false,
     };
     project.sessions.set(input.sessionId, session);
     try {
-      return await this.#runCached(session, input.commandId, this.#fingerprint("open", input), () =>
-        project.client.open(input),
+      const events = await this.#runCached(
+        session,
+        input.commandId,
+        this.#fingerprint("open", input),
+        "open",
+        () => project.client.open(input),
       );
+      if (this.#commandResultState(events, input.commandId, "open") !== "accepted-terminal") {
+        project.sessions.delete(input.sessionId);
+      }
+      return events;
     } catch (error) {
       project.sessions.delete(input.sessionId);
       throw error;
@@ -287,22 +339,100 @@ export class NotebookRuntimeManager {
     const completion = new Promise<CommandResult>((resolvePromise) => {
       complete = resolvePromise;
     });
-    this.#cacheCommand(session, input.commandId, { fingerprint, completion });
+    const entry: CommandCacheEntry = {
+      fingerprint,
+      completion,
+      retainedBytes: 0,
+      completed: false,
+    };
+    this.#cacheCommand(session, input.commandId, entry);
     const queue = new ExecutionEventQueue();
-    const events: NotebookExecutionEvent[] = [];
     void (async () => {
-      try {
-        for await (const event of project.client.execute(input)) {
-          this.#appendEvent(session, event);
-          events.push(event);
+      const eventsBySequence = new Map<number, NotebookExecutionEvent>();
+      const recordEvent = (event: NotebookExecutionEvent, allowReplay: boolean): void => {
+        const existing = eventsBySequence.get(event.sequence);
+        if (existing !== undefined) {
+          if (!allowReplay || JSON.stringify(existing) !== JSON.stringify(event)) {
+            throw new NotebookRuntimeManagerError({
+              reason: "invalid-sequence",
+              message: "Notebook runtime replayed conflicting execution data.",
+            });
+          }
+          return;
+        }
+        this.#appendEvent(session, event, allowReplay);
+        if (event.commandId === input.commandId) {
+          eventsBySequence.set(event.sequence, event);
           queue.push(event);
         }
-        complete({ events });
-        queue.finish();
+      };
+      let failure: unknown;
+      try {
+        for await (const event of project.client.execute(input)) {
+          recordEvent(event, true);
+        }
       } catch (error) {
-        complete({ error });
-        queue.finish(error);
+        failure = error;
       }
+
+      let events = [...eventsBySequence.values()].toSorted(
+        (left, right) => left.sequence - right.sequence,
+      );
+      let state = this.#commandResultState(events, input.commandId, "execute");
+      const recoverableFailure =
+        failure === undefined ||
+        (failure instanceof NotebookRuntimeClientError &&
+          (failure.reason === "transport" || failure.reason === "protocol"));
+      if (state === "incomplete" && recoverableFailure) {
+        try {
+          try {
+            const resumed = await project.client.eventsAfter(input.sessionId, session.lastSequence);
+            for (const event of resumed) recordEvent(event, true);
+          } catch (error) {
+            failure = error;
+          }
+          events = [...eventsBySequence.values()].toSorted(
+            (left, right) => left.sequence - right.sequence,
+          );
+          state = this.#commandResultState(events, input.commandId, "execute");
+          if (state === "incomplete") {
+            for await (const event of project.client.execute(input)) recordEvent(event, true);
+            events = [...eventsBySequence.values()].toSorted(
+              (left, right) => left.sequence - right.sequence,
+            );
+            state = this.#commandResultState(events, input.commandId, "execute");
+          }
+        } catch (error) {
+          failure = error;
+        }
+        events = [...eventsBySequence.values()].toSorted(
+          (left, right) => left.sequence - right.sequence,
+        );
+        state = this.#commandResultState(events, input.commandId, "execute");
+      }
+
+      if (state === "incomplete") {
+        const error =
+          failure ??
+          new NotebookRuntimeManagerError({
+            reason: "runtime-unavailable",
+            message: "Notebook execution ended before a terminal event.",
+          });
+        const result = { error } satisfies CommandResult;
+        this.#evictCommandCache(session, input.commandId, entry);
+        complete(result);
+        queue.finish(error);
+        return;
+      }
+
+      const result = { events } satisfies CommandResult;
+      if (state === "accepted-terminal") {
+        this.#settleCommandCache(session, entry, result);
+      } else {
+        this.#evictCommandCache(session, input.commandId, entry);
+      }
+      complete(result);
+      queue.finish();
     })();
     return queue;
   }
@@ -324,9 +454,12 @@ export class NotebookRuntimeManager {
       session,
       input.commandId,
       this.#fingerprint("dispose", input),
+      "dispose",
       () => project.client.dispose(input),
     );
-    session.disposed = true;
+    if (this.#commandResultState(events, input.commandId, "dispose") === "accepted-terminal") {
+      session.disposed = true;
+    }
     return events;
   }
 
@@ -363,8 +496,13 @@ export class NotebookRuntimeManager {
   ): Promise<ReadonlyArray<NotebookExecutionEvent>> {
     const { project, session } = this.#getSession(input);
     project.lastUsedAt = this.#now();
-    return this.#runCached(session, input.commandId, this.#fingerprint(command, input), () =>
-      command === "interrupt" ? project.client.interrupt(input) : project.client.restart(input),
+    return this.#runCached(
+      session,
+      input.commandId,
+      this.#fingerprint(command, input),
+      command,
+      () =>
+        command === "interrupt" ? project.client.interrupt(input) : project.client.restart(input),
     );
   }
 
@@ -387,6 +525,7 @@ export class NotebookRuntimeManager {
     session: SessionState,
     commandId: string,
     fingerprint: string,
+    command: "open" | "interrupt" | "restart" | "dispose",
     run: () => Promise<ReadonlyArray<NotebookExecutionEvent>>,
   ): Promise<ReadonlyArray<NotebookExecutionEvent>> {
     const cached = session.commands.get(commandId);
@@ -400,14 +539,35 @@ export class NotebookRuntimeManager {
     const completion = new Promise<CommandResult>((resolvePromise) => {
       complete = resolvePromise;
     });
-    this.#cacheCommand(session, commandId, { fingerprint, completion });
+    const entry: CommandCacheEntry = {
+      fingerprint,
+      completion,
+      retainedBytes: 0,
+      completed: false,
+    };
+    this.#cacheCommand(session, commandId, entry);
     try {
       const events = await run();
       for (const event of events) this.#appendEvent(session, event);
-      complete({ events });
+      const result = { events } satisfies CommandResult;
+      const state = this.#commandResultState(events, commandId, command);
+      if (state === "incomplete") {
+        throw new NotebookRuntimeManagerError({
+          reason: "runtime-unavailable",
+          message: "Notebook command ended before a terminal event.",
+        });
+      }
+      if (state === "accepted-terminal") {
+        this.#settleCommandCache(session, entry, result);
+      } else {
+        this.#evictCommandCache(session, commandId, entry);
+      }
+      complete(result);
       return events;
     } catch (error) {
-      complete({ error });
+      const result = { error } satisfies CommandResult;
+      this.#evictCommandCache(session, commandId, entry);
+      complete(result);
       throw error;
     }
   }
@@ -421,32 +581,138 @@ export class NotebookRuntimeManager {
   #cacheCommand(session: SessionState, commandId: string, entry: CommandCacheEntry): void {
     session.commands.set(commandId, entry);
     session.commandOrder.push(commandId);
-    while (session.commandOrder.length > this.#commandCacheLimit) {
-      const oldest = session.commandOrder.shift();
-      if (oldest !== undefined) session.commands.delete(oldest);
+    this.#trimCommandCache(session);
+  }
+
+  #settleCommandCache(
+    session: SessionState,
+    entry: CommandCacheEntry,
+    result: CommandResult,
+  ): void {
+    entry.completed = true;
+    entry.retainedBytes = (result.events ?? []).reduce(
+      (total, event) => total + Buffer.byteLength(JSON.stringify(event)),
+      0,
+    );
+    session.commandCacheBytes += entry.retainedBytes;
+    this.#trimCommandCache(session);
+  }
+
+  #evictCommandCache(session: SessionState, commandId: string, entry: CommandCacheEntry): void {
+    if (session.commands.get(commandId) !== entry) return;
+    session.commandCacheBytes -= entry.retainedBytes;
+    session.commands.delete(commandId);
+    const orderIndex = session.commandOrder.indexOf(commandId);
+    if (orderIndex >= 0) session.commandOrder.splice(orderIndex, 1);
+  }
+
+  #trimCommandCache(session: SessionState): void {
+    while (
+      session.commandOrder.length > this.#commandCacheLimit ||
+      session.commandCacheBytes > this.#commandCacheLimitBytes
+    ) {
+      const removableIndex = session.commandOrder.findIndex(
+        (commandId) => session.commands.get(commandId)?.completed === true,
+      );
+      if (removableIndex < 0) return;
+      const [commandId] = session.commandOrder.splice(removableIndex, 1);
+      if (commandId === undefined) return;
+      const entry = session.commands.get(commandId);
+      if (entry === undefined) continue;
+      session.commandCacheBytes -= entry.retainedBytes;
+      session.commands.delete(commandId);
     }
   }
 
-  #appendEvent(session: SessionState, event: NotebookExecutionEvent): void {
-    if (
-      event.sessionId !== session.sessionId ||
-      event.sequence <= session.lastSequence ||
-      session.pendingEvents.has(event.sequence)
-    ) {
+  #appendEvent(session: SessionState, event: NotebookExecutionEvent, allowReplay = false): boolean {
+    if (event.sessionId !== session.sessionId) {
       throw new NotebookRuntimeManagerError({
         reason: "invalid-sequence",
         message: "Notebook runtime emitted an invalid event sequence.",
       });
     }
-    session.pendingEvents.set(event.sequence, event);
+    if (event.sequence <= session.lastSequence) {
+      if (allowReplay) {
+        const retained = session.events.find((candidate) => candidate.sequence === event.sequence);
+        if (retained === undefined || JSON.stringify(retained) === JSON.stringify(event)) {
+          return false;
+        }
+      }
+      throw new NotebookRuntimeManagerError({
+        reason: "invalid-sequence",
+        message: "Notebook runtime emitted an invalid event sequence.",
+      });
+    }
+    const pendingAtSequence = session.pendingEvents.get(event.sequence);
+    if (pendingAtSequence !== undefined) {
+      if (allowReplay && JSON.stringify(pendingAtSequence.event) === JSON.stringify(event)) {
+        return false;
+      }
+      throw new NotebookRuntimeManagerError({
+        reason: "invalid-sequence",
+        message: "Notebook runtime emitted an invalid event sequence.",
+      });
+    }
+    const bytes = Buffer.byteLength(JSON.stringify(event));
+    session.pendingEvents.set(event.sequence, { event, bytes });
+    session.pendingEventBytes += bytes;
     while (true) {
       const next = session.pendingEvents.get(session.lastSequence + 1);
       if (next === undefined) break;
-      session.pendingEvents.delete(next.sequence);
-      session.lastSequence = next.sequence;
-      session.events.push(next);
-      while (session.events.length > this.#eventHistoryLimit) session.events.shift();
+      session.pendingEvents.delete(next.event.sequence);
+      session.pendingEventBytes -= next.bytes;
+      session.lastSequence = next.event.sequence;
+      session.events.push(next.event);
+      session.eventSizes.push(next.bytes);
+      session.eventHistoryBytes += next.bytes;
+      while (
+        session.events.length > this.#eventHistoryLimit ||
+        session.eventHistoryBytes > this.#eventHistoryLimitBytes
+      ) {
+        session.events.shift();
+        session.eventHistoryBytes -= session.eventSizes.shift() ?? 0;
+      }
     }
+    if (session.pendingEventBytes > this.#eventHistoryLimitBytes) {
+      const pending = session.pendingEvents.get(event.sequence);
+      if (pending !== undefined) {
+        session.pendingEvents.delete(event.sequence);
+        session.pendingEventBytes -= pending.bytes;
+      }
+      throw new NotebookRuntimeManagerError({
+        reason: "invalid-sequence",
+        message: "Notebook runtime pending events exceeded the retention limit.",
+      });
+    }
+    return true;
+  }
+
+  #commandResultState(
+    events: ReadonlyArray<NotebookExecutionEvent>,
+    commandId: string,
+    command: "open" | "execute" | "interrupt" | "restart" | "dispose",
+  ): "accepted-terminal" | "rejected" | "incomplete" {
+    const commandEvents = events.filter((event) => event.commandId === commandId);
+    if (commandEvents.some((event) => event.type === "rejected")) return "rejected";
+    const accepted = commandEvents.some(
+      (event) => event.type === "accepted" && event.commandType === command,
+    );
+    if (!accepted) return "incomplete";
+    const terminal = commandEvents.some((event) => {
+      if (event.type !== "kernel") return false;
+      switch (command) {
+        case "open":
+        case "restart":
+          return event.state === "idle";
+        case "execute":
+          return event.state === "idle" || event.state === "terminated";
+        case "interrupt":
+          return event.state === "interrupted";
+        case "dispose":
+          return event.state === "terminated";
+      }
+    });
+    return terminal ? "accepted-terminal" : "incomplete";
   }
 
   #assertFingerprint(entry: CommandCacheEntry, fingerprint: string): void {
@@ -533,7 +799,9 @@ export class NotebookRuntimeManager {
       "--env",
       "NOTEBOOK_OUTPUT_LIMIT_BYTES=10485760",
       "--env",
-      "NOTEBOOK_EXECUTION_TIMEOUT_SECONDS=120",
+      `NOTEBOOK_EXECUTION_TIMEOUT_SECONDS=${this.#executionTimeoutSeconds}`,
+      "--env",
+      `NOTEBOOK_TIMEOUT_IDLE_GRACE_SECONDS=${this.#timeoutIdleGraceSeconds}`,
     ];
     for (const [index, book] of books.entries()) {
       args.push("--mount", `type=bind,src=${book},dst=/books/book-${index},readonly`);
@@ -608,12 +876,28 @@ export class NotebookRuntimeManager {
   }
 
   async #removeProject(project: ProjectRuntime): Promise<void> {
-    if (!this.#projects.delete(project.projectId)) return;
+    if (this.#projects.get(project.projectId) !== project) return;
+    const activeRemoval = this.#projectRemovals.get(project.projectId);
+    if (activeRemoval !== undefined) return activeRemoval;
+    const removal = this.#removeProjectOnce(project);
+    this.#projectRemovals.set(project.projectId, removal);
     try {
-      await this.#docker.run(["rm", "--force", project.containerId]);
+      await removal;
     } finally {
-      await NodeFSP.rm(project.controlDirectory, { force: true, recursive: true });
+      if (this.#projectRemovals.get(project.projectId) === removal) {
+        this.#projectRemovals.delete(project.projectId);
+      }
     }
+  }
+
+  async #removeProjectOnce(project: ProjectRuntime): Promise<void> {
+    await this.#docker.run(["rm", "--force", project.containerId]);
+    if (this.#projects.get(project.projectId) === project) {
+      this.#projects.delete(project.projectId);
+    }
+    await NodeFSP.rm(project.controlDirectory, { force: true, recursive: true }).catch(
+      () => undefined,
+    );
   }
 }
 

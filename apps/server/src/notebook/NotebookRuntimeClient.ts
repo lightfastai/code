@@ -9,6 +9,8 @@ import {
 import * as Schema from "effect/Schema";
 
 const JSON_RESPONSE_LIMIT_BYTES = 16 * 1024 * 1024;
+const NDJSON_LINE_LIMIT_BYTES = 1024 * 1024;
+const NDJSON_AGGREGATE_LIMIT_BYTES = 16 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 130_000;
 const decodeEvent = Schema.decodeUnknownSync(NotebookExecutionEvent);
 
@@ -61,6 +63,45 @@ export class NotebookRuntimeClientError extends Error {
   }
 }
 
+const decodeExecutionStream = async function* (
+  chunks: AsyncIterable<Uint8Array>,
+  decode: (line: string) => ExecutionEvent,
+): AsyncIterable<ExecutionEvent> {
+  let buffered = Buffer.alloc(0);
+  let aggregateBytes = 0;
+  for await (const rawChunk of chunks) {
+    const chunk = Buffer.from(rawChunk);
+    aggregateBytes += chunk.length;
+    if (aggregateBytes > NDJSON_AGGREGATE_LIMIT_BYTES) {
+      throw new NotebookRuntimeClientError({
+        reason: "protocol",
+        message: "Notebook runtime execution stream exceeded the client limit.",
+      });
+    }
+    buffered = Buffer.concat([buffered, chunk]);
+    while (true) {
+      const newline = buffered.indexOf(10);
+      if (newline < 0) break;
+      if (newline > NDJSON_LINE_LIMIT_BYTES) {
+        throw new NotebookRuntimeClientError({
+          reason: "protocol",
+          message: "Notebook runtime execution frame exceeded the client limit.",
+        });
+      }
+      const line = buffered.subarray(0, newline);
+      buffered = buffered.subarray(newline + 1);
+      if (line.length > 0) yield decode(line.toString());
+    }
+    if (buffered.length > NDJSON_LINE_LIMIT_BYTES) {
+      throw new NotebookRuntimeClientError({
+        reason: "protocol",
+        message: "Notebook runtime execution frame exceeded the client limit.",
+      });
+    }
+  }
+  if (buffered.length > 0) yield decode(buffered.toString());
+};
+
 export interface NotebookRuntimeClientOptions {
   readonly token: string;
   readonly baseUrl?: string;
@@ -104,21 +145,12 @@ export class NotebookRuntimeClient implements NotebookRuntimeClientLike {
       `/v1/sessions/${encodeURIComponent(input.sessionId)}/execute`,
       input,
     );
-    let buffered = "";
-    const decoder = new TextDecoder();
     try {
-      for await (const chunk of response) {
-        buffered += decoder.decode(chunk as Uint8Array, { stream: true });
-        while (true) {
-          const newline = buffered.indexOf("\n");
-          if (newline < 0) break;
-          const line = buffered.slice(0, newline);
-          buffered = buffered.slice(newline + 1);
-          if (line) yield this.#decodeEventLine(line);
-        }
+      for await (const event of decodeExecutionStream(response, (line) =>
+        this.#decodeEventLine(line),
+      )) {
+        yield event;
       }
-      buffered += decoder.decode();
-      if (buffered.trim()) yield this.#decodeEventLine(buffered);
     } finally {
       response.destroy();
     }
@@ -319,24 +351,14 @@ export class DockerExecNotebookRuntimeClient implements NotebookRuntimeClientLik
   }
 
   async *execute(input: RuntimeExecuteRequest): AsyncIterable<ExecutionEvent> {
-    let buffered = "";
-    const decoder = new TextDecoder();
-    for await (const chunk of this.#request(
+    const chunks = this.#request(
       "POST",
       `/v1/sessions/${encodeURIComponent(input.sessionId)}/execute`,
       input,
-    )) {
-      buffered += decoder.decode(chunk, { stream: true });
-      while (true) {
-        const newline = buffered.indexOf("\n");
-        if (newline < 0) break;
-        const line = buffered.slice(0, newline);
-        buffered = buffered.slice(newline + 1);
-        if (line) yield this.#decodeEvent(line);
-      }
+    );
+    for await (const event of decodeExecutionStream(chunks, (line) => this.#decodeEvent(line))) {
+      yield event;
     }
-    buffered += decoder.decode();
-    if (buffered.trim()) yield this.#decodeEvent(buffered);
   }
 
   interrupt(input: RuntimeSessionCommandRequest): Promise<ReadonlyArray<ExecutionEvent>> {
@@ -482,6 +504,7 @@ export class DockerExecNotebookRuntimeClient implements NotebookRuntimeClientLik
       });
     } finally {
       clearTimeout(timer);
+      if (child.exitCode === null) child.kill("SIGKILL");
     }
   }
 }

@@ -12,6 +12,7 @@ import type {
   RuntimeSessionCommandRequest,
   RuntimeSessionOpenRequest,
 } from "./NotebookRuntimeClient.ts";
+import { NotebookRuntimeClientError } from "./NotebookRuntimeClient.ts";
 import {
   type DockerCommandRunner,
   NotebookRuntimeManager,
@@ -27,6 +28,7 @@ afterEach(async () => {
 
 class FakeDocker implements DockerCommandRunner {
   readonly calls: Array<{ args: readonly string[]; env?: Readonly<Record<string, string>> }> = [];
+  removeFailures = 0;
 
   async run(
     args: readonly string[],
@@ -36,6 +38,10 @@ class FakeDocker implements DockerCommandRunner {
       args: [...args],
       ...(options?.env === undefined ? {} : { env: options.env }),
     });
+    if (args[0] === "rm" && this.removeFailures > 0) {
+      this.removeFailures -= 1;
+      throw new Error("injected remove failure");
+    }
     return { stdout: args[0] === "run" ? "container-id\n" : "" };
   }
 }
@@ -43,6 +49,7 @@ class FakeDocker implements DockerCommandRunner {
 class FakeRuntimeClient implements NotebookRuntimeClientLike {
   executeCount = 0;
   healthCount = 0;
+  interruptFailures = 0;
   nextSequence = new Map<string, number>();
 
   async health(): Promise<void> {
@@ -82,11 +89,24 @@ class FakeRuntimeClient implements NotebookRuntimeClientLike {
   }
 
   async interrupt(input: RuntimeSessionCommandRequest): Promise<readonly NotebookExecutionEvent[]> {
+    if (this.interruptFailures > 0) {
+      this.interruptFailures -= 1;
+      throw new NotebookRuntimeClientError({
+        reason: "transport",
+        message: "injected interrupt transport failure",
+      });
+    }
     return this.control(input, "interrupt", "interrupted");
   }
 
   async restart(input: RuntimeSessionCommandRequest): Promise<readonly NotebookExecutionEvent[]> {
-    return this.control(input, "restart", "restarted");
+    const restarted = this.control(input, "restart", "restarted");
+    const sequence = this.nextSequence.get(input.sessionId) ?? 1;
+    this.nextSequence.set(input.sessionId, sequence + 1);
+    return [
+      ...restarted,
+      event(input.sessionId, input.commandId, sequence, "kernel", { state: "idle" }),
+    ];
   }
 
   async dispose(input: RuntimeSessionCommandRequest): Promise<readonly NotebookExecutionEvent[]> {
@@ -114,6 +134,63 @@ class FakeRuntimeClient implements NotebookRuntimeClientLike {
   }
 }
 
+class PartialFailureRuntimeClient extends FakeRuntimeClient {
+  readonly recoveryMode: "events" | "replay";
+  eventsAfterCount = 0;
+  sideEffectCount = 0;
+
+  constructor(recoveryMode: "events" | "replay") {
+    super();
+    this.recoveryMode = recoveryMode;
+  }
+
+  override async *execute(input: RuntimeExecuteRequest): AsyncIterable<NotebookExecutionEvent> {
+    this.executeCount += 1;
+    const events = [
+      event(input.sessionId, input.commandId, 4, "accepted", {
+        executionId: input.executionId,
+        commandType: "execute",
+      }),
+      event(input.sessionId, input.commandId, 5, "stream", {
+        executionId: input.executionId,
+        name: "stdout",
+        text: "once\n",
+      }),
+      event(input.sessionId, input.commandId, 6, "kernel", {
+        executionId: input.executionId,
+        state: "idle",
+      }),
+    ];
+    this.nextSequence.set(input.sessionId, 7);
+    if (this.executeCount === 1) {
+      this.sideEffectCount += 1;
+      yield events[0]!;
+      yield events[1]!;
+      throw new NotebookRuntimeClientError({
+        reason: "transport",
+        message: "injected partial execution transport failure",
+      });
+    }
+    for (const item of events) yield item;
+  }
+
+  override async eventsAfter(
+    _sessionId: string,
+    _afterSequence: number,
+  ): Promise<readonly NotebookExecutionEvent[]> {
+    this.eventsAfterCount += 1;
+    if (this.recoveryMode === "events") {
+      return [
+        event("session-1", "execute-recover", 6, "kernel", {
+          executionId: "execution-recover",
+          state: "idle",
+        }),
+      ];
+    }
+    return [];
+  }
+}
+
 const event = (
   sessionId: string,
   commandId: string,
@@ -123,7 +200,12 @@ const event = (
 ): NotebookExecutionEvent =>
   ({ sessionId, commandId, sequence, type, ...fields }) as NotebookExecutionEvent;
 
-const makeHarness = async (options?: { readonly idleTimeoutMs?: number }) => {
+const makeHarness = async (options?: {
+  readonly idleTimeoutMs?: number;
+  readonly eventHistoryLimitBytes?: number;
+  readonly commandCacheLimitBytes?: number;
+  readonly createClient?: () => FakeRuntimeClient;
+}) => {
   const runtimeRoot = await NodeFSP.mkdtemp(
     NodePath.join(NodeOS.tmpdir(), "notebook-manager-test-"),
   );
@@ -136,13 +218,19 @@ const makeHarness = async (options?: { readonly idleTimeoutMs?: number }) => {
     image: "lightfast/notebook-runtime:test",
     runtimeRoot,
     clientFactory: () => {
-      const client = new FakeRuntimeClient();
+      const client = options?.createClient?.() ?? new FakeRuntimeClient();
       clients.push(client);
       return client;
     },
     now: () => now,
     idleTimeoutMs: options?.idleTimeoutMs ?? 60_000,
     readinessTimeoutMs: 50,
+    ...(options?.eventHistoryLimitBytes === undefined
+      ? {}
+      : { eventHistoryLimitBytes: options.eventHistoryLimitBytes }),
+    ...(options?.commandCacheLimitBytes === undefined
+      ? {}
+      : { commandCacheLimitBytes: options.commandCacheLimitBytes }),
   });
   return { docker, clients, manager, setNow: (value: number) => (now = value) };
 };
@@ -266,5 +354,140 @@ it("rejects non-monotonic sidecar events", async () => {
   ).catch((cause: unknown) => cause);
   expect(error).toBeInstanceOf(NotebookRuntimeManagerError);
   expect(error).toMatchObject({ reason: "invalid-sequence" });
+  await manager.close();
+});
+
+it("bounds retained event history and command results by serialized bytes", async () => {
+  const eventLimit = 500;
+  const { clients, manager } = await makeHarness({
+    eventHistoryLimitBytes: eventLimit,
+    commandCacheLimitBytes: 300,
+  });
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+  const request = {
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "execute-byte-bound",
+    executionId: "execution-byte-bound",
+    code: "print('ok')",
+  } as const;
+
+  await Array.fromAsync(manager.execute(request));
+  const retained = manager.eventsAfter("project-1", "session-1", 0);
+  expect(
+    retained.reduce((bytes, item) => bytes + Buffer.byteLength(JSON.stringify(item)), 0),
+  ).toBeLessThanOrEqual(eventLimit);
+
+  await Array.fromAsync(manager.execute(request));
+  expect(clients[0]?.executeCount).toBe(2);
+  await manager.close();
+});
+
+it("keeps failed container cleanup tracked so close can retry", async () => {
+  const { docker, manager } = await makeHarness();
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+  docker.removeFailures = 1;
+
+  await expect(manager.close()).rejects.toThrow("injected remove failure");
+  await manager.close();
+
+  expect(
+    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id"),
+  ).toHaveLength(2);
+});
+
+it("reconciles a partial stream once for concurrent duplicates without repeating effects", async () => {
+  const client = new PartialFailureRuntimeClient("replay");
+  const { manager } = await makeHarness({ createClient: () => client });
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+  const request = {
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "execute-recover",
+    executionId: "execution-recover",
+    code: "side_effect()",
+  } as const;
+
+  const first = Array.fromAsync(manager.execute(request));
+  const duplicate = Array.fromAsync(manager.execute(request));
+  let conflict: unknown;
+  try {
+    manager.execute({ ...request, code: "different_side_effect()" });
+  } catch (error) {
+    conflict = error;
+  }
+  expect(conflict).toBeInstanceOf(NotebookRuntimeManagerError);
+  expect(conflict).toMatchObject({ reason: "command-id-conflict" });
+  const [firstEvents, duplicateEvents] = await Promise.all([first, duplicate]);
+
+  expect(firstEvents.map((item) => item.sequence)).toEqual([4, 5, 6]);
+  expect(duplicateEvents).toEqual(firstEvents);
+  expect(client.eventsAfterCount).toBe(1);
+  expect(client.executeCount).toBe(2);
+  expect(client.sideEffectCount).toBe(1);
+  await manager.close();
+});
+
+it("finishes a partial execution directly from queried sidecar history", async () => {
+  const client = new PartialFailureRuntimeClient("events");
+  const { manager } = await makeHarness({ createClient: () => client });
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+
+  const events = await Array.fromAsync(
+    manager.execute({
+      projectId: "project-1",
+      sessionId: "session-1",
+      commandId: "execute-recover",
+      executionId: "execution-recover",
+      code: "side_effect()",
+    }),
+  );
+
+  expect(events.map((item) => item.sequence)).toEqual([4, 5, 6]);
+  expect(client.eventsAfterCount).toBe(1);
+  expect(client.executeCount).toBe(1);
+  expect(client.sideEffectCount).toBe(1);
+  await manager.close();
+});
+
+it("does not cache nonterminal transport failures for control retries", async () => {
+  const { clients, manager } = await makeHarness();
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+  clients[0]!.interruptFailures = 1;
+  const input = {
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "interrupt-retry",
+  } as const;
+
+  await expect(manager.interrupt(input)).rejects.toThrow("injected interrupt transport failure");
+  const retried = await manager.interrupt(input);
+
+  expect(retried.at(-1)).toMatchObject({ type: "kernel", state: "interrupted" });
   await manager.close();
 });
