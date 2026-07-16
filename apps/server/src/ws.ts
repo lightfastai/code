@@ -121,6 +121,8 @@ import { searchStudyLibrary } from "./study/StudySearch.ts";
 import { createStudyVoiceSession } from "./study/StudyVoiceSession.ts";
 import * as NotebookRevisionStore from "./notebook/NotebookRevisionStore.ts";
 import { makeNotebookRevisionRpcHandlers } from "./notebook/NotebookRevisionRpc.ts";
+import * as NotebookRuntimeManager from "./notebook/NotebookRuntimeManager.ts";
+import { makeNotebookRuntimeRpcHandlers } from "./notebook/NotebookRuntimeRpc.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 const isStudyVoiceSessionError = Schema.is(StudyVoiceSessionError);
 
@@ -319,6 +321,12 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.studyLibraryList, AuthOrchestrationReadScope],
   [WS_METHODS.studyLibrarySearch, AuthOrchestrationReadScope],
   [WS_METHODS.studyVoiceSessionCreate, AuthOrchestrationOperateScope],
+  [WS_METHODS.notebookSessionOpen, AuthOrchestrationOperateScope],
+  [WS_METHODS.notebookCellExecute, AuthOrchestrationOperateScope],
+  [WS_METHODS.notebookExecutionInterrupt, AuthOrchestrationOperateScope],
+  [WS_METHODS.notebookKernelRestart, AuthOrchestrationOperateScope],
+  [WS_METHODS.notebookSessionDispose, AuthOrchestrationOperateScope],
+  [WS_METHODS.notebookSessionEvents, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeVcsStatus, AuthOrchestrationReadScope],
   [WS_METHODS.vcsRefreshStatus, AuthOrchestrationReadScope],
   [WS_METHODS.vcsPull, AuthOrchestrationOperateScope],
@@ -402,6 +410,7 @@ const makeWsRpcLayer = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
   notebookRevisionStore: NotebookRevisionStore.NotebookRevisionStore["Service"],
+  notebookRuntimeManager: NotebookRuntimeManager.NotebookRuntimeManager,
 ) =>
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
@@ -964,6 +973,13 @@ const makeWsRpcLayer = (
         store: notebookRevisionStore,
         observe: (method, effect) =>
           instrumentRpcEffect(method, effect, { "rpc.aggregate": "notebook" }),
+      });
+      const notebookRuntimeRpcHandlers = makeNotebookRuntimeRpcHandlers({
+        scopes: currentSession.scopes,
+        environmentId: serverEnvironment.getEnvironmentId,
+        projectExists: (projectId) =>
+          projectionSnapshotQuery.getProjectShellById(projectId).pipe(Effect.map(Option.isSome)),
+        manager: notebookRuntimeManager,
       });
 
       return WsRpcGroup.of({
@@ -1599,6 +1615,7 @@ const makeWsRpcLayer = (
             { "rpc.aggregate": "study" },
           ),
         ...notebookRevisionRpcHandlers,
+        ...notebookRuntimeRpcHandlers,
         [WS_METHODS.subscribeVcsStatus]: (input) =>
           observeRpcStream(
             WS_METHODS.subscribeVcsStatus,
@@ -1943,6 +1960,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
   Effect.gen(function* () {
     const previewAutomationBroker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
     const notebookRevisionStore = yield* NotebookRevisionStore.NotebookRevisionStore;
+    const notebookRuntimeManager = yield* NotebookRuntimeManager.NotebookRuntimeManagerService;
     return HttpRouter.add(
       "GET",
       "/ws",
@@ -1962,7 +1980,12 @@ export const websocketRpcRouteLayer = Layer.unwrap(
           disableTracing: true,
         }).pipe(
           Effect.provide(
-            makeWsRpcLayer(session, previewAutomationBroker, notebookRevisionStore).pipe(
+            makeWsRpcLayer(
+              session,
+              previewAutomationBroker,
+              notebookRevisionStore,
+              notebookRuntimeManager,
+            ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(ProviderMaintenanceRunner.layer),
               Layer.provide(

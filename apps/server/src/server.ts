@@ -83,6 +83,7 @@ import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as NotebookRevisionStore from "./notebook/NotebookRevisionStore.ts";
+import * as NotebookRuntimeManager from "./notebook/NotebookRuntimeManager.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import {
   clearPersistedServerRuntimeState,
@@ -365,6 +366,7 @@ export const makeRoutesLayer = Layer.mergeAll(
   McpHttpServer.layer.pipe(Layer.provide(McpSessionRegistry.layer)),
 ).pipe(
   Layer.provide(NotebookRevisionStoreLayerLive),
+  Layer.provide(NotebookRuntimeManager.layer),
   Layer.provide(PreviewAutomationBroker.layer),
   Layer.provide(browserApiCorsLayer),
 );

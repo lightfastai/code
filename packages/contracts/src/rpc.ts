@@ -144,11 +144,18 @@ import {
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
 import {
+  NotebookCellExecuteInput,
+  NotebookExecutionControlInput,
+  NotebookExecutionEvent,
+  NotebookExecutionEvents,
   NotebookRevisionCreateInput,
   NotebookRevisionExportResult,
   NotebookRevisionImportInput,
   NotebookRevisionRef,
   NotebookRevisionSaveInput,
+  NotebookRuntimeError,
+  NotebookSessionEventsInput,
+  NotebookSessionOpenInput,
 } from "./notebook.ts";
 import {
   NotebookRevision,
@@ -193,6 +200,12 @@ export const WS_METHODS = {
   notebookRevisionSave: "notebook.revision.save",
   notebookRevisionImport: "notebook.revision.import",
   notebookRevisionExport: "notebook.revision.export",
+  notebookSessionOpen: "notebook.session.open",
+  notebookCellExecute: "notebook.cell.execute",
+  notebookExecutionInterrupt: "notebook.execution.interrupt",
+  notebookKernelRestart: "notebook.kernel.restart",
+  notebookSessionDispose: "notebook.session.dispose",
+  notebookSessionEvents: "notebook.session.events",
 
   // VCS methods
   vcsPull: "vcs.pull",
@@ -474,6 +487,43 @@ export const WsNotebookRevisionExportRpc = Rpc.make(WS_METHODS.notebookRevisionE
   payload: NotebookRevisionRef,
   success: NotebookRevisionExportResult,
   error: Schema.Union([NotebookRevisionError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookSessionOpenRpc = Rpc.make(WS_METHODS.notebookSessionOpen, {
+  payload: NotebookSessionOpenInput,
+  success: NotebookExecutionEvents,
+  error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookCellExecuteRpc = Rpc.make(WS_METHODS.notebookCellExecute, {
+  payload: NotebookCellExecuteInput,
+  success: NotebookExecutionEvent,
+  error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
+export const WsNotebookExecutionInterruptRpc = Rpc.make(WS_METHODS.notebookExecutionInterrupt, {
+  payload: NotebookExecutionControlInput,
+  success: NotebookExecutionEvents,
+  error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookKernelRestartRpc = Rpc.make(WS_METHODS.notebookKernelRestart, {
+  payload: NotebookExecutionControlInput,
+  success: NotebookExecutionEvents,
+  error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookSessionDisposeRpc = Rpc.make(WS_METHODS.notebookSessionDispose, {
+  payload: NotebookExecutionControlInput,
+  success: NotebookExecutionEvents,
+  error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookSessionEventsRpc = Rpc.make(WS_METHODS.notebookSessionEvents, {
+  payload: NotebookSessionEventsInput,
+  success: NotebookExecutionEvents,
+  error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
 });
 
 export const WsSubscribeVcsStatusRpc = Rpc.make(WS_METHODS.subscribeVcsStatus, {
@@ -795,6 +845,12 @@ export const WsRpcGroup = RpcGroup.make(
   WsNotebookRevisionSaveRpc,
   WsNotebookRevisionImportRpc,
   WsNotebookRevisionExportRpc,
+  WsNotebookSessionOpenRpc,
+  WsNotebookCellExecuteRpc,
+  WsNotebookExecutionInterruptRpc,
+  WsNotebookKernelRestartRpc,
+  WsNotebookSessionDisposeRpc,
+  WsNotebookSessionEventsRpc,
   WsSubscribeVcsStatusRpc,
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,

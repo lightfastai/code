@@ -1,0 +1,642 @@
+// @effect-diagnostics nodeBuiltinImport:off globalTimers:off - Docker and UDS lifecycle is a Node boundary.
+import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import * as NodeProcess from "node:process";
+
+import type { NotebookExecutionEvent } from "@t3tools/contracts";
+import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+
+import {
+  DockerExecNotebookRuntimeClient,
+  type NotebookRuntimeClientLike,
+  type RuntimeExecuteRequest,
+} from "./NotebookRuntimeClient.ts";
+
+const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000;
+const DEFAULT_READINESS_TIMEOUT_MS = 30_000;
+const DEFAULT_EVENT_HISTORY_LIMIT = 4096;
+const DEFAULT_COMMAND_CACHE_LIMIT = 512;
+const DOCKER_OUTPUT_LIMIT_BYTES = 1024 * 1024;
+
+export interface DockerCommandRunner {
+  readonly run: (
+    args: readonly string[],
+    options?: { readonly env?: Readonly<Record<string, string>> },
+  ) => Promise<{ readonly stdout: string }>;
+}
+
+export class DockerCliCommandRunner implements DockerCommandRunner {
+  async run(
+    args: readonly string[],
+    options?: { readonly env?: Readonly<Record<string, string>> },
+  ): Promise<{ readonly stdout: string }> {
+    return new Promise((resolvePromise, reject) => {
+      const child = NodeChildProcess.spawn("docker", [...args], {
+        env: { ...NodeProcess.env, ...options?.env },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      let outputBytes = 0;
+      const append = (target: Buffer[], chunk: Uint8Array) => {
+        const buffer = Buffer.from(chunk);
+        outputBytes += buffer.length;
+        if (outputBytes > DOCKER_OUTPUT_LIMIT_BYTES) {
+          child.kill("SIGKILL");
+          return;
+        }
+        target.push(buffer);
+      };
+      child.stdout.on("data", (chunk) => append(stdout, chunk));
+      child.stderr.on("data", (chunk) => append(stderr, chunk));
+      child.on("error", () =>
+        reject(
+          new NotebookRuntimeManagerError({
+            reason: "docker-failed",
+            message: "Could not launch the Docker CLI.",
+          }),
+        ),
+      );
+      child.on("close", (code) => {
+        if (outputBytes > DOCKER_OUTPUT_LIMIT_BYTES) {
+          reject(
+            new NotebookRuntimeManagerError({
+              reason: "docker-failed",
+              message: "Docker CLI output exceeded the safety limit.",
+            }),
+          );
+          return;
+        }
+        if (code !== 0) {
+          const detail = Buffer.concat(stderr).toString().trim().slice(0, 512);
+          reject(
+            new NotebookRuntimeManagerError({
+              reason: "docker-failed",
+              message: detail ? `Docker command failed: ${detail}` : "Docker command failed.",
+            }),
+          );
+          return;
+        }
+        resolvePromise({ stdout: Buffer.concat(stdout).toString() });
+      });
+    });
+  }
+}
+
+export class NotebookRuntimeManagerError extends Error {
+  readonly reason:
+    | "docker-failed"
+    | "runtime-unavailable"
+    | "session-not-found"
+    | "command-id-conflict"
+    | "invalid-sequence"
+    | "invalid-mount";
+
+  constructor(options: {
+    readonly reason: NotebookRuntimeManagerError["reason"];
+    readonly message: string;
+  }) {
+    super(options.message);
+    this.name = "NotebookRuntimeManagerError";
+    this.reason = options.reason;
+  }
+}
+
+interface CommandResult {
+  readonly events?: ReadonlyArray<NotebookExecutionEvent>;
+  readonly error?: unknown;
+}
+
+interface CommandCacheEntry {
+  readonly fingerprint: string;
+  readonly completion: Promise<CommandResult>;
+}
+
+interface SessionState {
+  readonly sessionId: string;
+  readonly events: NotebookExecutionEvent[];
+  readonly commands: Map<string, CommandCacheEntry>;
+  readonly commandOrder: string[];
+  readonly pendingEvents: Map<number, NotebookExecutionEvent>;
+  lastSequence: number;
+  disposed: boolean;
+}
+
+interface ProjectRuntime {
+  readonly projectId: string;
+  readonly containerId: string;
+  readonly controlDirectory: string;
+  readonly client: NotebookRuntimeClientLike;
+  readonly books: ReadonlyArray<string>;
+  readonly sessions: Map<string, SessionState>;
+  lastUsedAt: number;
+}
+
+class ExecutionEventQueue implements AsyncIterable<NotebookExecutionEvent> {
+  readonly #events: NotebookExecutionEvent[] = [];
+  #wake: (() => void) | undefined;
+  #done = false;
+  #error: unknown;
+
+  push(event: NotebookExecutionEvent): void {
+    this.#events.push(event);
+    this.#wake?.();
+    this.#wake = undefined;
+  }
+
+  finish(error?: unknown): void {
+    this.#done = true;
+    this.#error = error;
+    this.#wake?.();
+    this.#wake = undefined;
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<NotebookExecutionEvent> {
+    while (true) {
+      const event = this.#events.shift();
+      if (event !== undefined) {
+        yield event;
+        continue;
+      }
+      if (this.#done) {
+        if (this.#error !== undefined) throw this.#error;
+        return;
+      }
+      await new Promise<void>((resolvePromise) => {
+        this.#wake = resolvePromise;
+      });
+    }
+  }
+}
+
+export interface NotebookRuntimeManagerOptions {
+  readonly docker?: DockerCommandRunner;
+  readonly image: string;
+  readonly runtimeRoot?: string;
+  readonly clientFactory?: (options: {
+    readonly containerId: string;
+    readonly token: string;
+  }) => NotebookRuntimeClientLike;
+  readonly now?: () => number;
+  readonly idleTimeoutMs?: number;
+  readonly readinessTimeoutMs?: number;
+  readonly eventHistoryLimit?: number;
+  readonly commandCacheLimit?: number;
+}
+
+export interface NotebookManagerSessionOpenInput {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly commandId: string;
+  readonly kernelName: string;
+  readonly bookPaths?: ReadonlyArray<string>;
+}
+
+export interface NotebookManagerExecuteInput extends RuntimeExecuteRequest {
+  readonly projectId: string;
+}
+
+export interface NotebookManagerControlInput {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly commandId: string;
+}
+
+export class NotebookRuntimeManager {
+  readonly #docker: DockerCommandRunner;
+  readonly #image: string;
+  readonly #runtimeRoot: string;
+  readonly #clientFactory: NonNullable<NotebookRuntimeManagerOptions["clientFactory"]>;
+  readonly #now: () => number;
+  readonly #idleTimeoutMs: number;
+  readonly #readinessTimeoutMs: number;
+  readonly #eventHistoryLimit: number;
+  readonly #commandCacheLimit: number;
+  readonly #projects = new Map<string, ProjectRuntime>();
+  readonly #projectStarts = new Map<string, Promise<ProjectRuntime>>();
+
+  constructor(options: NotebookRuntimeManagerOptions) {
+    this.#docker = options.docker ?? new DockerCliCommandRunner();
+    this.#image = options.image;
+    this.#runtimeRoot =
+      options.runtimeRoot ?? NodePath.join(NodeOS.tmpdir(), "lightfast-notebook-runtime");
+    this.#clientFactory =
+      options.clientFactory ??
+      ((clientOptions) =>
+        new DockerExecNotebookRuntimeClient({ ...clientOptions, requestTimeoutMs: 130_000 }));
+    this.#now = options.now ?? Date.now;
+    this.#idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    this.#readinessTimeoutMs = options.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
+    this.#eventHistoryLimit = options.eventHistoryLimit ?? DEFAULT_EVENT_HISTORY_LIMIT;
+    this.#commandCacheLimit = options.commandCacheLimit ?? DEFAULT_COMMAND_CACHE_LIMIT;
+  }
+
+  async open(
+    input: NotebookManagerSessionOpenInput,
+  ): Promise<ReadonlyArray<NotebookExecutionEvent>> {
+    const project = await this.#ensureProject(input.projectId, input.bookPaths ?? []);
+    project.lastUsedAt = this.#now();
+    const existing = project.sessions.get(input.sessionId);
+    if (existing !== undefined) {
+      if (existing.disposed) {
+        throw new NotebookRuntimeManagerError({
+          reason: "session-not-found",
+          message: "Notebook session has already been disposed.",
+        });
+      }
+      return this.#runCached(existing, input.commandId, this.#fingerprint("open", input), () =>
+        project.client.open(input),
+      );
+    }
+    const session: SessionState = {
+      sessionId: input.sessionId,
+      events: [],
+      commands: new Map(),
+      commandOrder: [],
+      pendingEvents: new Map(),
+      lastSequence: 0,
+      disposed: false,
+    };
+    project.sessions.set(input.sessionId, session);
+    try {
+      return await this.#runCached(session, input.commandId, this.#fingerprint("open", input), () =>
+        project.client.open(input),
+      );
+    } catch (error) {
+      project.sessions.delete(input.sessionId);
+      throw error;
+    }
+  }
+
+  execute(input: NotebookManagerExecuteInput): AsyncIterable<NotebookExecutionEvent> {
+    const { project, session } = this.#getSession(input);
+    project.lastUsedAt = this.#now();
+    const fingerprint = this.#fingerprint("execute", input);
+    const cached = session.commands.get(input.commandId);
+    if (cached !== undefined) {
+      this.#assertFingerprint(cached, fingerprint);
+      return this.#replay(cached);
+    }
+
+    let complete!: (result: CommandResult) => void;
+    const completion = new Promise<CommandResult>((resolvePromise) => {
+      complete = resolvePromise;
+    });
+    this.#cacheCommand(session, input.commandId, { fingerprint, completion });
+    const queue = new ExecutionEventQueue();
+    const events: NotebookExecutionEvent[] = [];
+    void (async () => {
+      try {
+        for await (const event of project.client.execute(input)) {
+          this.#appendEvent(session, event);
+          events.push(event);
+          queue.push(event);
+        }
+        complete({ events });
+        queue.finish();
+      } catch (error) {
+        complete({ error });
+        queue.finish(error);
+      }
+    })();
+    return queue;
+  }
+
+  interrupt(input: NotebookManagerControlInput): Promise<ReadonlyArray<NotebookExecutionEvent>> {
+    return this.#control("interrupt", input);
+  }
+
+  restart(input: NotebookManagerControlInput): Promise<ReadonlyArray<NotebookExecutionEvent>> {
+    return this.#control("restart", input);
+  }
+
+  async dispose(
+    input: NotebookManagerControlInput,
+  ): Promise<ReadonlyArray<NotebookExecutionEvent>> {
+    const { project, session } = this.#getSession(input, true);
+    project.lastUsedAt = this.#now();
+    const events = await this.#runCached(
+      session,
+      input.commandId,
+      this.#fingerprint("dispose", input),
+      () => project.client.dispose(input),
+    );
+    session.disposed = true;
+    return events;
+  }
+
+  eventsAfter(
+    projectId: string,
+    sessionId: string,
+    afterSequence: number,
+  ): ReadonlyArray<NotebookExecutionEvent> {
+    const { session } = this.#getSession({ projectId, sessionId });
+    return session.events.filter((event) => event.sequence > afterSequence);
+  }
+
+  async reapIdle(): Promise<void> {
+    const cutoff = this.#now() - this.#idleTimeoutMs;
+    const idle = [...this.#projects.values()].filter((project) => project.lastUsedAt <= cutoff);
+    await Promise.all(idle.map((project) => this.#removeProject(project)));
+  }
+
+  async close(): Promise<void> {
+    await Promise.all([...this.#projects.values()].map((project) => this.#removeProject(project)));
+  }
+
+  startIdleReaper(intervalMs = Math.min(this.#idleTimeoutMs, 60_000)): () => void {
+    const timer = setInterval(() => {
+      void this.reapIdle().catch(() => undefined);
+    }, intervalMs);
+    timer.unref();
+    return () => clearInterval(timer);
+  }
+
+  async #control(
+    command: "interrupt" | "restart",
+    input: NotebookManagerControlInput,
+  ): Promise<ReadonlyArray<NotebookExecutionEvent>> {
+    const { project, session } = this.#getSession(input);
+    project.lastUsedAt = this.#now();
+    return this.#runCached(session, input.commandId, this.#fingerprint(command, input), () =>
+      command === "interrupt" ? project.client.interrupt(input) : project.client.restart(input),
+    );
+  }
+
+  #getSession(
+    input: { readonly projectId: string; readonly sessionId: string },
+    allowDisposed = false,
+  ): { readonly project: ProjectRuntime; readonly session: SessionState } {
+    const project = this.#projects.get(input.projectId);
+    const session = project?.sessions.get(input.sessionId);
+    if (project === undefined || session === undefined || (session.disposed && !allowDisposed)) {
+      throw new NotebookRuntimeManagerError({
+        reason: "session-not-found",
+        message: "Notebook session was not found.",
+      });
+    }
+    return { project, session };
+  }
+
+  async #runCached(
+    session: SessionState,
+    commandId: string,
+    fingerprint: string,
+    run: () => Promise<ReadonlyArray<NotebookExecutionEvent>>,
+  ): Promise<ReadonlyArray<NotebookExecutionEvent>> {
+    const cached = session.commands.get(commandId);
+    if (cached !== undefined) {
+      this.#assertFingerprint(cached, fingerprint);
+      const result = await cached.completion;
+      if (result.error !== undefined) throw result.error;
+      return result.events ?? [];
+    }
+    let complete!: (result: CommandResult) => void;
+    const completion = new Promise<CommandResult>((resolvePromise) => {
+      complete = resolvePromise;
+    });
+    this.#cacheCommand(session, commandId, { fingerprint, completion });
+    try {
+      const events = await run();
+      for (const event of events) this.#appendEvent(session, event);
+      complete({ events });
+      return events;
+    } catch (error) {
+      complete({ error });
+      throw error;
+    }
+  }
+
+  async *#replay(entry: CommandCacheEntry): AsyncIterable<NotebookExecutionEvent> {
+    const result = await entry.completion;
+    if (result.error !== undefined) throw result.error;
+    for (const event of result.events ?? []) yield event;
+  }
+
+  #cacheCommand(session: SessionState, commandId: string, entry: CommandCacheEntry): void {
+    session.commands.set(commandId, entry);
+    session.commandOrder.push(commandId);
+    while (session.commandOrder.length > this.#commandCacheLimit) {
+      const oldest = session.commandOrder.shift();
+      if (oldest !== undefined) session.commands.delete(oldest);
+    }
+  }
+
+  #appendEvent(session: SessionState, event: NotebookExecutionEvent): void {
+    if (
+      event.sessionId !== session.sessionId ||
+      event.sequence <= session.lastSequence ||
+      session.pendingEvents.has(event.sequence)
+    ) {
+      throw new NotebookRuntimeManagerError({
+        reason: "invalid-sequence",
+        message: "Notebook runtime emitted an invalid event sequence.",
+      });
+    }
+    session.pendingEvents.set(event.sequence, event);
+    while (true) {
+      const next = session.pendingEvents.get(session.lastSequence + 1);
+      if (next === undefined) break;
+      session.pendingEvents.delete(next.sequence);
+      session.lastSequence = next.sequence;
+      session.events.push(next);
+      while (session.events.length > this.#eventHistoryLimit) session.events.shift();
+    }
+  }
+
+  #assertFingerprint(entry: CommandCacheEntry, fingerprint: string): void {
+    if (entry.fingerprint !== fingerprint) {
+      throw new NotebookRuntimeManagerError({
+        reason: "command-id-conflict",
+        message: "Notebook command ID was reused with a different payload.",
+      });
+    }
+  }
+
+  #fingerprint(command: string, input: unknown): string {
+    return NodeCrypto.createHash("sha256").update(JSON.stringify({ command, input })).digest("hex");
+  }
+
+  async #ensureProject(
+    projectId: string,
+    bookPaths: ReadonlyArray<string>,
+  ): Promise<ProjectRuntime> {
+    const existing = this.#projects.get(projectId);
+    if (existing !== undefined) {
+      const requestedBooks = this.#normalizeBooks(bookPaths);
+      if (requestedBooks.some((book) => !existing.books.includes(book))) {
+        throw new NotebookRuntimeManagerError({
+          reason: "invalid-mount",
+          message: "Books must be selected before the project runtime starts.",
+        });
+      }
+      return existing;
+    }
+    const starting = this.#projectStarts.get(projectId);
+    if (starting !== undefined) return starting;
+    const promise = this.#startProject(projectId, bookPaths);
+    this.#projectStarts.set(projectId, promise);
+    try {
+      return await promise;
+    } finally {
+      this.#projectStarts.delete(projectId);
+    }
+  }
+
+  async #startProject(
+    projectId: string,
+    bookPaths: ReadonlyArray<string>,
+  ): Promise<ProjectRuntime> {
+    const projectHash = NodeCrypto.createHash("sha256")
+      .update(projectId)
+      .digest("hex")
+      .slice(0, 16);
+    const controlDirectory = NodePath.join(this.#runtimeRoot, projectHash);
+    const token = NodeCrypto.randomBytes(32).toString("base64url");
+    const containerName = `lightfast-notebook-${projectHash}-${NodeCrypto.randomBytes(4).toString("hex")}`;
+    const books = this.#normalizeBooks(bookPaths);
+    await NodeFSP.mkdir(controlDirectory, { mode: 0o700, recursive: true });
+    const args = [
+      "run",
+      "--detach",
+      "--rm",
+      "--name",
+      containerName,
+      "--label",
+      `lightfast.notebook.project=${projectHash}`,
+      "--network",
+      "none",
+      "--cap-drop",
+      "ALL",
+      "--security-opt",
+      "no-new-privileges:true",
+      "--read-only",
+      "--pids-limit",
+      "64",
+      "--memory",
+      "512m",
+      "--cpus",
+      "1",
+      "--stop-timeout",
+      "5",
+      "--tmpfs",
+      "/tmp:rw,nosuid,nodev,noexec,size=64m,uid=10001,gid=10001,mode=0700",
+      "--tmpfs",
+      "/workspace:rw,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700",
+      "--env",
+      "NOTEBOOK_RUNTIME_TOKEN",
+      "--env",
+      "NOTEBOOK_OUTPUT_LIMIT_BYTES=10485760",
+      "--env",
+      "NOTEBOOK_EXECUTION_TIMEOUT_SECONDS=120",
+    ];
+    for (const [index, book] of books.entries()) {
+      args.push("--mount", `type=bind,src=${book},dst=/books/book-${index},readonly`);
+    }
+    args.push(this.#image);
+
+    let containerId: string | undefined;
+    try {
+      const launched = await this.#docker.run(args, {
+        env: { NOTEBOOK_RUNTIME_TOKEN: token },
+      });
+      containerId = launched.stdout.trim().split(/\s/)[0];
+      if (!containerId) {
+        throw new NotebookRuntimeManagerError({
+          reason: "docker-failed",
+          message: "Docker did not return a notebook container ID.",
+        });
+      }
+      const client = this.#clientFactory({ containerId, token });
+      await this.#waitUntilReady(client);
+      const project: ProjectRuntime = {
+        projectId,
+        containerId,
+        controlDirectory,
+        client,
+        books,
+        sessions: new Map(),
+        lastUsedAt: this.#now(),
+      };
+      this.#projects.set(projectId, project);
+      return project;
+    } catch (error) {
+      if (containerId !== undefined) {
+        await this.#docker.run(["rm", "--force", containerId]).catch(() => undefined);
+      }
+      await NodeFSP.rm(controlDirectory, { force: true, recursive: true });
+      throw error;
+    }
+  }
+
+  async #waitUntilReady(client: NotebookRuntimeClientLike): Promise<void> {
+    const deadline = this.#now() + this.#readinessTimeoutMs;
+    let lastError: unknown;
+    do {
+      try {
+        await client.health();
+        return;
+      } catch (error) {
+        lastError = error;
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+      }
+    } while (this.#now() < deadline);
+    throw new NotebookRuntimeManagerError({
+      reason: "runtime-unavailable",
+      message:
+        lastError === undefined
+          ? "Notebook runtime did not start."
+          : "Notebook runtime was not ready.",
+    });
+  }
+
+  #normalizeBooks(bookPaths: ReadonlyArray<string>): ReadonlyArray<string> {
+    return bookPaths.map((bookPath) => {
+      if (!NodePath.isAbsolute(bookPath) || /[,\n\r]/.test(bookPath)) {
+        throw new NotebookRuntimeManagerError({
+          reason: "invalid-mount",
+          message: "Notebook book mount path is invalid.",
+        });
+      }
+      return NodePath.resolve(bookPath);
+    });
+  }
+
+  async #removeProject(project: ProjectRuntime): Promise<void> {
+    if (!this.#projects.delete(project.projectId)) return;
+    try {
+      await this.#docker.run(["rm", "--force", project.containerId]);
+    } finally {
+      await NodeFSP.rm(project.controlDirectory, { force: true, recursive: true });
+    }
+  }
+}
+
+export class NotebookRuntimeManagerService extends Context.Service<
+  NotebookRuntimeManagerService,
+  NotebookRuntimeManager
+>()("t3/notebook/NotebookRuntimeManager/NotebookRuntimeManagerService") {}
+
+export const layer = Layer.effect(
+  NotebookRuntimeManagerService,
+  Effect.acquireRelease(
+    Effect.sync(() => {
+      const manager = new NotebookRuntimeManager({
+        image:
+          NodeProcess.env.LIGHTFAST_NOTEBOOK_RUNTIME_IMAGE ?? "lightfast/notebook-runtime:0.1.0",
+      });
+      const stopReaper = manager.startIdleReaper();
+      return { manager, stopReaper };
+    }),
+    ({ manager, stopReaper }) =>
+      Effect.promise(async () => {
+        stopReaper();
+        await manager.close();
+      }),
+  ).pipe(Effect.map(({ manager }) => manager)),
+);
