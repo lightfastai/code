@@ -235,6 +235,110 @@ class DeferredDisposeRuntimeClient extends FakeRuntimeClient {
   }
 }
 
+class QueuedCancellationRuntimeClient extends FakeRuntimeClient {
+  readonly activeStarted: Promise<void>;
+  readonly queuedStarted: Promise<void>;
+  eventsAfterCount = 0;
+  readonly #cancelled: Promise<void>;
+  readonly #markActiveStarted: () => void;
+  readonly #markQueuedStarted: () => void;
+  readonly #markQueuedRejected: () => void;
+  readonly #queuedRejected: Promise<void>;
+  readonly #markActiveTerminated: () => void;
+  readonly #activeTerminated: Promise<void>;
+  readonly #cancel: () => void;
+
+  constructor() {
+    super();
+    let markActiveStarted!: () => void;
+    let markQueuedStarted!: () => void;
+    let markQueuedRejected!: () => void;
+    let markActiveTerminated!: () => void;
+    let cancel!: () => void;
+    this.activeStarted = new Promise((resolve) => {
+      markActiveStarted = resolve;
+    });
+    this.queuedStarted = new Promise((resolve) => {
+      markQueuedStarted = resolve;
+    });
+    this.#queuedRejected = new Promise((resolve) => {
+      markQueuedRejected = resolve;
+    });
+    this.#activeTerminated = new Promise((resolve) => {
+      markActiveTerminated = resolve;
+    });
+    this.#cancelled = new Promise((resolve) => {
+      cancel = resolve;
+    });
+    this.#markActiveStarted = markActiveStarted;
+    this.#markQueuedStarted = markQueuedStarted;
+    this.#markQueuedRejected = markQueuedRejected;
+    this.#markActiveTerminated = markActiveTerminated;
+    this.#cancel = cancel;
+  }
+
+  override async *execute(input: RuntimeExecuteRequest): AsyncIterable<NotebookExecutionEvent> {
+    this.executeCount += 1;
+    if (input.cellId === "cell-a") {
+      yield this.executionEvent(input, "accepted", { commandType: "execute" });
+      yield this.executionEvent(input, "kernel", { state: "busy" });
+      this.#markActiveStarted();
+      await this.#cancelled;
+      await this.#queuedRejected;
+      yield this.executionEvent(input, "kernel", { state: "terminated" });
+      this.#markActiveTerminated();
+      return;
+    }
+
+    this.#markQueuedStarted();
+    await this.#cancelled;
+    yield this.executionEvent(input, "rejected", {
+      reason: "execution-cancelled",
+      message: "Execution was cancelled before it started.",
+    });
+    this.#markQueuedRejected();
+  }
+
+  override async dispose(
+    input: RuntimeSessionCommandRequest,
+  ): Promise<readonly NotebookExecutionEvent[]> {
+    this.disposeCount += 1;
+    this.#cancel();
+    await this.#activeTerminated;
+    const sequence = this.takeSequence(input.sessionId);
+    return [
+      event(input.sessionId, input.commandId, sequence, "accepted", { commandType: "dispose" }),
+      event(input.sessionId, input.commandId, sequence + 1, "kernel", { state: "terminated" }),
+    ];
+  }
+
+  override async eventsAfter(
+    _sessionId: string,
+    afterSequence: number,
+  ): Promise<NotebookExecutionReplay> {
+    this.eventsAfterCount += 1;
+    return { baselineSequence: afterSequence, events: [] };
+  }
+
+  private executionEvent(
+    input: RuntimeExecuteRequest,
+    type: NotebookExecutionEvent["type"],
+    fields: Record<string, unknown>,
+  ): NotebookExecutionEvent {
+    return event(input.sessionId, input.commandId, this.takeSequence(input.sessionId), type, {
+      executionId: input.executionId,
+      cellId: input.cellId,
+      ...fields,
+    });
+  }
+
+  private takeSequence(sessionId: string): number {
+    const sequence = this.nextSequence.get(sessionId) ?? 1;
+    this.nextSequence.set(sessionId, sequence + 1);
+    return sequence;
+  }
+}
+
 class PartialFailureRuntimeClient extends FakeRuntimeClient {
   readonly recoveryMode: "events" | "replay";
   eventsAfterCount = 0;
@@ -490,6 +594,63 @@ it("streams in sequence and replays completed command IDs without re-execution",
   expect(
     manager.eventsAfter("project-1", "session-1", 4).events.map((item) => item.sequence),
   ).toEqual([5, 6]);
+  await manager.close();
+});
+
+it("classifies a queued pre-accept cancellation as a clean rejected execution", async () => {
+  const client = new QueuedCancellationRuntimeClient();
+  const { manager } = await makeHarness({ createClient: () => client });
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+  const active = Array.fromAsync(
+    manager.execute({
+      projectId: "project-1",
+      sessionId: "session-1",
+      commandId: "execute-a",
+      executionId: "execution-a",
+      cellId: "cell-a",
+      code: "await_active()",
+    }),
+  );
+  await client.activeStarted;
+  const queued = Array.fromAsync(
+    manager.execute({
+      projectId: "project-1",
+      sessionId: "session-1",
+      commandId: "execute-b",
+      executionId: "execution-b",
+      cellId: "cell-b",
+      code: "queued()",
+    }),
+  );
+  await client.queuedStarted;
+
+  const [activeEvents, queuedEvents, disposeEvents] = await Promise.all([
+    active,
+    queued,
+    manager.dispose({
+      projectId: "project-1",
+      sessionId: "session-1",
+      commandId: "dispose-queued",
+    }),
+  ]);
+
+  expect(activeEvents.map((item) => item.type)).toEqual(["accepted", "kernel", "kernel"]);
+  expect(queuedEvents).toEqual([
+    expect.objectContaining({
+      type: "rejected",
+      executionId: "execution-b",
+      cellId: "cell-b",
+      reason: "execution-cancelled",
+    }),
+  ]);
+  expect(disposeEvents.at(-1)).toMatchObject({ type: "kernel", state: "terminated" });
+  expect(client.executeCount).toBe(2);
+  expect(client.eventsAfterCount).toBe(0);
   await manager.close();
 });
 

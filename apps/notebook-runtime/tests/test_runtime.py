@@ -185,6 +185,22 @@ class FakeKernelManager:
         self.client_instance.active = False
 
 
+class ObservedExecutionLock:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.attempts = 0
+        self.second_attempt = asyncio.Event()
+
+    async def __aenter__(self) -> None:
+        self.attempts += 1
+        if self.attempts == 2:
+            self.second_attempt.set()
+        await self.lock.acquire()
+
+    async def __aexit__(self, *_: object) -> None:
+        self.lock.release()
+
+
 @pytest.fixture
 def service(tmp_path: Any) -> RuntimeService:
     return RuntimeService(
@@ -495,23 +511,8 @@ async def test_queued_execution_is_not_accepted_until_the_session_lock_is_acquir
     service: RuntimeService,
 ) -> None:
     manager, _ = await open_session(service)
-    second_lock_attempt = asyncio.Event()
-
-    class ObservedLock:
-        def __init__(self) -> None:
-            self.lock = asyncio.Lock()
-            self.attempts = 0
-
-        async def __aenter__(self) -> None:
-            self.attempts += 1
-            if self.attempts == 2:
-                second_lock_attempt.set()
-            await self.lock.acquire()
-
-        async def __aexit__(self, *_: object) -> None:
-            self.lock.release()
-
-    service.sessions["session-1"].lock = ObservedLock()  # type: ignore[assignment]
+    observed_lock = ObservedExecutionLock()
+    service.sessions["session-1"].lock = observed_lock  # type: ignore[assignment]
     first = service.execute(
         "session-1", "command-a", "execution-a", "cell-a", "wait"
     )
@@ -521,7 +522,7 @@ async def test_queued_execution_is_not_accepted_until_the_session_lock_is_acquir
         "session-1", "command-b", "execution-b", "cell-b", "assignment"
     )
     second_event = asyncio.create_task(anext(second))
-    await asyncio.wait_for(second_lock_attempt.wait(), timeout=0.1)
+    await asyncio.wait_for(observed_lock.second_attempt.wait(), timeout=0.1)
     queued_record = service.sessions["session-1"].commands["command-b"]
     assert queued_record.events == []
     assert not second_event.done()
@@ -541,6 +542,51 @@ async def test_queued_execution_is_not_accepted_until_the_session_lock_is_acquir
     assert second_events[0]["type"] == "accepted"
     assert second_events[-1]["state"] == "idle"
     assert manager.client_instance.execute_count == 2
+
+
+async def test_dispose_rejects_execution_cancelled_while_waiting_for_acceptance(
+    service: RuntimeService,
+) -> None:
+    _, _ = await open_session(service)
+    observed_lock = ObservedExecutionLock()
+    service.sessions["session-1"].lock = observed_lock  # type: ignore[assignment]
+
+    first = service.execute(
+        "session-1", "command-a", "execution-a", "cell-a", "wait"
+    )
+    first_events = [await anext(first)]
+    assert first_events[0]["type"] == "accepted"
+
+    second = service.execute(
+        "session-1", "command-b", "execution-b", "cell-b", "assignment"
+    )
+    second_event = asyncio.create_task(anext(second))
+    await asyncio.wait_for(observed_lock.second_attempt.wait(), timeout=0.1)
+    queued_record = service.sessions["session-1"].commands["command-b"]
+    assert queued_record.events == []
+
+    disposed = await service.dispose("session-1", "dispose-queued")
+    first_events.extend([event async for event in first])
+    second_events = [await asyncio.wait_for(second_event, timeout=0.1)]
+    second_events.extend([event async for event in second])
+
+    assert [event["type"] for event in second_events] == ["rejected"]
+    assert second_events[0]["reason"] == "execution-cancelled"
+    assert second_events[0]["cellId"] == "cell-b"
+    assert all(event["type"] != "accepted" for event in second_events)
+    assert all(event["type"] != "kernel" for event in second_events)
+    assert first_events[0]["type"] == "accepted"
+    assert first_events[-1] == {
+        "type": "kernel",
+        "sessionId": "session-1",
+        "commandId": "command-a",
+        "executionId": "execution-a",
+        "cellId": "cell-a",
+        "sequence": first_events[-1]["sequence"],
+        "state": "terminated",
+    }
+    assert disposed[-1]["state"] == "terminated"
+    assert queued_record.completed.is_set()
 
 
 async def test_dispose_finalizes_execution_cancelled_before_owner_task_starts(

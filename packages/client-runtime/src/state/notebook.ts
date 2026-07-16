@@ -46,7 +46,6 @@ export interface NotebookRuntimeState extends NotebookOutputState {
   readonly lastSequence: number;
   readonly recoveryAfterSequence: number | null;
   readonly pendingEvents: ReadonlyMap<number, NotebookExecutionEvent>;
-  readonly cellIdByExecution: ReadonlyMap<string, string>;
   readonly activeExecutionIdByCell: ReadonlyMap<string, string>;
   readonly latestExecutionIdByCell: ReadonlyMap<string, string>;
   readonly executionCountByCell: ReadonlyMap<string, number | null>;
@@ -60,7 +59,6 @@ export function createNotebookRuntimeState(): NotebookRuntimeState {
     lastSequence: 0,
     recoveryAfterSequence: null,
     pendingEvents: new Map(),
-    cellIdByExecution: new Map(),
     activeExecutionIdByCell: new Map(),
     latestExecutionIdByCell: new Map(),
     ...createNotebookOutputState(),
@@ -75,8 +73,6 @@ export function beginNotebookCellExecution(
   cellId: string,
   executionId: string,
 ): NotebookRuntimeState {
-  const cellIdByExecution = new Map(state.cellIdByExecution);
-  cellIdByExecution.set(executionId, cellId);
   const activeExecutionIdByCell = new Map(state.activeExecutionIdByCell);
   activeExecutionIdByCell.set(cellId, executionId);
   const latestExecutionIdByCell = new Map(state.latestExecutionIdByCell);
@@ -85,7 +81,6 @@ export function beginNotebookCellExecution(
   runningCellIds.add(cellId);
   return {
     ...state,
-    cellIdByExecution,
     activeExecutionIdByCell,
     latestExecutionIdByCell,
     kernelStatus: "busy",
@@ -114,8 +109,6 @@ const activateExecution = (
   identity: ExecutionIdentity,
   kernelStatus: NotebookKernelStatus = "busy",
 ): NotebookRuntimeState => {
-  const cellIdByExecution = new Map(state.cellIdByExecution);
-  cellIdByExecution.set(identity.executionId, identity.cellId);
   const activeExecutionIdByCell = new Map(state.activeExecutionIdByCell);
   activeExecutionIdByCell.set(identity.cellId, identity.executionId);
   const latestExecutionIdByCell = new Map(state.latestExecutionIdByCell);
@@ -124,7 +117,6 @@ const activateExecution = (
   runningCellIds.add(identity.cellId);
   return {
     ...state,
-    cellIdByExecution,
     activeExecutionIdByCell,
     latestExecutionIdByCell,
     kernelStatus,
@@ -137,12 +129,10 @@ const finishExecution = (
   identity: ExecutionIdentity,
   kernelStatus: NotebookKernelStatus,
 ): NotebookRuntimeState => {
-  const cellIdByExecution = new Map(state.cellIdByExecution);
-  cellIdByExecution.set(identity.executionId, identity.cellId);
   const activeExecutionIdByCell = new Map(state.activeExecutionIdByCell);
   const activeExecutionId = activeExecutionIdByCell.get(identity.cellId);
   if (activeExecutionId !== undefined && activeExecutionId !== identity.executionId) {
-    return { ...state, cellIdByExecution };
+    return state;
   }
   activeExecutionIdByCell.delete(identity.cellId);
   const latestExecutionIdByCell = new Map(state.latestExecutionIdByCell);
@@ -151,7 +141,6 @@ const finishExecution = (
   runningCellIds.delete(identity.cellId);
   return {
     ...state,
-    cellIdByExecution,
     activeExecutionIdByCell,
     latestExecutionIdByCell,
     kernelStatus: runningCellIds.size > 0 ? "busy" : kernelStatus,
@@ -346,9 +335,7 @@ export function failNotebookCellExecution(
     return { ...state, error: message };
   }
   const finished = finishExecution(state, { cellId, executionId }, "idle");
-  const cellIdByExecution = new Map(finished.cellIdByExecution);
-  if (cellIdByExecution.get(executionId) === cellId) cellIdByExecution.delete(executionId);
-  return { ...finished, cellIdByExecution, error: message };
+  return { ...finished, error: message };
 }
 
 export function clearNotebookRuntimeError(state: NotebookRuntimeState): NotebookRuntimeState {

@@ -82,6 +82,7 @@ class CommandRecord:
     updated: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[None] | None = None
     error: BaseException | None = None
+    accepted: bool = False
 
 
 @dataclass
@@ -542,6 +543,7 @@ class RuntimeService:
 
         try:
             async with session.lock:
+                record.accepted = True
                 emit("accepted", commandType="execute")
                 msg_id = session.client.execute(code, allow_stdin=False, stop_on_error=True)
                 loop = asyncio.get_running_loop()
@@ -698,7 +700,16 @@ class RuntimeService:
                         output_bytes += encoded_size
                         emit("error", **error_fields)
         except asyncio.CancelledError:
-            emit("kernel", state="terminated")
+            record.events.append(
+                self._execution_cancelled_event(
+                    session,
+                    command_id,
+                    execution_id,
+                    cell_id,
+                    accepted=record.accepted,
+                )
+            )
+            record.updated.set()
         except BaseException as error:
             record.error = error
         finally:
@@ -719,31 +730,45 @@ class RuntimeService:
                 task.exception()
             return
         if task.cancelled():
-            accepted = any(event["type"] == "accepted" for event in record.events)
-            event = (
-                self._event(
-                    session,
-                    command_id,
-                    "kernel",
-                    execution_id=execution_id,
-                    cell_id=cell_id,
-                    state="terminated",
-                )
-                if accepted
-                else self._rejected(
-                    session,
-                    command_id,
-                    execution_id=execution_id,
-                    cell_id=cell_id,
-                    reason="execution-cancelled",
-                    message="Execution was cancelled before it started.",
-                )
+            event = self._execution_cancelled_event(
+                session,
+                command_id,
+                execution_id,
+                cell_id,
+                accepted=record.accepted,
             )
             record.events.append(event)
         else:
             record.error = task.exception()
         record.completed.set()
         record.updated.set()
+
+    def _execution_cancelled_event(
+        self,
+        session: KernelSession,
+        command_id: str,
+        execution_id: str,
+        cell_id: str,
+        *,
+        accepted: bool,
+    ) -> Event:
+        if accepted:
+            return self._event(
+                session,
+                command_id,
+                "kernel",
+                execution_id=execution_id,
+                cell_id=cell_id,
+                state="terminated",
+            )
+        return self._rejected(
+            session,
+            command_id,
+            execution_id=execution_id,
+            cell_id=cell_id,
+            reason="execution-cancelled",
+            message="Execution was cancelled before it started.",
+        )
 
     async def interrupt(self, session_id: str, command_id: str) -> list[Event]:
         session = self._get_session(session_id)

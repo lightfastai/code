@@ -79,7 +79,7 @@ describe("notebook runtime client state", () => {
     });
   });
 
-  it("reconstructs execution-to-cell identity from replayed accepted events", () => {
+  it("applies replayed scoped events directly to their cells", () => {
     const state = applyNotebookExecutionEvents(createNotebookRuntimeState(), [
       event(1, {
         type: "accepted",
@@ -96,7 +96,6 @@ describe("notebook runtime client state", () => {
       }),
     ]);
 
-    expect(state.cellIdByExecution.get("execution-1")).toBe("code-1");
     expect(state.outputsByCell.get("code-1")).toEqual([
       { output_type: "stream", name: "stdout", text: "replayed\n" },
     ]);
@@ -245,7 +244,6 @@ describe("notebook runtime client state", () => {
       ],
     });
 
-    expect(state.cellIdByExecution.get("execution-trimmed")).toBe("code-trimmed");
     expect(state.outputsByCell.get("code-trimmed")?.map((output) => output.output_type)).toEqual([
       "stream",
       "execute_result",
@@ -573,6 +571,36 @@ describe("notebook runtime client state", () => {
 
     expect(state.executionCountByCell.get("code-counted")).toBe(12);
     expect(state.runningCellIds.has("code-counted")).toBe(true);
+  });
+
+  it("keeps execution identity state bounded by cells across long-running sessions", () => {
+    const cellIds = ["code-0", "code-1", "code-2", "code-3"] as const;
+    const events: NotebookExecutionEvent[] = [];
+    let sequence = 0;
+    for (let index = 0; index < 2_000; index += 1) {
+      const cellId = cellIds[index % cellIds.length] ?? "code-0";
+      const executionId = `execution-${index}`;
+      events.push(
+        event(++sequence, {
+          type: "accepted",
+          commandType: "execute",
+          executionId,
+          cellId,
+        }),
+        event(++sequence, {
+          type: "kernel",
+          executionId,
+          cellId,
+          state: "idle",
+        }),
+      );
+    }
+
+    const state = applyNotebookExecutionEvents(createNotebookRuntimeState(), events);
+
+    expect(state.activeExecutionIdByCell.size).toBe(0);
+    expect(state.latestExecutionIdByCell.size).toBe(cellIds.length);
+    expect(state.runningCellIds.size).toBe(0);
   });
 
   it("bounds output entries and bytes per cell and per session with stable retained keys", () => {
