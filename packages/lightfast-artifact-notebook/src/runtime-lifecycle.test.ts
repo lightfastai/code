@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import type { NotebookRevision } from "./contracts.ts";
 import {
   importNotebookRevisionAndReplaceRuntime,
+  isNotebookExecutionDisabled,
   isNotebookRevisionSwitchDisabled,
   loadNotebookRevisionAndConnect,
   notebookRuntimeTarget,
@@ -187,6 +188,13 @@ describe("notebook runtime lifecycle", () => {
     expect(isNotebookRevisionSwitchDisabled(null, new Set())).toBe(false);
     expect(isNotebookRevisionSwitchDisabled("import", new Set())).toBe(true);
     expect(isNotebookRevisionSwitchDisabled(null, new Set(["code-1"]))).toBe(true);
+  });
+
+  it("globally blocks notebook execution while any cell is running", () => {
+    expect(isNotebookExecutionDisabled(null, true, new Set())).toBe(false);
+    expect(isNotebookExecutionDisabled("run all", true, new Set())).toBe(true);
+    expect(isNotebookExecutionDisabled(null, false, new Set())).toBe(true);
+    expect(isNotebookExecutionDisabled(null, true, new Set(["code-other"]))).toBe(true);
   });
 
   it("continues import after an explicitly disposed old runtime is already absent", async () => {

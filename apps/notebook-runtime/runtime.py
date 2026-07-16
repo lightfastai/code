@@ -540,9 +540,9 @@ class RuntimeService:
                     high = midpoint - 1
             return text[:low], True
 
-        emit("accepted", commandType="execute")
         try:
             async with session.lock:
+                emit("accepted", commandType="execute")
                 msg_id = session.client.execute(code, allow_stdin=False, stop_on_error=True)
                 loop = asyncio.get_running_loop()
                 deadline = loop.time() + self.execution_timeout_seconds

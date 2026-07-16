@@ -17,6 +17,7 @@ export type NotebookCellProps = {
   readonly index: number;
   readonly total: number;
   readonly disabled?: boolean;
+  readonly runDisabled?: boolean;
   readonly renderedOutputs?: ReadonlyArray<NotebookOutputValue> | undefined;
   readonly outputKeys?: ReadonlyArray<string> | undefined;
   readonly outputRetention?: NotebookOutputRetentionNotice | null | undefined;
@@ -33,6 +34,7 @@ export function NotebookCell({
   index,
   total,
   disabled = false,
+  runDisabled = false,
   renderedOutputs,
   outputKeys,
   outputRetention,
@@ -50,12 +52,13 @@ export function NotebookCell({
     label: string,
     handler: (() => void) | undefined,
     children: ReactNode = label,
+    actionDisabled = disabled,
   ) => (
     <button
       type="button"
       aria-label={label}
       className="rounded px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-      disabled={disabled || handler === undefined}
+      disabled={actionDisabled || handler === undefined}
       onClick={handler}
     >
       {children}
@@ -71,8 +74,12 @@ export function NotebookCell({
         <span className="mr-auto text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
           {cell.cell_type === "code" ? `Execution ${cell.execution_count ?? "–"}` : "Markdown"}
         </span>
-        {cell.cell_type === "code" ? action("Run cell", onRun) : null}
-        {cell.cell_type === "code" ? action("Run cells above", onRunAbove) : null}
+        {cell.cell_type === "code"
+          ? action("Run cell", onRun, undefined, disabled || runDisabled)
+          : null}
+        {cell.cell_type === "code"
+          ? action("Run cells above", onRunAbove, undefined, disabled || runDisabled)
+          : null}
         {action("Move cell up", index > 0 && onMove ? () => onMove(-1) : undefined, "↑")}
         {action("Move cell down", index + 1 < total && onMove ? () => onMove(1) : undefined, "↓")}
         {action("Duplicate cell", onDuplicate, "Duplicate")}

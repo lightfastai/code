@@ -491,6 +491,58 @@ async def test_execution_survives_subscriber_cancellation_and_replays_terminal_e
     )
 
 
+async def test_queued_execution_is_not_accepted_until_the_session_lock_is_acquired(
+    service: RuntimeService,
+) -> None:
+    manager, _ = await open_session(service)
+    second_lock_attempt = asyncio.Event()
+
+    class ObservedLock:
+        def __init__(self) -> None:
+            self.lock = asyncio.Lock()
+            self.attempts = 0
+
+        async def __aenter__(self) -> None:
+            self.attempts += 1
+            if self.attempts == 2:
+                second_lock_attempt.set()
+            await self.lock.acquire()
+
+        async def __aexit__(self, *_: object) -> None:
+            self.lock.release()
+
+    service.sessions["session-1"].lock = ObservedLock()  # type: ignore[assignment]
+    first = service.execute(
+        "session-1", "command-a", "execution-a", "cell-a", "wait"
+    )
+    assert (await anext(first))["type"] == "accepted"
+
+    second = service.execute(
+        "session-1", "command-b", "execution-b", "cell-b", "assignment"
+    )
+    second_event = asyncio.create_task(anext(second))
+    await asyncio.wait_for(second_lock_attempt.wait(), timeout=0.1)
+    queued_record = service.sessions["session-1"].commands["command-b"]
+    assert queued_record.events == []
+    assert not second_event.done()
+
+    manager.client_instance.messages.append(
+        message(
+            "status",
+            {"execution_state": "idle"},
+            parent_id="execute-1",
+        )
+    )
+    first_events = [event async for event in first]
+    assert first_events[-1]["state"] == "idle"
+
+    accepted = await asyncio.wait_for(second_event, timeout=0.1)
+    second_events = [accepted, *[event async for event in second]]
+    assert second_events[0]["type"] == "accepted"
+    assert second_events[-1]["state"] == "idle"
+    assert manager.client_instance.execute_count == 2
+
+
 async def test_dispose_finalizes_execution_cancelled_before_owner_task_starts(
     service: RuntimeService,
     monkeypatch: pytest.MonkeyPatch,

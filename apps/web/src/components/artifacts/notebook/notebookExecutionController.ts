@@ -22,6 +22,7 @@ export const notebookExecutionFailureMessage = (cause: unknown): string =>
 export async function executeNotebookCellWithState(
   options: ExecuteNotebookCellWithStateOptions,
 ): Promise<void> {
+  if (options.current().runningCellIds.size > 0) return;
   options.publish(
     beginNotebookCellExecution(options.current(), options.cellId, options.executionId),
   );

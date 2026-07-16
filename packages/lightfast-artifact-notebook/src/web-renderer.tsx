@@ -21,6 +21,7 @@ import {
 } from "./working-copy.ts";
 import {
   importNotebookRevisionAndReplaceRuntime,
+  isNotebookExecutionDisabled,
   isNotebookRevisionSwitchDisabled,
   loadNotebookRevisionAndConnect,
   notebookLifecycleErrorMessage,
@@ -278,7 +279,11 @@ export function NotebookArtifactEnvelopeRenderer({
 
   const dirty = isNotebookWorkingCopyDirty(working);
   const disabled = pendingAction !== null;
-  const executionDisabled = disabled || !runtimeReady;
+  const executionDisabled = isNotebookExecutionDisabled(
+    pendingAction,
+    runtimeReady,
+    runtime.runningCellIds,
+  );
   const revisionSwitchDisabled = isNotebookRevisionSwitchDisabled(
     pendingAction,
     runtime.runningCellIds,
@@ -519,6 +524,7 @@ export function NotebookArtifactEnvelopeRenderer({
                   index={actualIndex}
                   total={working.document.cells.length}
                   disabled={disabled || runtime.runningCellIds.has(cell.id)}
+                  runDisabled={executionDisabled}
                   renderedOutputs={renderedOutput?.outputs}
                   outputKeys={renderedOutput?.outputKeys}
                   outputRetention={renderedOutput?.retention}

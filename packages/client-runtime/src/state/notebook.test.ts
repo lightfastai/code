@@ -283,6 +283,215 @@ describe("notebook runtime client state", () => {
     expect(state.runningCellIds.has("code-suffix")).toBe(false);
   });
 
+  it("preserves independent cells while globally busy across interleaved executions", () => {
+    let state = applyNotebookExecutionReplay(createNotebookRuntimeState(), {
+      baselineSequence: 1,
+      events: [
+        event(2, {
+          type: "stream",
+          executionId: "execution-a",
+          cellId: "code-a",
+          name: "stdout",
+          text: "A running\n",
+        }),
+      ],
+    });
+    state = applyNotebookExecutionEvents(state, [
+      event(3, {
+        type: "accepted",
+        commandType: "execute",
+        executionId: "execution-b",
+        cellId: "code-b",
+      }),
+      event(4, {
+        type: "error",
+        executionId: "execution-a",
+        cellId: "code-a",
+        ename: "ValueError",
+        evalue: "A failed",
+        traceback: ["ValueError: A failed"],
+      }),
+    ]);
+
+    expect(state.runningCellIds).toEqual(new Set(["code-b"]));
+    expect(state.kernelStatus).toBe("busy");
+    expect(state.outputsByCell.get("code-a")?.map((output) => output.output_type)).toEqual([
+      "stream",
+      "error",
+    ]);
+
+    state = applyNotebookExecutionEvents(state, [
+      event(5, {
+        type: "stream",
+        executionId: "execution-b",
+        cellId: "code-b",
+        name: "stdout",
+        text: "B running\n",
+      }),
+      event(6, {
+        type: "kernel",
+        executionId: "execution-b",
+        cellId: "code-b",
+        state: "idle",
+      }),
+    ]);
+
+    expect(state.runningCellIds.size).toBe(0);
+    expect(state.kernelStatus).toBe("idle");
+    expect(state.outputsByCell.get("code-b")).toEqual([
+      { output_type: "stream", name: "stdout", text: "B running\n" },
+    ]);
+  });
+
+  it("ignores stale events after a newer execution supersedes the same cell", () => {
+    let state = applyNotebookExecutionEvents(createNotebookRuntimeState(), [
+      event(1, {
+        type: "accepted",
+        commandType: "execute",
+        executionId: "execution-a",
+        cellId: "code-1",
+      }),
+      event(2, {
+        type: "stream",
+        executionId: "execution-a",
+        cellId: "code-1",
+        name: "stdout",
+        text: "old output\n",
+      }),
+      event(3, {
+        type: "accepted",
+        commandType: "execute",
+        executionId: "execution-b",
+        cellId: "code-1",
+      }),
+      event(4, {
+        type: "error",
+        executionId: "execution-a",
+        cellId: "code-1",
+        ename: "OldError",
+        evalue: "stale",
+        traceback: ["OldError: stale"],
+      }),
+      event(5, {
+        type: "execution",
+        executionId: "execution-a",
+        cellId: "code-1",
+        executionCount: 99,
+      }),
+      event(6, {
+        type: "stream",
+        executionId: "execution-b",
+        cellId: "code-1",
+        name: "stdout",
+        text: "new output\n",
+      }),
+    ]);
+
+    expect(state.activeExecutionIdByCell.get("code-1")).toBe("execution-b");
+    expect(state.runningCellIds).toEqual(new Set(["code-1"]));
+    expect(state.executionCountByCell.has("code-1")).toBe(false);
+    expect(state.outputsByCell.get("code-1")).toEqual([
+      { output_type: "stream", name: "stdout", text: "new output\n" },
+    ]);
+
+    state = applyNotebookExecutionEvents(state, [
+      event(7, {
+        type: "kernel",
+        executionId: "execution-a",
+        cellId: "code-1",
+        state: "idle",
+      }),
+      event(8, {
+        type: "kernel",
+        executionId: "execution-b",
+        cellId: "code-1",
+        state: "idle",
+      }),
+    ]);
+    expect(state.runningCellIds.size).toBe(0);
+    expect(state.kernelStatus).toBe("idle");
+
+    state = applyNotebookExecutionEvents(state, [
+      event(9, {
+        type: "stream",
+        executionId: "execution-a",
+        cellId: "code-1",
+        name: "stdout",
+        text: "very late old output\n",
+      }),
+    ]);
+    expect(state.runningCellIds.size).toBe(0);
+    expect(state.outputsByCell.get("code-1")).toEqual([
+      { output_type: "stream", name: "stdout", text: "new output\n" },
+    ]);
+  });
+
+  it("clears stale active state when an authoritative replay jumps its baseline", () => {
+    let state = applyNotebookExecutionEvents(createNotebookRuntimeState(), [
+      event(1, {
+        type: "accepted",
+        commandType: "execute",
+        executionId: "execution-a",
+        cellId: "code-a",
+      }),
+    ]);
+    expect(state.runningCellIds).toEqual(new Set(["code-a"]));
+
+    state = applyNotebookExecutionReplay(state, {
+      baselineSequence: 3,
+      events: [
+        event(4, {
+          type: "stream",
+          executionId: "execution-b",
+          cellId: "code-b",
+          name: "stdout",
+          text: "retained B\n",
+        }),
+        event(5, {
+          type: "kernel",
+          executionId: "execution-b",
+          cellId: "code-b",
+          state: "idle",
+        }),
+      ],
+    });
+
+    expect(state.lastSequence).toBe(5);
+    expect(state.activeExecutionIdByCell.size).toBe(0);
+    expect(state.runningCellIds.size).toBe(0);
+    expect(state.kernelStatus).toBe("idle");
+    expect(state.outputsByCell.get("code-b")).toEqual([
+      { output_type: "stream", name: "stdout", text: "retained B\n" },
+    ]);
+  });
+
+  it("does not clear active state for a normal no-gap replay", () => {
+    let state = applyNotebookExecutionEvents(createNotebookRuntimeState(), [
+      event(1, {
+        type: "accepted",
+        commandType: "execute",
+        executionId: "execution-a",
+        cellId: "code-a",
+      }),
+    ]);
+    state = applyNotebookExecutionReplay(state, {
+      baselineSequence: 1,
+      events: [
+        event(2, {
+          type: "stream",
+          executionId: "execution-a",
+          cellId: "code-a",
+          name: "stdout",
+          text: "continued A\n",
+        }),
+      ],
+    });
+
+    expect(state.activeExecutionIdByCell.get("code-a")).toBe("execution-a");
+    expect(state.runningCellIds).toEqual(new Set(["code-a"]));
+    expect(state.kernelStatus).toBe("busy");
+  });
+
   it("treats every scoped nonterminal suffix as active and terminal errors as finished", () => {
     const nonterminalEvents: ReadonlyArray<EventInput> = [
       {

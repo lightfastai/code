@@ -8,10 +8,8 @@ import { sandboxedNotebookHtmlDocument, sanitizeNotebookSvg } from "./notebook-s
 import {
   NOTEBOOK_OUTPUT_RENDER_MAX_CHARACTERS,
   NOTEBOOK_OUTPUT_RENDER_MAX_LINES,
-  NOTEBOOK_TABLE_RENDER_MAX_CELLS,
-  NOTEBOOK_TABLE_RENDER_MAX_COLUMNS,
-  NOTEBOOK_TABLE_RENDER_MAX_ROWS,
   boundedNotebookText,
+  planNotebookTableRendering,
 } from "./notebook-output-rendering.ts";
 
 const OUTPUT_PREVIEW_CHARACTERS = 12_000;
@@ -99,56 +97,6 @@ export function NotebookMarkdown({ children }: { readonly children: string }) {
   );
 }
 
-type DataResourceRow = Readonly<Record<string, unknown>>;
-
-const isRecord = (value: unknown): value is DataResourceRow =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
-
-const asDataResource = (
-  value: unknown,
-): {
-  readonly columns: readonly string[];
-  readonly rows: ReadonlyArray<DataResourceRow>;
-  readonly truncated: boolean;
-} | null => {
-  if (!isRecord(value) || !Array.isArray(value.data) || !value.data.every(isRecord)) return null;
-
-  let allColumns: string[];
-  if (value.schema !== undefined) {
-    if (!isRecord(value.schema) || !Array.isArray(value.schema.fields)) return null;
-    const declaredColumns: string[] = [];
-    const seenColumns = new Set<string>();
-    for (const field of value.schema.fields) {
-      if (!isRecord(field) || typeof field.name !== "string" || field.name.length === 0)
-        return null;
-      if (!seenColumns.has(field.name)) {
-        seenColumns.add(field.name);
-        declaredColumns.push(field.name);
-      }
-    }
-    allColumns = declaredColumns;
-  } else {
-    const discovered = new Set<string>();
-    for (const row of value.data) {
-      for (const key of Object.keys(row)) discovered.add(key);
-    }
-    allColumns = [...discovered];
-  }
-
-  const columns = allColumns.slice(0, NOTEBOOK_TABLE_RENDER_MAX_COLUMNS);
-  const productRowLimit =
-    columns.length === 0
-      ? NOTEBOOK_TABLE_RENDER_MAX_ROWS
-      : Math.floor(NOTEBOOK_TABLE_RENDER_MAX_CELLS / columns.length);
-  const rowLimit = Math.min(NOTEBOOK_TABLE_RENDER_MAX_ROWS, productRowLimit);
-  const rows = value.data.slice(0, rowLimit);
-  return {
-    columns,
-    rows,
-    truncated: allColumns.length > columns.length || value.data.length > rows.length,
-  };
-};
-
 const cellValue = (value: unknown): string =>
   typeof value === "string"
     ? value
@@ -157,7 +105,7 @@ const cellValue = (value: unknown): string =>
       : JSON.stringify(value);
 
 function NotebookTable({ value }: { readonly value: unknown }) {
-  const table = asDataResource(value);
+  const table = planNotebookTableRendering(value);
   if (table === null) {
     return (
       <div

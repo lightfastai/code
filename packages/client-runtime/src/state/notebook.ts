@@ -48,6 +48,7 @@ export interface NotebookRuntimeState extends NotebookOutputState {
   readonly pendingEvents: ReadonlyMap<number, NotebookExecutionEvent>;
   readonly cellIdByExecution: ReadonlyMap<string, string>;
   readonly activeExecutionIdByCell: ReadonlyMap<string, string>;
+  readonly latestExecutionIdByCell: ReadonlyMap<string, string>;
   readonly executionCountByCell: ReadonlyMap<string, number | null>;
   readonly runningCellIds: ReadonlySet<string>;
   readonly error: string | null;
@@ -61,6 +62,7 @@ export function createNotebookRuntimeState(): NotebookRuntimeState {
     pendingEvents: new Map(),
     cellIdByExecution: new Map(),
     activeExecutionIdByCell: new Map(),
+    latestExecutionIdByCell: new Map(),
     ...createNotebookOutputState(),
     executionCountByCell: new Map(),
     runningCellIds: new Set(),
@@ -77,12 +79,15 @@ export function beginNotebookCellExecution(
   cellIdByExecution.set(executionId, cellId);
   const activeExecutionIdByCell = new Map(state.activeExecutionIdByCell);
   activeExecutionIdByCell.set(cellId, executionId);
+  const latestExecutionIdByCell = new Map(state.latestExecutionIdByCell);
+  latestExecutionIdByCell.set(cellId, executionId);
   const runningCellIds = new Set(state.runningCellIds);
   runningCellIds.add(cellId);
   return {
     ...state,
     cellIdByExecution,
     activeExecutionIdByCell,
+    latestExecutionIdByCell,
     kernelStatus: "busy",
     runningCellIds,
     error: null,
@@ -113,12 +118,15 @@ const activateExecution = (
   cellIdByExecution.set(identity.executionId, identity.cellId);
   const activeExecutionIdByCell = new Map(state.activeExecutionIdByCell);
   activeExecutionIdByCell.set(identity.cellId, identity.executionId);
+  const latestExecutionIdByCell = new Map(state.latestExecutionIdByCell);
+  latestExecutionIdByCell.set(identity.cellId, identity.executionId);
   const runningCellIds = new Set(state.runningCellIds);
   runningCellIds.add(identity.cellId);
   return {
     ...state,
     cellIdByExecution,
     activeExecutionIdByCell,
+    latestExecutionIdByCell,
     kernelStatus,
     runningCellIds,
   };
@@ -137,13 +145,16 @@ const finishExecution = (
     return { ...state, cellIdByExecution };
   }
   activeExecutionIdByCell.delete(identity.cellId);
+  const latestExecutionIdByCell = new Map(state.latestExecutionIdByCell);
+  latestExecutionIdByCell.set(identity.cellId, identity.executionId);
   const runningCellIds = new Set(state.runningCellIds);
   runningCellIds.delete(identity.cellId);
   return {
     ...state,
     cellIdByExecution,
     activeExecutionIdByCell,
-    kernelStatus,
+    latestExecutionIdByCell,
+    kernelStatus: runningCellIds.size > 0 ? "busy" : kernelStatus,
     runningCellIds,
   };
 };
@@ -162,6 +173,14 @@ const applyOrderedEvent = (
   state: NotebookRuntimeState,
   event: NotebookExecutionEvent,
 ): NotebookRuntimeState => {
+  if (
+    event.type !== "accepted" &&
+    event.executionId !== undefined &&
+    state.latestExecutionIdByCell.has(event.cellId) &&
+    state.latestExecutionIdByCell.get(event.cellId) !== event.executionId
+  ) {
+    return state;
+  }
   if (event.type === "rejected") {
     if (event.executionId !== undefined) {
       return {
@@ -298,9 +317,13 @@ export function applyNotebookExecutionReplay(
   return applyNotebookExecutionEvents(
     {
       ...state,
+      activeExecutionIdByCell: new Map(),
+      kernelStatus: "disconnected",
+      latestExecutionIdByCell: new Map(),
       lastSequence: replay.baselineSequence,
       pendingEvents,
       recoveryAfterSequence: pendingEvents.size > 0 ? replay.baselineSequence : null,
+      runningCellIds: new Set(),
     },
     replay.events,
   );

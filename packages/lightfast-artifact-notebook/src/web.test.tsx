@@ -17,6 +17,7 @@ import {
   NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_SESSION,
   NOTEBOOK_OUTPUT_RENDER_MAX_LINES,
   NOTEBOOK_TABLE_RENDER_MAX_CELLS,
+  NOTEBOOK_TABLE_RENDER_MAX_CELLS_PER_SESSION,
   NOTEBOOK_TABLE_RENDER_MAX_COLUMNS,
   NOTEBOOK_TABLE_RENDER_MAX_ROWS,
   boundedNotebookText,
@@ -96,6 +97,30 @@ describe("NotebookCell", () => {
     expect(html).toContain("Execution 7");
     expect(html).toContain('aria-label="Code cell 1 source"');
     expect(html).toContain("Run cell");
+  });
+
+  it("disables every per-cell run action when notebook execution is globally disabled", () => {
+    const cell: NotebookCellValue = {
+      cell_type: "code",
+      id: "code-busy",
+      metadata: {},
+      source: "print('busy')",
+      execution_count: null,
+      outputs: [],
+    };
+    const html = renderToStaticMarkup(
+      createElement(NotebookCell, {
+        cell,
+        index: 0,
+        total: 1,
+        runDisabled: true,
+        onRun: () => undefined,
+        onRunAbove: () => undefined,
+      }),
+    );
+
+    expect(html).toMatch(/aria-label="Run cell"[^>]*disabled/);
+    expect(html).toMatch(/aria-label="Run cells above"[^>]*disabled/);
   });
 
   it("renders an explicit notice when output has been omitted", () => {
@@ -386,5 +411,57 @@ describe("NotebookOutput", () => {
     expect(inputs.reduce((total, input) => total + input.outputs.length, 0)).toBe(
       originalEntryCount,
     );
+  });
+
+  it("bounds rendered table cells across the whole notebook with a visible omission notice", () => {
+    const columns = Array.from({ length: 50 }, (_, index) => `c${index}`);
+    const tableOutput: NotebookOutputValue = {
+      output_type: "display_data",
+      metadata: {},
+      data: {
+        "application/vnd.dataresource+json": {
+          schema: { fields: columns.map((name) => ({ name })) },
+          data: Array.from({ length: 40 }, () => ({})),
+        },
+      },
+    };
+    const inputs = Array.from({ length: 8 }, (_, cellIndex) => ({
+      cellId: `table-${cellIndex}`,
+      outputs: Array.from({ length: 32 }, () => tableOutput),
+    }));
+
+    const plan = planNotebookOutputRendering(inputs);
+    const html = [...plan.values()]
+      .flatMap((item) => item.outputs)
+      .map(renderOutput)
+      .join("");
+    const renderedCells = html.match(/<(?:td|th)(?:\s|>)/g)?.length ?? 0;
+    const firstPlan = plan.get("table-0");
+    const notice = renderToStaticMarkup(
+      createElement(NotebookCell, {
+        cell: {
+          cell_type: "code",
+          id: "table-0",
+          metadata: {},
+          source: "display(table)",
+          execution_count: 1,
+          outputs: inputs[0]?.outputs ?? [],
+        },
+        index: 0,
+        total: 8,
+        renderedOutputs: firstPlan?.outputs,
+        outputRetention: firstPlan?.retention,
+      }),
+    );
+
+    expect(renderedCells).toBeLessThanOrEqual(NOTEBOOK_TABLE_RENDER_MAX_CELLS_PER_SESSION);
+    expect(firstPlan?.outputs).toHaveLength(3);
+    expect(firstPlan?.outputKeys[0]).toBe("table-0-output-29");
+    expect(plan.get("table-1")?.outputs).toHaveLength(0);
+    expect(
+      [...plan.values()].reduce((total, item) => total + (item.retention?.omittedEntries ?? 0), 0),
+    ).toBeGreaterThan(0);
+    expect(notice).toContain("Earlier output omitted");
+    expect(notice).toContain("Export the notebook");
   });
 });

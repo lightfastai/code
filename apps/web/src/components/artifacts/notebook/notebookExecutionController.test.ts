@@ -10,6 +10,41 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import { executeNotebookCellWithState } from "./notebookExecutionController.ts";
 
 describe("executeNotebookCellWithState", () => {
+  it("does not queue another execution while any notebook cell is running", async () => {
+    let state = applyNotebookExecutionReplay(createNotebookRuntimeState(), {
+      baselineSequence: 5,
+      events: [
+        {
+          type: "stream",
+          sessionId: "session-1",
+          commandId: "command-active",
+          executionId: "execution-active",
+          cellId: "code-active",
+          sequence: 6,
+          name: "stdout",
+          text: "still running\n",
+        },
+      ],
+    });
+    const publish = vi.fn((next: typeof state) => {
+      state = next;
+    });
+    const execute = vi.fn(async () => undefined);
+
+    await executeNotebookCellWithState({
+      cellId: "code-queued",
+      executionId: "execution-queued",
+      current: () => state,
+      publish,
+      execute,
+      recover: vi.fn(async () => undefined),
+    });
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    expect(state.runningCellIds).toEqual(new Set(["code-active"]));
+  });
+
   it("rolls back an optimistic cell when the RPC rejects before emitting events", async () => {
     let state = createNotebookRuntimeState();
     const published = vi.fn((next: typeof state) => {

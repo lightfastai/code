@@ -49,6 +49,12 @@ export const isNotebookRevisionSwitchDisabled = (
   runningCellIds: ReadonlySet<string>,
 ): boolean => pendingAction !== null || runningCellIds.size > 0;
 
+export const isNotebookExecutionDisabled = (
+  pendingAction: string | null,
+  runtimeReady: boolean,
+  runningCellIds: ReadonlySet<string>,
+): boolean => pendingAction !== null || !runtimeReady || runningCellIds.size > 0;
+
 export async function loadNotebookRevisionAndConnect(
   request: LifecycleRequest & {
     readonly documentId: string;
