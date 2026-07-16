@@ -70,3 +70,21 @@ it("refreshes only repository-owned integration branches without rewriting their
   assert.notInclude(upstreamSyncWorkflow, "--force-with-lease");
   assert.include(upstreamSyncWorkflow, 'git push origin "HEAD:refs/heads/$BRANCH"');
 });
+
+it("continues a repeated semantic-conflict refresh when the brief is unchanged", () => {
+  assert.include(
+    upstreamSyncWorkflow,
+    `          git add -- "$brief"
+          set +e
+          git diff --cached --quiet -- "$brief"
+          brief_diff_exit=$?
+          set -e
+          if [[ "$brief_diff_exit" -eq 1 ]]; then
+            git commit -m "docs: record upstream merge conflicts for $sync_date"
+          elif [[ "$brief_diff_exit" -ne 0 ]]; then
+            exit "$brief_diff_exit"
+          fi
+          echo "outcome=conflict" >> "$GITHUB_OUTPUT"
+          echo "conflict_brief=$brief" >> "$GITHUB_OUTPUT"`,
+  );
+});
