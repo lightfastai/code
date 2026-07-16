@@ -103,7 +103,14 @@ const applyOrderedEvent = (
   state: NotebookRuntimeState,
   event: NotebookExecutionEvent,
 ): NotebookRuntimeState => {
-  if (event.type === "rejected") return { ...state, error: event.message };
+  if (event.type === "rejected") {
+    const runningCellIds = new Set(state.runningCellIds);
+    if (event.executionId !== undefined) {
+      const cellId = state.cellIdByExecution.get(event.executionId);
+      if (cellId !== undefined) runningCellIds.delete(cellId);
+    }
+    return { ...state, runningCellIds, error: event.message };
+  }
   if (event.type === "kernel") {
     const runningCellIds = new Set(state.runningCellIds);
     if (event.state === "idle" || event.state === "interrupted" || event.state === "terminated") {
@@ -117,7 +124,22 @@ const applyOrderedEvent = (
     return { ...state, kernelStatus: event.state, runningCellIds };
   }
   if (event.type === "limit") return { ...state, error: event.message };
-  if (event.type === "accepted") return state;
+  if (event.type === "accepted") {
+    if (event.commandType !== "execute") return state;
+    const cellIdByExecution = new Map(state.cellIdByExecution);
+    cellIdByExecution.set(event.executionId, event.cellId);
+    const outputsByCell = new Map(state.outputsByCell);
+    outputsByCell.set(event.cellId, []);
+    const runningCellIds = new Set(state.runningCellIds);
+    runningCellIds.add(event.cellId);
+    return {
+      ...state,
+      cellIdByExecution,
+      outputsByCell,
+      runningCellIds,
+      error: null,
+    };
+  }
 
   const cellId = state.cellIdByExecution.get(event.executionId);
   if (cellId === undefined) return state;

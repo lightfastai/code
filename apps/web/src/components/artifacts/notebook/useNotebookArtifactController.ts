@@ -239,6 +239,7 @@ export function useNotebookArtifactController(): NotebookArtifactController {
                   sessionId: request.sessionId,
                   commandId: commandId("execute"),
                   executionId,
+                  cellId: request.cellId,
                   code: request.code,
                 },
                 onEvent: (event) => apply(request, [event]),

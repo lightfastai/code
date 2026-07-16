@@ -22,6 +22,48 @@ const event = (sequence: number, value: EventInput): NotebookExecutionEvent =>
   }) as NotebookExecutionEvent;
 
 describe("notebook runtime client state", () => {
+  it("reconstructs execution-to-cell identity from replayed accepted events", () => {
+    const state = applyNotebookExecutionEvents(createNotebookRuntimeState(), [
+      event(1, {
+        type: "accepted",
+        commandType: "execute",
+        executionId: "execution-1",
+        cellId: "code-1",
+      }),
+      event(2, {
+        type: "stream",
+        executionId: "execution-1",
+        name: "stdout",
+        text: "replayed\n",
+      }),
+    ]);
+
+    expect(state.cellIdByExecution.get("execution-1")).toBe("code-1");
+    expect(state.outputsByCell.get("code-1")).toEqual([
+      { output_type: "stream", name: "stdout", text: "replayed\n" },
+    ]);
+    expect(state.runningCellIds.has("code-1")).toBe(true);
+  });
+
+  it("clears the corresponding running cell when execution is rejected", () => {
+    const running = beginNotebookCellExecution(
+      createNotebookRuntimeState(),
+      "code-1",
+      "execution-1",
+    );
+    const state = applyNotebookExecutionEvents(running, [
+      event(1, {
+        type: "rejected",
+        executionId: "execution-1",
+        reason: "command-id-conflict",
+        message: "Execution was rejected.",
+      }),
+    ]);
+
+    expect(state.runningCellIds.has("code-1")).toBe(false);
+    expect(state.error).toBe("Execution was rejected.");
+  });
+
   it("orders streaming events, resumes gaps, and ignores replayed sequences", () => {
     let state = createNotebookRuntimeState();
     state = applyNotebookExecutionEvents(state, [

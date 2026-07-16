@@ -421,11 +421,18 @@ class RuntimeService:
         session_id: str,
         command_id: str,
         execution_id: str,
+        cell_id: str,
         code: str,
     ) -> AsyncIterator[Event]:
         session = self._get_session(session_id)
         fingerprint = _fingerprint(
-            "execute", {"code": code, "executionId": execution_id, "sessionId": session_id}
+            "execute",
+            {
+                "cellId": cell_id,
+                "code": code,
+                "executionId": execution_id,
+                "sessionId": session_id,
+            },
         )
         record, replay, is_new = self._begin_execution_command(
             session, command_id, fingerprint, execution_id
@@ -437,7 +444,7 @@ class RuntimeService:
         assert record is not None
         if is_new:
             task = asyncio.create_task(
-                self._run_execution(session, command_id, execution_id, code, record)
+                self._run_execution(session, command_id, execution_id, cell_id, code, record)
             )
             record.task = task
             task.add_done_callback(
@@ -462,6 +469,7 @@ class RuntimeService:
         session: KernelSession,
         command_id: str,
         execution_id: str,
+        cell_id: str,
         code: str,
         record: CommandRecord,
     ) -> None:
@@ -520,7 +528,7 @@ class RuntimeService:
                     high = midpoint - 1
             return text[:low], True
 
-        emit("accepted", commandType="execute")
+        emit("accepted", commandType="execute", cellId=cell_id)
         try:
             async with session.lock:
                 msg_id = session.client.execute(code, allow_stdin=False, stop_on_error=True)
@@ -868,11 +876,14 @@ def create_app(*, service: RuntimeService, token: str, bootstrap_enabled: bool =
         body = await request.json()
         command_id = _require_string(body, "commandId", max_length=256)
         execution_id = _require_string(body, "executionId", max_length=256)
+        cell_id = _require_string(body, "cellId", max_length=64)
         code = _require_code(body)
         service._get_session(session_id)
 
         async def lines() -> AsyncIterator[bytes]:
-            async for event in service.execute(session_id, command_id, execution_id, code):
+            async for event in service.execute(
+                session_id, command_id, execution_id, cell_id, code
+            ):
                 yield json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
 
         return StreamingResponse(lines(), media_type="application/x-ndjson")

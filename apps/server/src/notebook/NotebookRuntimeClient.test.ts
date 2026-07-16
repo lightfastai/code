@@ -31,17 +31,23 @@ const listen = async (handler: NodeHttp.RequestListener) => {
 
 it("authenticates every request and parses split NDJSON in order", async () => {
   const authorizations: Array<string | undefined> = [];
+  const executeBodies: unknown[] = [];
   const baseUrl = await listen((request, response) => {
     authorizations.push(request.headers.authorization);
     if (request.url?.endsWith("/execute")) {
-      response.writeHead(200, { "content-type": "application/x-ndjson" });
-      response.write(
-        '{"type":"accepted","sessionId":"session-1","commandId":"command-1","executionId":"execution-1","sequence":4,"commandType":"execute"}\n{"type":"stream",',
-      );
-      setImmediate(() => {
-        response.end(
-          '"sessionId":"session-1","commandId":"command-1","executionId":"execution-1","sequence":5,"name":"stdout","text":"hello\\n"}\n',
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Uint8Array) => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        executeBodies.push(JSON.parse(Buffer.concat(chunks).toString()));
+        response.writeHead(200, { "content-type": "application/x-ndjson" });
+        response.write(
+          '{"type":"accepted","sessionId":"session-1","commandId":"command-1","executionId":"execution-1","cellId":"cell-1","sequence":4,"commandType":"execute"}\n{"type":"stream",',
         );
+        setImmediate(() => {
+          response.end(
+            '"sessionId":"session-1","commandId":"command-1","executionId":"execution-1","sequence":5,"name":"stdout","text":"hello\\n"}\n',
+          );
+        });
       });
       return;
     }
@@ -56,6 +62,7 @@ it("authenticates every request and parses split NDJSON in order", async () => {
       sessionId: "session-1",
       commandId: "command-1",
       executionId: "execution-1",
+      cellId: "cell-1",
       code: "print('hello')",
     }),
   );
@@ -66,6 +73,10 @@ it("authenticates every request and parses split NDJSON in order", async () => {
     [5, "stream"],
   ]);
   expect(events[1]).toMatchObject({ type: "stream", name: "stdout", text: "hello\n" });
+  expect(events[0]).toMatchObject({ type: "accepted", cellId: "cell-1" });
+  expect(executeBodies).toEqual([
+    expect.objectContaining({ executionId: "execution-1", cellId: "cell-1" }),
+  ]);
 });
 
 it("supports session lifecycle and resume endpoints", async () => {
@@ -134,6 +145,7 @@ it("rejects oversized NDJSON lines and aggregate execution bytes", async () => {
       sessionId: "session-1",
       commandId: "command-line",
       executionId: "execution-line",
+      cellId: "cell-line",
       code: "line",
     }),
   ).catch((cause: unknown) => cause);
@@ -167,6 +179,7 @@ it("rejects oversized NDJSON lines and aggregate execution bytes", async () => {
       sessionId: "session-1",
       commandId: "command-aggregate",
       executionId: "execution-aggregate",
+      cellId: "cell-aggregate",
       code: "aggregate",
     }),
   ).catch((cause: unknown) => cause);

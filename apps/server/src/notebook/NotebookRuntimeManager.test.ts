@@ -107,6 +107,7 @@ class FakeRuntimeClient implements NotebookRuntimeClientLike {
     const events = [
       event(input.sessionId, input.commandId, sequence, "accepted", {
         executionId: input.executionId,
+        cellId: input.cellId,
         commandType: "execute",
       }),
       event(input.sessionId, input.commandId, sequence + 1, "stream", {
@@ -252,6 +253,7 @@ class PartialFailureRuntimeClient extends FakeRuntimeClient {
     const events = [
       event(input.sessionId, input.commandId, 4, "accepted", {
         executionId: input.executionId,
+        cellId: input.cellId,
         commandType: "execute",
       }),
       event(input.sessionId, input.commandId, 5, "stream", {
@@ -431,12 +433,14 @@ it("streams in sequence and replays completed command IDs without re-execution",
     sessionId: "session-1",
     commandId: "execute-1",
     executionId: "execution-1",
+    cellId: "cell-1",
     code: "print('ok')",
   } as const;
   const first = await Array.fromAsync(manager.execute(request));
   const replay = await Array.fromAsync(manager.execute(request));
 
   expect(first.map((item) => item.sequence)).toEqual([4, 5, 6]);
+  expect(first[0]).toMatchObject({ type: "accepted", cellId: "cell-1" });
   expect(replay).toEqual(first);
   expect(clients[0]?.executeCount).toBe(1);
   expect(manager.eventsAfter("project-1", "session-1", 4).map((item) => item.sequence)).toEqual([
@@ -465,6 +469,7 @@ it("forwards controls, disposes sessions, reaps idle projects, and removes conta
       sessionId: "session-2",
       commandId: "execute-2",
       executionId: "execution-2",
+      cellId: "cell-2",
       code: "print('session-2')",
     }),
   );
@@ -773,6 +778,7 @@ it("rejects non-monotonic sidecar events", async () => {
       sessionId: "session-1",
       commandId: "execute-bad",
       executionId: "execution-bad",
+      cellId: "cell-bad",
       code: "bad",
     }),
   ).catch((cause: unknown) => cause);
@@ -798,6 +804,7 @@ it("bounds retained event history and command results by serialized bytes", asyn
     sessionId: "session-1",
     commandId: "execute-byte-bound",
     executionId: "execution-byte-bound",
+    cellId: "cell-byte-bound",
     code: "print('ok')",
   } as const;
 
@@ -1043,6 +1050,7 @@ it("reconciles a partial stream once for concurrent duplicates without repeating
     sessionId: "session-1",
     commandId: "execute-recover",
     executionId: "execution-recover",
+    cellId: "cell-recover",
     code: "side_effect()",
   } as const;
 
@@ -1082,6 +1090,7 @@ it("finishes a partial execution directly from queried sidecar history", async (
       sessionId: "session-1",
       commandId: "execute-recover",
       executionId: "execution-recover",
+      cellId: "cell-recover",
       code: "side_effect()",
     }),
   );

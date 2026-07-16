@@ -91,6 +91,7 @@ const execute = (
       sessionId,
       commandId,
       executionId: `execution-${sequence}`,
+      cellId: `cell-${sequence}`,
       code,
     }),
   );
@@ -202,6 +203,7 @@ liveIt(
         sessionId: "live-session",
         commandId: "disconnect-live",
         executionId: "disconnect-execution",
+        cellId: "cell-disconnect",
         code: "import time\ntime.sleep(0.6)\ndisconnect_counter = globals().get('disconnect_counter', 0) + 1\ndisconnect_counter",
       } as const;
       const disconnectedOutput = await executeUntilSocketTimeout({

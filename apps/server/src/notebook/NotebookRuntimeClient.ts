@@ -24,6 +24,7 @@ export interface RuntimeExecuteRequest {
   readonly sessionId: string;
   readonly commandId: string;
   readonly executionId: string;
+  readonly cellId: string;
   readonly code: string;
 }
 

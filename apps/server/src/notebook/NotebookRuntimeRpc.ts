@@ -186,6 +186,7 @@ export const makeNotebookRuntimeRpcHandlers = (dependencies: NotebookRuntimeRpcD
                   sessionId: input.sessionId,
                   commandId: input.commandId,
                   executionId: input.executionId,
+                  cellId: input.cellId,
                   code: input.code,
                 }),
                 runtimeFailure,

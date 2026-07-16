@@ -3,15 +3,8 @@ import type { ReactNode } from "react";
 import type { NotebookCell as NotebookCellValue } from "./contracts.ts";
 import { NotebookMarkdown, NotebookOutput } from "./NotebookOutput.tsx";
 
-const stableOutputKeys = (cellId: string, outputs: ReadonlyArray<unknown>) => {
-  const counts = new Map<string, number>();
-  return outputs.map((output) => {
-    const serialized = JSON.stringify(output);
-    const occurrence = (counts.get(serialized) ?? 0) + 1;
-    counts.set(serialized, occurrence);
-    return `${cellId}:${serialized}:${occurrence}`;
-  });
-};
+export const notebookOutputKey = (cellId: string, outputIndex: number): string =>
+  `${cellId}-output-${outputIndex}`;
 
 export type NotebookCellProps = {
   readonly cell: NotebookCellValue;
@@ -39,7 +32,6 @@ export function NotebookCell({
   onRemove,
 }: NotebookCellProps) {
   const number = index + 1;
-  const outputKeys = cell.cell_type === "code" ? stableOutputKeys(cell.id, cell.outputs) : [];
   const sourceLabel = `${cell.cell_type === "code" ? "Code" : "Markdown"} cell ${number} source`;
   const action = (
     label: string,
@@ -90,7 +82,7 @@ export function NotebookCell({
         {cell.cell_type === "code" && cell.outputs.length > 0 ? (
           <div aria-label={`Outputs for code cell ${number}`} className="mt-2 space-y-2">
             {cell.outputs.map((output, outputIndex) => (
-              <NotebookOutput key={outputKeys[outputIndex]} output={output} />
+              <NotebookOutput key={notebookOutputKey(cell.id, outputIndex)} output={output} />
             ))}
           </div>
         ) : null}

@@ -8,7 +8,7 @@ import {
   type NotebookRevision,
 } from "./contracts.ts";
 
-export { NotebookCell, type NotebookCellProps } from "./NotebookCell.tsx";
+export { NotebookCell, notebookOutputKey, type NotebookCellProps } from "./NotebookCell.tsx";
 export { NotebookMarkdown, NotebookOutput } from "./NotebookOutput.tsx";
 export { sanitizeNotebookSvg } from "./notebook-sanitize.ts";
 

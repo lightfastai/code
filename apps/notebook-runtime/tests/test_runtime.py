@@ -284,7 +284,10 @@ async def test_sidecar_rejects_a_second_distinct_session(tmp_path: Any) -> None:
 async def test_orders_matching_iopub_messages_through_idle(service: RuntimeService) -> None:
     _, opened = await open_session(service)
     events = [
-        event async for event in service.execute("session-1", "command-1", "execution-1", "ordered")
+        event
+        async for event in service.execute(
+            "session-1", "command-1", "execution-1", "cell-1", "ordered"
+        )
     ]
 
     assert [event["type"] for event in opened] == ["accepted", "kernel", "kernel"]
@@ -308,7 +311,9 @@ async def test_normalizes_kernel_errors(service: RuntimeService) -> None:
     await open_session(service)
     events = [
         event
-        async for event in service.execute("session-1", "command-error", "execution-error", "error")
+        async for event in service.execute(
+            "session-1", "command-error", "execution-error", "cell-error", "error"
+        )
     ]
     error = next(event for event in events if event["type"] == "error")
     assert error == {
@@ -342,7 +347,11 @@ async def test_bounds_complete_events_and_all_untrusted_kernel_fields(
     display_events = [
         event
         async for event in service.execute(
-            "session-1", "bounded-metadata", "bounded-metadata-execution", "bounded-metadata"
+            "session-1",
+            "bounded-metadata",
+            "bounded-metadata-execution",
+            "cell-bounded-metadata",
+            "bounded-metadata",
         )
     ]
     manager.client_instance.messages.extend(
@@ -359,7 +368,11 @@ async def test_bounds_complete_events_and_all_untrusted_kernel_fields(
     error_events = [
         event
         async for event in service.execute(
-            "session-1", "bounded-error", "bounded-error-execution", "bounded-error"
+            "session-1",
+            "bounded-error",
+            "bounded-error-execution",
+            "cell-bounded-error",
+            "bounded-error",
         )
     ]
     events = [*display_events, *error_events]
@@ -379,16 +392,25 @@ async def test_bounds_complete_events_and_all_untrusted_kernel_fields(
 async def test_duplicate_command_replays_without_executing_twice(service: RuntimeService) -> None:
     manager, _ = await open_session(service)
     first = [
-        event async for event in service.execute("session-1", "same", "execution-1", "ordered")
+        event
+        async for event in service.execute(
+            "session-1", "same", "execution-1", "cell-1", "ordered"
+        )
     ]
     replay = [
-        event async for event in service.execute("session-1", "same", "execution-1", "ordered")
+        event
+        async for event in service.execute(
+            "session-1", "same", "execution-1", "cell-1", "ordered"
+        )
     ]
     assert replay == first
     assert manager.client_instance.execute_count == 1
 
     rejected = [
-        event async for event in service.execute("session-1", "same", "execution-2", "error")
+        event
+        async for event in service.execute(
+            "session-1", "same", "execution-2", "cell-2", "error"
+        )
     ]
     assert len(rejected) == 1
     assert rejected[0]["type"] == "rejected"
@@ -399,7 +421,9 @@ async def test_execution_survives_subscriber_cancellation_and_replays_terminal_e
     service: RuntimeService,
 ) -> None:
     manager, _ = await open_session(service)
-    stream = service.execute("session-1", "disconnect", "disconnect-execution", "wait")
+    stream = service.execute(
+        "session-1", "disconnect", "disconnect-execution", "cell-disconnect", "wait"
+    )
     accepted = await anext(stream)
     assert accepted["type"] == "accepted"
     pending = asyncio.create_task(anext(stream))
@@ -413,7 +437,7 @@ async def test_execution_survives_subscriber_cancellation_and_replays_terminal_e
     replay = [
         event
         async for event in service.execute(
-            "session-1", "disconnect", "disconnect-execution", "wait"
+            "session-1", "disconnect", "disconnect-execution", "cell-disconnect", "wait"
         )
     ]
 
@@ -451,7 +475,11 @@ async def test_dispose_finalizes_execution_cancelled_before_owner_task_starts(
 
     monkeypatch.setattr(asyncio, "create_task", intercept_owner)
     stream = service.execute(
-        "session-1", "pre-start-cancel", "pre-start-cancel-execution", "ordered"
+        "session-1",
+        "pre-start-cancel",
+        "pre-start-cancel-execution",
+        "cell-pre-start-cancel",
+        "ordered",
     )
     subscriber = original_create_task(anext(stream))
     await asyncio.wait_for(owner_created.wait(), timeout=0.1)
@@ -492,7 +520,10 @@ async def test_output_and_time_limits_emit_structured_events(service: RuntimeSer
     service.output_limit_bytes = 5
     manager, _ = await open_session(service)
     output_events = [
-        event async for event in service.execute("session-1", "large", "execution-large", "large")
+        event
+        async for event in service.execute(
+            "session-1", "large", "execution-large", "cell-large", "large"
+        )
     ]
     streams = [event for event in output_events if event["type"] == "stream"]
     limits = [event for event in output_events if event["type"] == "limit"]
@@ -511,7 +542,10 @@ async def test_output_and_time_limits_emit_structured_events(service: RuntimeSer
     ]
 
     timed_out = [
-        event async for event in service.execute("session-1", "wait", "execution-wait", "wait")
+        event
+        async for event in service.execute(
+            "session-1", "wait", "execution-wait", "cell-wait", "wait"
+        )
     ]
     assert any(event["type"] == "limit" and event["kind"] == "time" for event in timed_out)
     assert manager.interrupt_count == 1
@@ -527,7 +561,7 @@ async def test_timeout_waits_for_real_idle_or_restarts_before_next_execution(
     drained = [
         event
         async for event in service.execute(
-            "session-1", "timeout-drain", "timeout-drain-execution", "wait"
+            "session-1", "timeout-drain", "timeout-drain-execution", "cell-timeout-drain", "wait"
         )
     ]
 
@@ -547,7 +581,11 @@ async def test_timeout_waits_for_real_idle_or_restarts_before_next_execution(
     recovered = [
         event
         async for event in service.execute(
-            "session-1", "timeout-restart", "timeout-restart-execution", "wait"
+            "session-1",
+            "timeout-restart",
+            "timeout-restart-execution",
+            "cell-timeout-restart",
+            "wait",
         )
     ]
     assert [event.get("state") for event in recovered if event["type"] == "kernel"][-3:] == [
@@ -560,7 +598,11 @@ async def test_timeout_waits_for_real_idle_or_restarts_before_next_execution(
     following = [
         event
         async for event in service.execute(
-            "session-1", "after-recovery", "after-recovery-execution", "ordered"
+            "session-1",
+            "after-recovery",
+            "after-recovery-execution",
+            "cell-after-recovery",
+            "ordered",
         )
     ]
     assert any(event["type"] == "stream" and event["text"] == "one\n" for event in following)
@@ -625,9 +667,16 @@ async def test_execute_api_streams_ndjson(service: RuntimeService) -> None:
         response = await client.post(
             "/v1/sessions/session-api/execute",
             headers=headers,
-            json={"commandId": "execute-api", "executionId": "execution-api", "code": "ordered"},
+            json={
+                "commandId": "execute-api",
+                "executionId": "execution-api",
+                "cellId": "cell-api",
+                "code": "ordered",
+            },
         )
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/x-ndjson")
     assert '"type":"stream"' in response.text
+    accepted = json.loads(response.text.splitlines()[0])
+    assert accepted["cellId"] == "cell-api"

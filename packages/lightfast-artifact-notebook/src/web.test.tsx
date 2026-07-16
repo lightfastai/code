@@ -10,6 +10,7 @@ import type {
 import {
   NotebookCell,
   NotebookOutput,
+  notebookOutputKey,
   notebookWebCapability,
   sanitizeNotebookSvg,
 } from "./web.tsx";
@@ -26,6 +27,11 @@ describe("notebook web capability", () => {
 });
 
 describe("NotebookCell", () => {
+  it("keys outputs by stable cell identity and output position", () => {
+    expect(notebookOutputKey("code-1", 0)).toBe("code-1-output-0");
+    expect(notebookOutputKey("code-1", 2)).toBe("code-1-output-2");
+  });
+
   it("renders Markdown cells without executing embedded HTML", () => {
     const cell: NotebookCellValue = {
       cell_type: "markdown",

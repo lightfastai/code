@@ -8,9 +8,7 @@ import {
 } from "./contracts.ts";
 import {
   addNotebookCell,
-  applyImportedNotebookRevision,
   applySavedNotebookRevision,
-  createNotebookWorkingCopy,
   duplicateNotebookCell,
   isNotebookWorkingCopyDirty,
   moveNotebookCell,
@@ -21,6 +19,12 @@ import {
   viewReferencedNotebookRevision,
   type NotebookWorkingCopy,
 } from "./working-copy.ts";
+import {
+  importNotebookRevisionAndReplaceRuntime,
+  loadNotebookRevisionAndConnect,
+  notebookLifecycleErrorMessage,
+  notebookRuntimeTarget,
+} from "./runtime-lifecycle.ts";
 import { NotebookCell } from "./NotebookCell.tsx";
 import { type NotebookRuntimeView, useNotebookWebBindings } from "./web.tsx";
 
@@ -48,9 +52,6 @@ const nextId = (prefix: string): string => {
     .slice(0, 64);
 };
 
-const sessionIdFor = (documentId: string): string =>
-  `notebook-${documentId}`.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 128);
-
 const isNotebookPayload = (value: unknown): value is NotebookArtifactPayload => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
@@ -64,13 +65,6 @@ const isNotebookPayload = (value: unknown): value is NotebookArtifactPayload => 
     record.initialView !== null
   );
 };
-
-const errorMessage = (cause: unknown): string =>
-  cause instanceof Error
-    ? cause.message
-    : typeof cause === "string"
-      ? cause
-      : "Notebook action failed.";
 
 function applyRuntimeToWorkingCopy(
   working: NotebookWorkingCopy,
@@ -106,8 +100,10 @@ export function NotebookArtifactEnvelopeRenderer({
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(true);
   const mounted = useRef(true);
+  const loadGeneration = useRef(0);
   const importInput = useRef<HTMLInputElement | null>(null);
-  const sessionId = payload === null ? "notebook-invalid" : sessionIdFor(payload.documentId);
+  const runtimeTarget = working === null ? null : notebookRuntimeTarget(working);
+  const sessionId = runtimeTarget?.sessionId ?? "notebook-invalid";
 
   const onRuntimeState = useCallback((next: NotebookRuntimeView) => {
     if (!mounted.current) return;
@@ -124,29 +120,38 @@ export function NotebookArtifactEnvelopeRenderer({
     };
   }, []);
 
-  useEffect(() => {
+  const loadRevisionAndConnect = useCallback(async () => {
     if (bindings === null || payload === null) return;
-    let active = true;
-    setLoadError(null);
-    void bindings.controller
-      .readRevision(bindings.scope, payload.documentId, payload.revisionId)
-      .then(async (revision) => {
-        if (!active) return;
-        setWorking(createNotebookWorkingCopy(revision));
-        await bindings.controller.connect({
-          scope: bindings.scope,
-          sessionId,
-          kernelName: payload.kernel.name,
-          onState: onRuntimeState,
-        });
-      })
-      .catch((cause: unknown) => {
-        if (active) setLoadError(errorMessage(cause));
+    const generation = ++loadGeneration.current;
+    const isActive = () => mounted.current && loadGeneration.current === generation;
+    try {
+      await loadNotebookRevisionAndConnect({
+        controller: bindings.controller,
+        scope: bindings.scope,
+        documentId: payload.documentId,
+        revisionId: payload.revisionId,
+        onState: onRuntimeState,
+        isActive,
+        onLoadError: (error) => {
+          if (isActive()) setLoadError(error);
+        },
+        onWorkingCopy: (next) => {
+          if (!isActive()) return;
+          setRuntime(INITIAL_RUNTIME_STATE);
+          setWorking(next);
+        },
       });
+    } catch {
+      // The shared loader has already surfaced the bounded error message.
+    }
+  }, [bindings, onRuntimeState, payload]);
+
+  useEffect(() => {
+    void loadRevisionAndConnect();
     return () => {
-      active = false;
+      loadGeneration.current += 1;
     };
-  }, [bindings, onRuntimeState, payload, sessionId]);
+  }, [loadRevisionAndConnect]);
 
   const runAction = useCallback(async (label: string, action: () => Promise<void>) => {
     setPendingAction(label);
@@ -154,7 +159,7 @@ export function NotebookArtifactEnvelopeRenderer({
     try {
       await action();
     } catch (cause) {
-      if (mounted.current) setActionError(errorMessage(cause));
+      if (mounted.current) setActionError(notebookLifecycleErrorMessage(cause));
     } finally {
       if (mounted.current) setPendingAction(null);
     }
@@ -162,16 +167,16 @@ export function NotebookArtifactEnvelopeRenderer({
 
   const runCell = useCallback(
     async (cell: NotebookCellValue) => {
-      if (bindings === null || cell.cell_type !== "code") return;
+      if (bindings === null || runtimeTarget === null || cell.cell_type !== "code") return;
       await bindings.controller.executeCell({
         scope: bindings.scope,
-        sessionId,
+        sessionId: runtimeTarget.sessionId,
         cellId: cell.id,
         code: cell.source,
         onState: onRuntimeState,
       });
     },
-    [bindings, onRuntimeState, sessionId],
+    [bindings, onRuntimeState, runtimeTarget],
   );
 
   const visibleCells = useMemo(() => {
@@ -208,18 +213,9 @@ export function NotebookArtifactEnvelopeRenderer({
         <button
           type="button"
           className="mt-2 rounded border border-border px-2 py-1 text-xs"
-          onClick={() =>
-            void runAction("reconnect", () =>
-              bindings.controller.connect({
-                scope: bindings.scope,
-                sessionId,
-                kernelName: payload.kernel.name,
-                onState: onRuntimeState,
-              }),
-            )
-          }
+          onClick={() => void loadRevisionAndConnect()}
         >
-          Reconnect runtime
+          Retry notebook
         </button>
       </div>
     );
@@ -239,6 +235,7 @@ export function NotebookArtifactEnvelopeRenderer({
   const disabled = pendingAction !== null;
   const permission = bindings.agentExecutionPermission;
   const currentRevision = working.baseRevision;
+  const kernelName = runtimeTarget?.kernelName ?? currentRevision.kernel.name;
 
   return (
     <article
@@ -366,7 +363,7 @@ export function NotebookArtifactEnvelopeRenderer({
                   await bindings.controller.connect({
                     scope: bindings.scope,
                     sessionId,
-                    kernelName: payload.kernel.name,
+                    kernelName,
                     onState: onRuntimeState,
                   });
                   await bindings.controller.recover({
@@ -551,14 +548,19 @@ export function NotebookArtifactEnvelopeRenderer({
                 event.currentTarget.value = "";
                 if (!file) return;
                 void runAction("import", async () => {
-                  const revision = await bindings.controller.importRevision(
-                    bindings.scope,
-                    await file.text(),
-                  );
-                  if (mounted.current)
-                    setWorking((current) =>
-                      current === null ? current : applyImportedNotebookRevision(current, revision),
-                    );
+                  await importNotebookRevisionAndReplaceRuntime({
+                    controller: bindings.controller,
+                    scope: bindings.scope,
+                    working,
+                    ipynbJson: await file.text(),
+                    onState: onRuntimeState,
+                    isActive: () => mounted.current,
+                    onWorkingCopy: (next) => {
+                      if (!mounted.current) return;
+                      setRuntime(INITIAL_RUNTIME_STATE);
+                      setWorking(next);
+                    },
+                  });
                 });
               }}
             />

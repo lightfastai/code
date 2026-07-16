@@ -1,5 +1,6 @@
 import {
   NOTEBOOK_DOCUMENT_MAX_BYTES,
+  NotebookCellId,
   NotebookMimeBundle,
   NotebookDocument,
   NotebookDocumentId,
@@ -37,8 +38,13 @@ export const NotebookExecutionEvent = Schema.Union([
   Schema.Struct({
     ...NotebookExecutionEventBase.fields,
     type: Schema.Literal("accepted"),
-    executionId: Schema.optional(NotebookExecutionId),
-    commandType: Schema.Literals(["open", "execute", "interrupt", "restart", "dispose"]),
+    commandType: Schema.Literals(["open", "interrupt", "restart", "dispose"]),
+  }),
+  Schema.Struct({
+    ...NotebookExecutionScopedEventBase.fields,
+    type: Schema.Literal("accepted"),
+    commandType: Schema.Literal("execute"),
+    cellId: NotebookCellId,
   }),
   Schema.Struct({
     ...NotebookExecutionEventBase.fields,
@@ -105,6 +111,7 @@ export const NotebookCellExecuteInput = Schema.Struct({
   ...NotebookRuntimeSessionRef.fields,
   commandId: NotebookCommandId,
   executionId: NotebookExecutionId,
+  cellId: NotebookCellId,
   code: Schema.String.check(Schema.isMaxLength(2 * 1024 * 1024)),
 });
 export type NotebookCellExecuteInput = typeof NotebookCellExecuteInput.Type;
