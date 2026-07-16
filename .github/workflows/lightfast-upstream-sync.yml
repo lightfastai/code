@@ -69,19 +69,22 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --base main \
               --state open \
-              --json number,headRefName \
-              --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))][0] // empty'
+              --limit 100 \
+              --json number,headRefName,isCrossRepository,updatedAt \
+              --jq '[.[] | select(.isCrossRepository == false and (.headRefName | test("^sync/upstream-[0-9]{8}$")))] | sort_by(.updatedAt) | reverse | .[0] // empty'
           )"
 
           if [[ -n "$existing_pr" ]]; then
             branch="$(jq -r '.headRefName' <<< "$existing_pr")"
             pr_number="$(jq -r '.number' <<< "$existing_pr")"
+            git fetch --no-tags origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+            git switch --force-create "$branch" "origin/$branch"
           else
             branch="sync/upstream-$(date -u +%Y%m%d)"
             pr_number=""
+            git switch --force-create "$branch" origin/main
           fi
 
-          git switch --force-create "$branch" origin/main
           echo "name=$branch" >> "$GITHUB_OUTPUT"
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
 
@@ -245,17 +248,7 @@ jobs:
           BRANCH: ${{ steps.branch.outputs.name }}
         run: |
           set -euo pipefail
-
-          remote_sha="$(
-            git ls-remote --heads origin "refs/heads/$BRANCH" | awk '{print $1}'
-          )"
-          if [[ -n "$remote_sha" ]]; then
-            git push \
-              --force-with-lease="refs/heads/$BRANCH:$remote_sha" \
-              origin "HEAD:refs/heads/$BRANCH"
-          else
-            git push origin "HEAD:refs/heads/$BRANCH"
-          fi
+          git push origin "HEAD:refs/heads/$BRANCH"
 
       - name: Open or update the integration pull request
         if: steps.pr.outcome == 'success'
