@@ -155,6 +155,8 @@ const config: ExpoConfig = {
       },
       NSLocalNetworkUsageDescription:
         "Allow T3 Code to connect to T3 Code servers on your local network or tailnet.",
+      NSMicrophoneUsageDescription:
+        "Allow T3 Code to use your microphone for live voice study sessions.",
       ITSAppUsesNonExemptEncryption: false,
     },
   },
@@ -176,6 +178,20 @@ const config: ExpoConfig = {
   },
   plugins: [
     "expo-asset",
+    [
+      "@livekit/react-native-expo-plugin",
+      {
+        android: { audioType: "communication" },
+        ios: { enableMultitaskingCameraAccess: false },
+      },
+    ],
+    [
+      "@config-plugins/react-native-webrtc",
+      {
+        cameraPermission: "Allow T3 Code to use your camera in interactive study sessions.",
+        microphonePermission: "Allow T3 Code to use your microphone for live voice study sessions.",
+      },
+    ],
     [
       "expo-font",
       {

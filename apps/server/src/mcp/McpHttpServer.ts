@@ -22,6 +22,10 @@ import {
   PreviewSnapshotToolkit,
   PreviewStandardToolkit,
 } from "./toolkits/preview/tools.ts";
+import { ArtifactToolkitHandlersLive } from "./toolkits/artifacts/handlers.ts";
+import { ArtifactToolkit } from "./toolkits/artifacts/tools.ts";
+import { StudyToolkitHandlersLive } from "./toolkits/study/handlers.ts";
+import { StudyToolkit } from "./toolkits/study/tools.ts";
 
 const unauthorized = HttpServerResponse.jsonUnsafe(
   {
@@ -208,10 +212,22 @@ export const PreviewToolkitRegistrationLive = Layer.mergeAll(
   PreviewSnapshotRegistrationLive,
 );
 
+export const ArtifactToolkitRegistrationLive = McpServer.toolkit(ArtifactToolkit).pipe(
+  Layer.provide(ArtifactToolkitHandlersLive),
+);
+
+export const StudyToolkitRegistrationLive = McpServer.toolkit(StudyToolkit).pipe(
+  Layer.provide(StudyToolkitHandlersLive),
+);
+
 const McpTransportLive = McpServer.layerHttp({
   name: "T3 Code",
   version: packageJson.version,
   path: "/mcp",
 }).pipe(Layer.provide(McpAuthMiddlewareLive));
 
-export const layer = PreviewToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive));
+export const layer = Layer.mergeAll(
+  PreviewToolkitRegistrationLive,
+  ArtifactToolkitRegistrationLive,
+  StudyToolkitRegistrationLive,
+).pipe(Layer.provideMerge(McpTransportLive));

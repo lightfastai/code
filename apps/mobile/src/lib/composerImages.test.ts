@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { PROVIDER_SEND_TURN_MAX_ATTACHMENTS } from "@t3tools/contracts";
+import {
+  PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
+  PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
+} from "@t3tools/contracts";
 
 const files = new Map<string, { base64: string; deleted: boolean }>();
 
@@ -36,7 +39,32 @@ vi.mock("./uuid", () => ({
   uuidv4: () => "attachment-id",
 }));
 
-import { convertPastedImagesToAttachments, isOwnedPastedImageUri } from "./composerImages";
+import {
+  convertPastedImagesToAttachments,
+  createPngComposerAttachmentFromBase64,
+  isOwnedPastedImageUri,
+} from "./composerImages";
+
+describe("canvas region attachments", () => {
+  it("creates a data-backed PNG attachment from trimmed base64", () => {
+    expect(createPngComposerAttachmentFromBase64("  aGVsbG8=  ", "region.png")).toEqual({
+      id: "attachment-id",
+      type: "image",
+      name: "region.png",
+      mimeType: "image/png",
+      sizeBytes: 5,
+      dataUrl: "data:image/png;base64,aGVsbG8=",
+      previewUri: "data:image/png;base64,aGVsbG8=",
+    });
+  });
+
+  it("rejects empty and oversized canvas exports", () => {
+    const oversized = "A".repeat(Math.ceil(((PROVIDER_SEND_TURN_MAX_IMAGE_BYTES + 1) * 4) / 3));
+
+    expect(createPngComposerAttachmentFromBase64("  ")).toBeNull();
+    expect(createPngComposerAttachmentFromBase64(oversized)).toBeNull();
+  });
+});
 
 describe("native pasted image cleanup", () => {
   beforeEach(() => {

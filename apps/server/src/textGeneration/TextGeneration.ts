@@ -1,7 +1,7 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import type { ChatAttachment, ModelSelection, ProviderInstanceId } from "@t3tools/contracts";
+import type { ChatImageAttachment, ModelSelection, ProviderInstanceId } from "@t3tools/contracts";
 import { TextGenerationError } from "@t3tools/contracts";
 
 import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
@@ -46,7 +46,7 @@ export interface PrContentGenerationResult {
 export interface BranchNameGenerationInput {
   cwd: string;
   message: string;
-  attachments?: ReadonlyArray<ChatAttachment> | undefined;
+  attachments?: ReadonlyArray<ChatImageAttachment> | undefined;
   /** What model and provider to use for generation. */
   modelSelection: ModelSelection;
 }
@@ -58,7 +58,7 @@ export interface BranchNameGenerationResult {
 export interface ThreadTitleGenerationInput {
   cwd: string;
   message: string;
-  attachments?: ReadonlyArray<ChatAttachment> | undefined;
+  attachments?: ReadonlyArray<ChatImageAttachment> | undefined;
   /** What model and provider to use for generation. */
   modelSelection: ModelSelection;
 }

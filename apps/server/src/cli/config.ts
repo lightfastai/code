@@ -103,6 +103,10 @@ const EnvServerConfig = Config.all({
   port: Config.port("T3CODE_PORT").pipe(Config.option, Config.map(Option.getOrUndefined)),
   host: Config.string("T3CODE_HOST").pipe(Config.option, Config.map(Option.getOrUndefined)),
   t3Home: Config.string("T3CODE_HOME").pipe(Config.option, Config.map(Option.getOrUndefined)),
+  studyLibraryDir: Config.string("T3_STUDY_LIBRARY").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   devUrl: Config.url("VITE_DEV_SERVER_URL").pipe(Config.option, Config.map(Option.getOrUndefined)),
   noBrowser: Config.boolean("T3CODE_NO_BROWSER").pipe(
     Config.option,
@@ -272,7 +276,10 @@ export const resolveServerConfig = (
     const cwd = path.resolve(yield* expandHomePath(rawCwd.trim()));
     yield* fs.makeDirectory(cwd, { recursive: true });
     const derivedPaths = yield* ServerConfig.deriveServerPaths(baseDir, devUrl);
-    yield* ServerConfig.ensureServerDirectories(derivedPaths);
+    const studyLibraryDir = env.studyLibraryDir
+      ? path.resolve(yield* expandHomePath(env.studyLibraryDir))
+      : derivedPaths.studyLibraryDir;
+    yield* ServerConfig.ensureServerDirectories({ ...derivedPaths, studyLibraryDir });
     const persistedObservabilitySettings = yield* loadPersistedObservabilitySettings(
       derivedPaths.settingsPath,
     );
@@ -355,6 +362,7 @@ export const resolveServerConfig = (
       cwd,
       baseDir,
       ...derivedPaths,
+      studyLibraryDir,
       serverTracePath,
       host,
       staticDir,

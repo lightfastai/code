@@ -38,6 +38,14 @@ const TestLayer = McpHttpServer.PreviewToolkitRegistrationLive.pipe(
   Layer.provideMerge(McpServer.McpServer.layer),
   Layer.provideMerge(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
 );
+const ToolkitRegistrationTestLayer = Layer.mergeAll(
+  McpHttpServer.PreviewToolkitRegistrationLive,
+  McpHttpServer.ArtifactToolkitRegistrationLive,
+  McpHttpServer.StudyToolkitRegistrationLive,
+).pipe(
+  Layer.provideMerge(McpServer.McpServer.layer),
+  Layer.provideMerge(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
+);
 
 it("normalizes empty successful notification responses to accepted", () => {
   const notificationResponse = McpHttpServer.normalizeMcpHttpResponse(
@@ -50,6 +58,36 @@ it("normalizes empty successful notification responses to accepted", () => {
   );
   expect(resultResponse.status).toBe(200);
 });
+
+it.effect("registers the study and semantic artifact tools with safe annotations", () =>
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+
+    const studyList = server.tools.find(({ tool }) => tool.name === "study_library_list");
+    expect(studyList?.tool.annotations).toMatchObject({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+
+    const studySearch = server.tools.find(({ tool }) => tool.name === "study_library_search");
+    expect(studySearch?.tool.annotations).toMatchObject({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+
+    const artifact = server.tools.find(({ tool }) => tool.name === "artifact_publish_3d_scene");
+    expect(artifact?.tool.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    });
+  }).pipe(Effect.provide(ToolkitRegistrationTestLayer)),
+);
 
 it.effect("returns bounded structural preview snapshot failures", () =>
   Effect.scoped(

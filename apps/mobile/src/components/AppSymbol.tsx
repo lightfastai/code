@@ -95,6 +95,7 @@ const ANDROID_ICON_BY_SF_SYMBOL: Partial<Record<SFSymbol, Icon>> = {
   "bolt.horizontal.circle": IconBolt,
   camera: IconCamera,
   checkmark: IconCheck,
+  crop: IconArrowsMaximize,
   "checkmark.circle": IconCircleCheck,
   "chevron.down": IconChevronDown,
   "chevron.left": IconChevronLeft,

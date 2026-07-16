@@ -12,6 +12,7 @@ import type {
   ProviderInteractionMode,
   RuntimeMode,
   ServerConfig as T3ServerConfig,
+  StudyDocument,
   ThreadId,
 } from "@t3tools/contracts";
 import { formatElapsed } from "@t3tools/shared/orchestrationTiming";
@@ -60,6 +61,7 @@ export interface ThreadDetailScreenProps {
   readonly respondingUserInputId: ApprovalRequestId | null;
   readonly draftMessage: string;
   readonly draftAttachments: ReadonlyArray<DraftComposerImageAttachment>;
+  readonly studyDocuments: ReadonlyArray<StudyDocument>;
   readonly connectionStateLabel: EnvironmentConnectionPhase;
   /** Message sync status for the selected thread (drives the composer status pill). */
   readonly threadSyncStatus?: EnvironmentThreadStatus;
@@ -83,6 +85,7 @@ export interface ThreadDetailScreenProps {
   readonly onUpdateThreadModelSelection: (modelSelection: ModelSelection) => void;
   readonly onUpdateThreadRuntimeMode: (runtimeMode: RuntimeMode) => void;
   readonly onUpdateThreadInteractionMode: (interactionMode: ProviderInteractionMode) => void;
+  readonly onUpdateStudyDocuments: (documents: ReadonlyArray<StudyDocument>) => void;
   readonly onRespondToApproval: (
     requestId: ApprovalRequestId,
     decision: ProviderApprovalDecision,
@@ -472,6 +475,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               editorRef={composerEditorRef}
               draftMessage={props.draftMessage}
               draftAttachments={props.draftAttachments}
+              studyDocuments={props.studyDocuments}
               placeholder="Ask the repo agent, or run a command…"
               contentMaxWidth={contentMaxWidth}
               connectionState={props.connectionStateLabel}
@@ -495,6 +499,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               onUpdateModelSelection={props.onUpdateThreadModelSelection}
               onUpdateRuntimeMode={props.onUpdateThreadRuntimeMode}
               onUpdateInteractionMode={props.onUpdateThreadInteractionMode}
+              onUpdateStudyDocuments={props.onUpdateStudyDocuments}
               onExpandedChange={setComposerExpanded}
             />
           </View>

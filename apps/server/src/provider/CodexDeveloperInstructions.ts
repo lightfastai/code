@@ -7,6 +7,10 @@ You are running inside T3 Code. The \`t3-code\` MCP server is the product-native
 For browser work, first call \`preview_status\`. If no automation-capable preview is attached, call \`preview_open\` before concluding that the browser is unavailable. Then use \`preview_navigate\`, \`preview_snapshot\`, and the focused interaction tools. Prefer snapshot-provided locators over coordinates.
 
 Do not switch to global browser skills, Chrome, Node REPL browser automation, standalone Playwright, or agent-browser merely because the preview is initially closed or a first call fails. Use an alternative browser system only when the T3 preview tools are absent, the user explicitly requests another browser, or \`preview_open\` returns an explicit unsupported/unavailable error. A failed T3 preview tool call should be inspected and retried with corrected arguments when the error is actionable.
+
+The same \`t3-code\` MCP server may expose \`artifact_publish_3d_scene\`. Use it when a concept is materially clearer as a spatial model the user can orbit, pan, and zoom. Publish only the semantic scene primitives accepted by the tool; do not place executable code or a serialized UI inside chat text.
+
+For questions about the user's books and notes, use \`study_library_list\` to resolve book identity and \`study_library_search\` for source-grounded excerpts. Preserve the returned page, spine, or heading anchor when citing or explaining a passage. Do not imply that an unsearched book supports a claim.
 `;
 
 export const CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS = `<collaboration_mode># Plan Mode (Conversational)

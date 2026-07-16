@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "@effect/vitest";
-import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
+import { EnvironmentId, ProviderInstanceId, type StudyDocument } from "@t3tools/contracts";
 
 import { appAtomRegistry } from "./atom-registry";
 import {
@@ -14,6 +14,18 @@ import {
 const DRAFT: ComposerDraft = {
   text: "hello",
   attachments: [],
+};
+
+const STUDY_DOCUMENT: StudyDocument = {
+  id: "a".repeat(64),
+  sha256: "a".repeat(64),
+  format: "pdf",
+  title: "Linear Algebra Done Right",
+  fileName: "linear-algebra.pdf",
+  objectKey: `objects/aa/${"a".repeat(64)}.pdf`,
+  sizeBytes: 123,
+  tags: ["math"],
+  importedAt: "2026-07-15T00:00:00.000Z",
 };
 
 afterEach(() => {
@@ -64,6 +76,27 @@ describe("mobile composer drafts", () => {
     });
   });
 
+  it("hydrates pinned study documents even when message content is empty", () => {
+    expect(
+      decodePersistedComposerDrafts({
+        schemaVersion: 1,
+        drafts: {
+          "environment-1:thread-1": {
+            text: "",
+            attachments: [],
+            studyDocuments: [STUDY_DOCUMENT],
+          },
+        },
+      }),
+    ).toEqual({
+      "environment-1:thread-1": {
+        text: "",
+        attachments: [],
+        studyDocuments: [STUDY_DOCUMENT],
+      },
+    });
+  });
+
   it("keeps legacy content-only drafts and rejects invalid selector state", () => {
     expect(
       decodePersistedComposerDrafts({
@@ -89,7 +122,7 @@ describe("mobile composer drafts", () => {
     ).toThrow();
   });
 
-  it("clears sent content without clearing the selected model or workspace", () => {
+  it("clears sent content without clearing model, workspace, or pinned books", () => {
     const draftKey = "environment-1:thread-1";
     const draft: ComposerDraft = {
       text: "send this",
@@ -104,6 +137,7 @@ describe("mobile composer drafts", () => {
         branch: "main",
         worktreePath: null,
       },
+      studyDocuments: [STUDY_DOCUMENT],
     };
 
     expect(clearComposerDraftContentState({ [draftKey]: draft }, draftKey)).toEqual({
@@ -113,6 +147,33 @@ describe("mobile composer drafts", () => {
         attachments: [],
       },
     });
+  });
+
+  it("rejects malformed or excessive pinned study documents", () => {
+    const persistedDraft = (studyDocuments: ReadonlyArray<unknown>) => ({
+      schemaVersion: 1,
+      drafts: {
+        "environment-1:thread-1": {
+          ...DRAFT,
+          studyDocuments,
+        },
+      },
+    });
+
+    expect(() =>
+      decodePersistedComposerDrafts(persistedDraft([{ ...STUDY_DOCUMENT, id: "not-a-sha256" }])),
+    ).toThrow();
+    expect(() =>
+      decodePersistedComposerDrafts(
+        persistedDraft(
+          Array.from({ length: 33 }, (_, index) => ({
+            ...STUDY_DOCUMENT,
+            id: index.toString(16).padStart(64, "0"),
+            sha256: index.toString(16).padStart(64, "0"),
+          })),
+        ),
+      ),
+    ).toThrow();
   });
 
   it("reads the latest selector state synchronously for send", () => {

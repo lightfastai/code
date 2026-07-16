@@ -8,10 +8,12 @@ import {
   type ModelSelection,
   type ProviderInteractionMode,
   type RuntimeMode,
+  type StudyDocument,
   type ThreadId,
 } from "@t3tools/contracts";
 import { safeErrorLogAttributes } from "@t3tools/client-runtime/errors";
 import { deriveActiveWorkStartedAt } from "@t3tools/shared/orchestrationTiming";
+import { appendStudyDocumentsToPrompt } from "@t3tools/shared/studyContext";
 
 import { makeQueuedMessageMetadata } from "../lib/commandMetadata";
 import {
@@ -97,6 +99,7 @@ export function useThreadComposerState() {
   const selectedDraft = selectedThreadKey ? composerDrafts[selectedThreadKey] : null;
   const draftMessage = selectedDraft?.text ?? "";
   const draftAttachments = selectedDraft?.attachments ?? [];
+  const studyDocuments = selectedDraft?.studyDocuments ?? [];
   const selectedThreadQueueCount = selectedThreadQueuedMessages.length;
   const selectedThread = selectedThreadDetail ?? selectedThreadShell;
   const modelSelection = selectedDraft?.modelSelection ?? selectedThread?.modelSelection ?? null;
@@ -132,44 +135,66 @@ export function useThreadComposerState() {
     !!selectedThread &&
     (selectedThread.session?.status === "running" || selectedThread.session?.status === "starting");
 
+  const onSendMessageContent = useCallback(
+    async (input: {
+      readonly text: string;
+      readonly attachments?: ReadonlyArray<DraftComposerImageAttachment>;
+    }) => {
+      if (!selectedThreadShell) {
+        return null;
+      }
+
+      const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
+      const draft = getComposerDraftSnapshot(threadKey);
+      const thread = selectedThreadDetail ?? selectedThreadShell;
+      const rawText = input.text.trim();
+      const attachments = input.attachments ?? [];
+      if (rawText.length === 0 && attachments.length === 0) {
+        return null;
+      }
+      const text = appendStudyDocumentsToPrompt(rawText, draft.studyDocuments ?? []);
+
+      const metadata = makeQueuedMessageMetadata();
+      const messageId = MessageId.make(metadata.messageId);
+      try {
+        await enqueueThreadOutboxMessage({
+          environmentId: selectedThreadShell.environmentId,
+          threadId: selectedThreadShell.id,
+          messageId,
+          commandId: CommandId.make(metadata.commandId),
+          text,
+          attachments,
+          modelSelection: draft.modelSelection ?? thread.modelSelection,
+          runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
+          interactionMode: draft.interactionMode ?? thread.interactionMode,
+          createdAt: metadata.createdAt,
+        });
+        return messageId;
+      } catch (error) {
+        setPendingConnectionError(
+          error instanceof Error ? error.message : "Failed to save the queued message.",
+        );
+        return null;
+      }
+    },
+    [selectedThreadDetail, selectedThreadShell],
+  );
+
   const onSendMessage = useCallback(async () => {
     if (!selectedThreadShell) {
       return null;
     }
-
     const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
     const draft = getComposerDraftSnapshot(threadKey);
-    const thread = selectedThreadDetail ?? selectedThreadShell;
-    const text = draft.text.trim();
-    const attachments = draft.attachments;
-    if (text.length === 0 && attachments.length === 0) {
-      return null;
-    }
-
-    const metadata = makeQueuedMessageMetadata();
-    const messageId = MessageId.make(metadata.messageId);
-    try {
-      await enqueueThreadOutboxMessage({
-        environmentId: selectedThreadShell.environmentId,
-        threadId: selectedThreadShell.id,
-        messageId,
-        commandId: CommandId.make(metadata.commandId),
-        text,
-        attachments,
-        modelSelection: draft.modelSelection ?? thread.modelSelection,
-        runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
-        interactionMode: draft.interactionMode ?? thread.interactionMode,
-        createdAt: metadata.createdAt,
-      });
+    const messageId = await onSendMessageContent({
+      text: draft.text,
+      attachments: draft.attachments,
+    });
+    if (messageId !== null) {
       clearComposerDraftContent(threadKey);
-      return messageId;
-    } catch (error) {
-      setPendingConnectionError(
-        error instanceof Error ? error.message : "Failed to save the queued message.",
-      );
-      return null;
     }
-  }, [selectedThreadDetail, selectedThreadShell]);
+    return messageId;
+  }, [onSendMessageContent, selectedThreadShell]);
 
   const onChangeDraftMessage = useCallback(
     (value: string) => {
@@ -289,12 +314,23 @@ export function useThreadComposerState() {
     [selectedThreadKey],
   );
 
+  const onUpdateStudyDocuments = useCallback(
+    (documents: ReadonlyArray<StudyDocument>) => {
+      if (!selectedThreadKey) return;
+      updateComposerDraftSettings(selectedThreadKey, {
+        studyDocuments: documents.slice(0, 32),
+      });
+    },
+    [selectedThreadKey],
+  );
+
   return {
     selectedThreadFeed,
     selectedThreadQueueCount,
     activeWorkStartedAt,
     draftMessage,
     draftAttachments,
+    studyDocuments,
     modelSelection,
     runtimeMode,
     interactionMode,
@@ -305,8 +341,10 @@ export function useThreadComposerState() {
     onNativePasteImages,
     onRemoveDraftImage,
     onSendMessage,
+    onSendMessageContent,
     onUpdateModelSelection,
     onUpdateRuntimeMode,
     onUpdateInteractionMode,
+    onUpdateStudyDocuments,
   };
 }

@@ -56,6 +56,8 @@ import {
   type TerminalError,
   type TerminalEvent,
   type TerminalMetadataStreamEvent,
+  StudyLibraryRequestError,
+  StudyVoiceSessionError,
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
@@ -114,7 +116,11 @@ import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
+import { readStudyLibraryIndex, resolveStudyLibraryPaths } from "./study/StudyLibrary.ts";
+import { searchStudyLibrary } from "./study/StudySearch.ts";
+import { createStudyVoiceSession } from "./study/StudyVoiceSession.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
+const isStudyVoiceSessionError = Schema.is(StudyVoiceSessionError);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -308,6 +314,9 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.shellOpenInEditor, AuthOrchestrationOperateScope],
   [WS_METHODS.filesystemBrowse, AuthOrchestrationReadScope],
   [WS_METHODS.assetsCreateUrl, AuthOrchestrationReadScope],
+  [WS_METHODS.studyLibraryList, AuthOrchestrationReadScope],
+  [WS_METHODS.studyLibrarySearch, AuthOrchestrationReadScope],
+  [WS_METHODS.studyVoiceSessionCreate, AuthOrchestrationOperateScope],
   [WS_METHODS.subscribeVcsStatus, AuthOrchestrationReadScope],
   [WS_METHODS.vcsRefreshStatus, AuthOrchestrationReadScope],
   [WS_METHODS.vcsPull, AuthOrchestrationOperateScope],
@@ -1518,6 +1527,62 @@ const makeWsRpcLayer = (
               });
             }),
             { "rpc.aggregate": "workspace" },
+          ),
+        [WS_METHODS.studyLibraryList]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.studyLibraryList,
+            Effect.gen(function* () {
+              const paths = yield* resolveStudyLibraryPaths(config.studyLibraryDir);
+              const index = yield* readStudyLibraryIndex(paths);
+              const tags = input.tags?.map((tag) => tag.trim().toLocaleLowerCase()) ?? [];
+              return index.documents.filter((document) =>
+                tags.every((tag) => document.tags.includes(tag)),
+              );
+            }).pipe(
+              Effect.mapError(
+                () =>
+                  new StudyLibraryRequestError({
+                    operation: "list",
+                    message: "Could not list the local study library.",
+                  }),
+              ),
+            ),
+            { "rpc.aggregate": "study" },
+          ),
+        [WS_METHODS.studyLibrarySearch]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.studyLibrarySearch,
+            Effect.gen(function* () {
+              const paths = yield* resolveStudyLibraryPaths(config.studyLibraryDir);
+              return yield* searchStudyLibrary(paths, input);
+            }).pipe(
+              Effect.mapError(
+                () =>
+                  new StudyLibraryRequestError({
+                    operation: "search",
+                    message: "Could not search the local study library.",
+                  }),
+              ),
+            ),
+            { "rpc.aggregate": "study" },
+          ),
+        [WS_METHODS.studyVoiceSessionCreate]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.studyVoiceSessionCreate,
+            Effect.gen(function* () {
+              const paths = yield* resolveStudyLibraryPaths(config.studyLibraryDir);
+              return yield* createStudyVoiceSession({ paths, request: input });
+            }).pipe(
+              Effect.mapError((error) =>
+                isStudyVoiceSessionError(error)
+                  ? error
+                  : new StudyVoiceSessionError({
+                      reason: "token",
+                      message: "Could not create a voice study session.",
+                    }),
+              ),
+            ),
+            { "rpc.aggregate": "study" },
           ),
         [WS_METHODS.subscribeVcsStatus]: (input) =>
           observeRpcStream(

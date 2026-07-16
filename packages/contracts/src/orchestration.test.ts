@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { ChatArtifactAttachment } from "./artifacts.ts";
 
 import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
@@ -11,6 +12,7 @@ import {
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetTurnDiffInput,
   OrchestrationLatestTurn,
+  OrchestrationMessage,
   ProjectCreatedPayload,
   ProjectMetaUpdatedPayload,
   OrchestrationProposedPlan,
@@ -49,6 +51,95 @@ const decodeThreadCreatedPayload = Schema.decodeUnknownEffect(ThreadCreatedPaylo
 const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationCommand);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
+const decodeChatArtifactAttachment = Schema.decodeUnknownEffect(ChatArtifactAttachment);
+const decodeOrchestrationMessage = Schema.decodeUnknownEffect(OrchestrationMessage);
+
+it.effect("decodes a versioned semantic 3D scene artifact", () =>
+  Effect.gen(function* () {
+    const artifact = yield* decodeChatArtifactAttachment({
+      type: "artifact",
+      id: "artifact-vector-addition",
+      kind: "3d-scene",
+      schemaVersion: 1,
+      title: "Vector addition",
+      capabilities: ["orbit", "zoom", "reset-camera"],
+      provenance: [
+        {
+          sourceType: "pdf",
+          sourceId: "book-linear-algebra",
+          locator: "page:42",
+        },
+      ],
+      payload: {
+        camera: { position: [5, 4, 6], target: [0, 1, 0] },
+        objects: [
+          {
+            type: "vector",
+            id: "vector-a",
+            start: [0, 0, 0],
+            end: [2, 1, 0],
+            color: "#38bdf8",
+            label: "a",
+          },
+          {
+            type: "circle",
+            id: "angle-guide",
+            center: [0, 0, 0],
+            normal: [0, 0, 1],
+            radius: 0.75,
+          },
+        ],
+      },
+    });
+
+    assert.strictEqual(artifact.kind, "3d-scene");
+    assert.strictEqual(artifact.payload.objects.length, 2);
+  }),
+);
+
+it.effect("rejects unversioned executable artifact payloads", () =>
+  Effect.gen(function* () {
+    const result = yield* Effect.exit(
+      decodeChatArtifactAttachment({
+        type: "artifact",
+        id: "artifact-script",
+        kind: "3d-scene",
+        schemaVersion: 1,
+        title: "Unsafe scene",
+        payload: {
+          objects: [{ type: "javascript", id: "script", source: "alert(1)" }],
+        },
+      }),
+    );
+
+    assert.strictEqual(result._tag, "Failure");
+  }),
+);
+
+it.effect("keeps image-only persisted messages backward compatible", () =>
+  Effect.gen(function* () {
+    const message = yield* decodeOrchestrationMessage({
+      id: "message-legacy-image",
+      role: "user",
+      text: "What is shown here?",
+      attachments: [
+        {
+          type: "image",
+          id: "image-legacy",
+          name: "notes.png",
+          mimeType: "image/png",
+          sizeBytes: 1024,
+        },
+      ],
+      turnId: null,
+      streaming: false,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    assert.strictEqual(message.attachments?.[0]?.type, "image");
+  }),
+);
 
 it.effect("parses turn diff input when fromTurnCount <= toTurnCount", () =>
   Effect.gen(function* () {

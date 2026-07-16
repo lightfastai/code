@@ -1,5 +1,5 @@
 import {
-  type ChatAttachment,
+  type ChatImageAttachment,
   CommandId,
   EventId,
   type ModelSelection,
@@ -586,7 +586,7 @@ const make = Effect.gen(function* () {
   const buildSendTurnRequestForThread = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
     readonly messageText: string;
-    readonly attachments?: ReadonlyArray<ChatAttachment>;
+    readonly attachments?: ReadonlyArray<ChatImageAttachment>;
     readonly modelSelection?: ModelSelection;
     readonly interactionMode?: "default" | "plan";
     readonly createdAt: string;
@@ -651,7 +651,7 @@ const make = Effect.gen(function* () {
     readonly branch: string | null;
     readonly worktreePath: string | null;
     readonly messageText: string;
-    readonly attachments?: ReadonlyArray<ChatAttachment>;
+    readonly attachments?: ReadonlyArray<ChatImageAttachment>;
   }) {
     if (!input.branch || !input.worktreePath) {
       return;
@@ -704,7 +704,7 @@ const make = Effect.gen(function* () {
       readonly threadId: ThreadId;
       readonly cwd: string;
       readonly messageText: string;
-      readonly attachments?: ReadonlyArray<ChatAttachment>;
+      readonly attachments?: ReadonlyArray<ChatImageAttachment>;
       readonly titleSeed?: string;
     }) {
       const attachments = input.attachments ?? [];
@@ -772,6 +772,7 @@ const make = Effect.gen(function* () {
 
     const isFirstUserMessageTurn =
       thread.messages.filter((entry) => entry.role === "user").length === 1;
+    const messageImages = message.attachments?.filter((attachment) => attachment.type === "image");
     if (isFirstUserMessageTurn) {
       const project = yield* resolveProject(thread.projectId);
       const generationCwd =
@@ -781,7 +782,7 @@ const make = Effect.gen(function* () {
         }) ?? process.cwd();
       const generationInput = {
         messageText: message.text,
-        ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
+        ...(messageImages !== undefined ? { attachments: messageImages } : {}),
         ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),
       };
 
@@ -840,7 +841,7 @@ const make = Effect.gen(function* () {
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
       threadId: event.payload.threadId,
       messageText: message.text,
-      ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
+      ...(messageImages !== undefined ? { attachments: messageImages } : {}),
       ...(event.payload.modelSelection !== undefined
         ? { modelSelection: event.payload.modelSelection }
         : {}),

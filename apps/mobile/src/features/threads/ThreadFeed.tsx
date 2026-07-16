@@ -1,7 +1,13 @@
 import * as Haptics from "expo-haptics";
 import { KeyboardAwareLegendList } from "@legendapp/list/keyboard";
 import { type LegendListRef } from "@legendapp/list/react-native";
-import type { EnvironmentId, MessageId, ThreadId, TurnId } from "@t3tools/contracts";
+import type {
+  ChatArtifactAttachment,
+  EnvironmentId,
+  MessageId,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 import { CHAT_LIST_ANCHOR_OFFSET, resolveChatListAnchoredEndSpace } from "@t3tools/shared/chatList";
 import { SymbolView } from "../../components/AppSymbol";
 import { HeaderHeightContext } from "@react-navigation/elements";
@@ -892,7 +898,7 @@ function renderFeedEntry(
               />
             ) : null}
             {attachments.map((attachment) => {
-              return (
+              return attachment.type === "image" ? (
                 <MessageAttachmentImage
                   key={attachment.id}
                   environmentId={props.environmentId}
@@ -900,6 +906,8 @@ function renderFeedEntry(
                   className="aspect-[1.3] w-full rounded-[14px] bg-white/15"
                   onPressImage={props.onPressImage}
                 />
+              ) : (
+                <MessageArtifactCard key={attachment.id} artifact={attachment} />
               );
             })}
           </View>
@@ -953,7 +961,7 @@ function renderFeedEntry(
           )
         ) : null}
         {attachments.map((attachment) => {
-          return (
+          return attachment.type === "image" ? (
             <MessageAttachmentImage
               key={attachment.id}
               environmentId={props.environmentId}
@@ -961,6 +969,8 @@ function renderFeedEntry(
               className="mt-1.5 aspect-[1.3] w-full rounded-[18px] bg-neutral-200 dark:bg-neutral-800"
               onPressImage={props.onPressImage}
             />
+          ) : (
+            <MessageArtifactCard key={attachment.id} artifact={attachment} />
           );
         })}
         {showAssistantMeta ? (
@@ -990,6 +1000,22 @@ function renderFeedEntry(
       onCopyRow={props.onCopyWorkRow}
       onToggleRow={props.onToggleWorkRow}
     />
+  );
+}
+
+function MessageArtifactCard({ artifact }: { readonly artifact: ChatArtifactAttachment }) {
+  return (
+    <View className="mt-1.5 gap-1 rounded-[18px] border border-neutral-200 bg-neutral-100 px-4 py-3 dark:border-neutral-700 dark:bg-neutral-900">
+      <View className="flex-row items-center gap-2">
+        <View className="size-2 rounded-full bg-sky-500" />
+        <Text className="font-t3-medium flex-1 text-sm text-foreground" numberOfLines={1}>
+          {artifact.title}
+        </Text>
+      </View>
+      <Text className="text-xs text-foreground-muted">
+        Interactive 3D scene · open on Mac or web to rotate and explore
+      </Text>
+    </View>
   );
 }
 

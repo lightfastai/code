@@ -7,7 +7,7 @@
  * @module textGenerationPrompts
  */
 import * as Schema from "effect/Schema";
-import type { ChatAttachment } from "@t3tools/contracts";
+import type { ChatImageAttachment } from "@t3tools/contracts";
 
 import { limitSection } from "./TextGenerationUtils.ts";
 import type { TextGenerationPolicy } from "./TextGenerationPolicy.ts";
@@ -126,7 +126,7 @@ export function buildPrContentPrompt(input: PrContentPromptInput) {
 
 export interface BranchNamePromptInput {
   message: string;
-  attachments?: ReadonlyArray<ChatAttachment> | undefined;
+  attachments?: ReadonlyArray<ChatImageAttachment> | undefined;
   policy?: TextGenerationPolicy | undefined;
 }
 
@@ -135,7 +135,7 @@ interface PromptFromMessageInput {
   responseShape: string;
   rules: ReadonlyArray<string>;
   message: string;
-  attachments?: ReadonlyArray<ChatAttachment> | undefined;
+  attachments?: ReadonlyArray<ChatImageAttachment> | undefined;
   additionalInstructions?: string | undefined;
 }
 
@@ -192,7 +192,7 @@ export function buildBranchNamePrompt(input: BranchNamePromptInput) {
 
 export interface ThreadTitlePromptInput {
   message: string;
-  attachments?: ReadonlyArray<ChatAttachment> | undefined;
+  attachments?: ReadonlyArray<ChatImageAttachment> | undefined;
   policy?: TextGenerationPolicy | undefined;
 }
 

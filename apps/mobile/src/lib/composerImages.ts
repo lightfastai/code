@@ -17,6 +17,27 @@ function estimateBase64ByteSize(base64: string): number {
   return Math.floor((base64.length * 3) / 4) - padding;
 }
 
+export function createPngComposerAttachmentFromBase64(
+  base64: string,
+  name = "canvas-selection.png",
+): DraftComposerImageAttachment | null {
+  const normalized = base64.trim();
+  const sizeBytes = estimateBase64ByteSize(normalized);
+  if (sizeBytes <= 0 || sizeBytes > PROVIDER_SEND_TURN_MAX_IMAGE_BYTES) {
+    return null;
+  }
+  const dataUrl = `data:image/png;base64,${normalized}`;
+  return {
+    id: uuidv4(),
+    type: "image",
+    name,
+    mimeType: "image/png",
+    sizeBytes,
+    dataUrl,
+    previewUri: dataUrl,
+  };
+}
+
 async function loadImagePicker() {
   try {
     return await import("expo-image-picker");

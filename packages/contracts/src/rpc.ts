@@ -143,6 +143,16 @@ import {
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
+import {
+  StudyLibraryListInput,
+  StudyLibraryListResult,
+  StudyLibraryRequestError,
+  StudySearchInput,
+  StudySearchResult,
+  StudyVoiceSessionError,
+  StudyVoiceSessionInput,
+  StudyVoiceSessionResult,
+} from "./study.ts";
 
 export const WS_METHODS = {
   // Project registry methods
@@ -160,6 +170,11 @@ export const WS_METHODS = {
   // Filesystem methods
   filesystemBrowse: "filesystem.browse",
   assetsCreateUrl: "assets.createUrl",
+
+  // Local-first study library methods
+  studyLibraryList: "study.library.list",
+  studyLibrarySearch: "study.library.search",
+  studyVoiceSessionCreate: "study.voice.session.create",
 
   // VCS methods
   vcsPull: "vcs.pull",
@@ -393,6 +408,24 @@ export const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
   payload: AssetCreateUrlInput,
   success: AssetCreateUrlResult,
   error: Schema.Union([AssetAccessError, EnvironmentAuthorizationError]),
+});
+
+export const WsStudyLibraryListRpc = Rpc.make(WS_METHODS.studyLibraryList, {
+  payload: StudyLibraryListInput,
+  success: StudyLibraryListResult,
+  error: Schema.Union([StudyLibraryRequestError, EnvironmentAuthorizationError]),
+});
+
+export const WsStudyLibrarySearchRpc = Rpc.make(WS_METHODS.studyLibrarySearch, {
+  payload: StudySearchInput,
+  success: StudySearchResult,
+  error: Schema.Union([StudyLibraryRequestError, EnvironmentAuthorizationError]),
+});
+
+export const WsStudyVoiceSessionCreateRpc = Rpc.make(WS_METHODS.studyVoiceSessionCreate, {
+  payload: StudyVoiceSessionInput,
+  success: StudyVoiceSessionResult,
+  error: Schema.Union([StudyVoiceSessionError, EnvironmentAuthorizationError]),
 });
 
 export const WsSubscribeVcsStatusRpc = Rpc.make(WS_METHODS.subscribeVcsStatus, {
@@ -706,6 +739,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsAssetsCreateUrlRpc,
+  WsStudyLibraryListRpc,
+  WsStudyLibrarySearchRpc,
+  WsStudyVoiceSessionCreateRpc,
   WsSubscribeVcsStatusRpc,
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,
