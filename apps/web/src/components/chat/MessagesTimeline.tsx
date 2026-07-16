@@ -1015,6 +1015,7 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
         {artifacts.length > 0 ? (
           <NotebookArtifactProvider
             projectRef={ctx.projectRef}
+            threadRef={ctx.threadRef}
             {...(ctx.notebookAgentExecutionPermission === undefined
               ? {}
               : { agentExecutionPermission: ctx.notebookAgentExecutionPermission })}

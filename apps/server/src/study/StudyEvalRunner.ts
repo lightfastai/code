@@ -9,6 +9,7 @@ import {
   type StudyEvalCaseResult,
   type StudyEvalComparison,
   type StudyEvalSplitSummary,
+  type StudyNotebookExecutionEvent,
   type StudyPromotionPolicy,
   type StudyTraceEvent,
   type StudyTraceEventMatcher,
@@ -21,7 +22,6 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
-import { writeFileStringAtomically } from "../atomicWrite.ts";
 import { hashStudyValue, readStudyTrace, type StudyLoopPaths } from "./StudyTraceStore.ts";
 
 const decodeDatasetJson = Schema.decodeUnknownEffect(Schema.fromJsonString(StudyEvalDataset));
@@ -98,6 +98,42 @@ function assertionWeight(assertion: StudyEvalAssertion): number {
   return assertion.weight ?? 1;
 }
 
+function hasContiguousSubsequence<T>(
+  actual: ReadonlyArray<T>,
+  expected: ReadonlyArray<T>,
+): boolean {
+  for (let start = 0; start <= actual.length - expected.length; start += 1) {
+    if (expected.every((value, offset) => actual[start + offset] === value)) return true;
+  }
+  return false;
+}
+
+function matchingNotebookExecutions(
+  records: ReadonlyArray<StudyTraceRecord>,
+  operation: StudyNotebookExecutionEvent["operation"],
+): ReadonlyArray<StudyNotebookExecutionEvent> {
+  return records.flatMap((record) =>
+    record.event.type === "notebook_execution" && record.event.operation === operation
+      ? [record.event]
+      : [],
+  );
+}
+
+function notebookAssertionResult(input: {
+  readonly assertion: StudyEvalAssertion;
+  readonly assertionIndex: number;
+  readonly passed: boolean;
+  readonly detail: string;
+}): StudyEvalAssertionResult {
+  return {
+    assertionIndex: input.assertionIndex,
+    type: input.assertion.type,
+    passed: input.passed,
+    weight: assertionWeight(input.assertion),
+    detail: input.detail,
+  };
+}
+
 function evaluateAssertion(
   assertion: StudyEvalAssertion,
   assertionIndex: number,
@@ -136,6 +172,114 @@ function evaluateAssertion(
         ? "Observed the required event order."
         : `No ordered pair was found (${before.length} before matches, ${after.length} after matches).`,
     };
+  }
+
+  if (assertion.type === "notebook_output_order") {
+    const executions = matchingNotebookExecutions(records, assertion.operation);
+    const passed = executions.some(
+      (event) =>
+        event.outputHash === assertion.outputHash &&
+        hasContiguousSubsequence(
+          event.commands.map((command) => command.type),
+          assertion.commandOrder,
+        ) &&
+        hasContiguousSubsequence(
+          event.runtimeEvents.map((runtimeEvent) => runtimeEvent.type),
+          assertion.runtimeEventOrder,
+        ),
+    );
+    return notebookAssertionResult({
+      assertion,
+      assertionIndex,
+      passed,
+      detail: passed
+        ? "Observed the required notebook command and runtime-event order with the exact output hash."
+        : `No ${assertion.operation} event matched the required order and output hash (${executions.length} candidates).`,
+    });
+  }
+
+  if (assertion.type === "notebook_max_latency") {
+    const executions = matchingNotebookExecutions(records, assertion.operation);
+    const durations = executions
+      .map((event) => event.durationMs)
+      .filter((duration) => Number.isFinite(duration) && duration >= 0);
+    const bestLatency = durations.length > 0 ? Math.min(...durations) : null;
+    const passed = bestLatency !== null && bestLatency <= assertion.maxMs;
+    return notebookAssertionResult({
+      assertion,
+      assertionIndex,
+      passed,
+      detail:
+        bestLatency === null
+          ? `No ${assertion.operation} event had a valid duration.`
+          : `Best observed notebook latency was ${bestLatency} ms; limit is ${assertion.maxMs} ms.`,
+    });
+  }
+
+  if (assertion.type === "notebook_permission") {
+    const executions = matchingNotebookExecutions(records, assertion.operation);
+    const passed = executions.some((event) => event.permissionGranted === assertion.required);
+    return notebookAssertionResult({
+      assertion,
+      assertionIndex,
+      passed,
+      detail: passed
+        ? `Observed ${assertion.operation} with permissionGranted=${assertion.required}.`
+        : `No ${assertion.operation} event matched permissionGranted=${assertion.required} (${executions.length} candidates).`,
+    });
+  }
+
+  if (assertion.type === "notebook_isolation") {
+    const executions = matchingNotebookExecutions(records, assertion.operation);
+    const passed = executions.some(
+      (event) =>
+        event.isolation.session === "ephemeral-exclusive" &&
+        event.isolation.network === "disabled" &&
+        event.isolation.hostWorkspace === "not-mounted",
+    );
+    return notebookAssertionResult({
+      assertion,
+      assertionIndex,
+      passed,
+      detail: passed
+        ? "Observed ephemeral-exclusive execution with networking disabled and no host workspace mount."
+        : `No ${assertion.operation} event had the required isolation (${executions.length} candidates).`,
+    });
+  }
+
+  if (assertion.type === "notebook_cleanup") {
+    const executions = matchingNotebookExecutions(records, assertion.operation);
+    const passed = executions.some((event) => {
+      const lastCommand = event.commands.at(-1);
+      return (
+        event.cleanup.attempted &&
+        event.cleanup.succeeded &&
+        lastCommand?.type === "dispose" &&
+        event.cleanup.commandId === lastCommand.commandId
+      );
+    });
+    return notebookAssertionResult({
+      assertion,
+      assertionIndex,
+      passed,
+      detail: passed
+        ? "Observed successful cleanup with the recorded dispose command last."
+        : `No ${assertion.operation} event proved successful final disposal (${executions.length} candidates).`,
+    });
+  }
+
+  if (assertion.type === "notebook_identity") {
+    const executions = matchingNotebookExecutions(records, assertion.operation);
+    const expectedHash = hashStudyValue(assertion.binding);
+    const passed = executions.some((event) => hashStudyValue(event.binding) === expectedHash);
+    return notebookAssertionResult({
+      assertion,
+      assertionIndex,
+      passed,
+      detail: passed
+        ? "Observed the exact immutable notebook, runtime image, kernel lock, and kernel identity."
+        : `No ${assertion.operation} event matched the exact binding identity (${executions.length} candidates).`,
+    });
   }
 
   const from = matchingIndices(records, assertion.from);
@@ -279,9 +423,23 @@ export const writeStudyEvalReport = Effect.fn("StudyEvalRunner.writeReport")(fun
         evaluationError(reportPath, "Could not create the eval report directory.", cause),
       ),
     );
-  yield* writeFileStringAtomically({ filePath: reportPath, contents: `${encoded}\n` }).pipe(
-    Effect.mapError((cause) => evaluationError(reportPath, "Could not write eval report.", cause)),
+  const contents = `${encoded}\n`;
+  const writeResult = yield* Effect.result(
+    fileSystem.writeFileString(reportPath, contents, { flag: "wx" }),
   );
+  if (writeResult._tag === "Failure") {
+    const existingResult = yield* Effect.result(fileSystem.readFileString(reportPath));
+    if (existingResult._tag === "Success" && existingResult.success === contents) {
+      return reportPath;
+    }
+    return yield* evaluationError(
+      reportPath,
+      existingResult._tag === "Success"
+        ? "Eval reports are immutable; this report ID already contains different bytes."
+        : "Could not write eval report.",
+      writeResult.failure,
+    );
+  }
   return reportPath;
 });
 

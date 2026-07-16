@@ -2,6 +2,7 @@ import {
   ArtifactPublishError,
   type EnvironmentId,
   PreviewAutomationUnavailableError,
+  NotebookAgentToolError,
   StudyToolError,
   type ProviderInstanceId,
   type ThreadId,
@@ -17,6 +18,7 @@ export interface McpInvocationScope {
   readonly providerSessionId: string;
   readonly providerInstanceId: ProviderInstanceId;
   readonly capabilities: ReadonlySet<McpCapability>;
+  readonly allowNotebookExecution: boolean;
   readonly issuedAt: number;
   readonly expiresAt: number;
 }
@@ -57,6 +59,17 @@ export const requireStudyCapability = Effect.fn("mcp.requireStudyCapability")(fu
   if (!invocation.capabilities.has("study")) {
     return yield* new StudyToolError({
       message: "MCP credential does not grant the study capability.",
+    });
+  }
+  return invocation;
+});
+
+export const requireNotebookExecution = Effect.fn("mcp.requireNotebookExecution")(function* () {
+  const invocation = yield* McpInvocationContext;
+  if (!invocation.allowNotebookExecution) {
+    return yield* new NotebookAgentToolError({
+      reason: "permission-denied",
+      message: "This thread does not grant notebook execution to the agent.",
     });
   }
   return invocation;

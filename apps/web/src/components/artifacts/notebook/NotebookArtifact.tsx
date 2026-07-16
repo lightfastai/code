@@ -1,4 +1,4 @@
-import type { ScopedProjectRef } from "@t3tools/contracts";
+import type { ScopedProjectRef, ScopedThreadRef } from "@t3tools/contracts";
 import {
   NotebookWebProvider,
   type NotebookAgentExecutionPermission,
@@ -6,22 +6,23 @@ import {
 import { useMemo, type ReactNode } from "react";
 
 import { useNotebookArtifactController } from "./useNotebookArtifactController";
-
-const UNAVAILABLE_AGENT_PERMISSION: NotebookAgentExecutionPermission = {
-  status: "unavailable",
-  label: "Thread permission is not connected yet.",
-};
+import { useNotebookAgentExecutionPermission } from "./useNotebookAgentExecutionPermission";
 
 export function NotebookArtifactProvider({
   projectRef,
-  agentExecutionPermission = UNAVAILABLE_AGENT_PERMISSION,
+  threadRef,
+  agentExecutionPermission,
   children,
 }: {
   readonly projectRef: ScopedProjectRef | null;
+  readonly threadRef: ScopedThreadRef | null;
   readonly agentExecutionPermission?: NotebookAgentExecutionPermission;
   readonly children: ReactNode;
 }) {
   const controller = useNotebookArtifactController();
+  const connectedAgentExecutionPermission = useNotebookAgentExecutionPermission(threadRef);
+  const resolvedAgentExecutionPermission =
+    agentExecutionPermission ?? connectedAgentExecutionPermission;
   const bindings = useMemo(
     () =>
       projectRef === null
@@ -29,9 +30,9 @@ export function NotebookArtifactProvider({
         : {
             scope: projectRef,
             controller,
-            agentExecutionPermission,
+            agentExecutionPermission: resolvedAgentExecutionPermission,
           },
-    [agentExecutionPermission, controller, projectRef],
+    [controller, projectRef, resolvedAgentExecutionPermission],
   );
   return <NotebookWebProvider bindings={bindings}>{children}</NotebookWebProvider>;
 }

@@ -145,6 +145,9 @@ import {
 import { VcsError } from "./vcs.ts";
 import {
   NotebookCellExecuteInput,
+  NotebookAgentExecutionPermission,
+  NotebookAgentExecutionPermissionGetInput,
+  NotebookAgentExecutionPermissionSetInput,
   NotebookExecutionControlInput,
   NotebookExecutionEvent,
   NotebookExecutionEvents,
@@ -207,6 +210,8 @@ export const WS_METHODS = {
   notebookKernelRestart: "notebook.kernel.restart",
   notebookSessionDispose: "notebook.session.dispose",
   notebookSessionEvents: "notebook.session.events",
+  notebookAgentExecutionPermissionGet: "notebook.agentExecutionPermission.get",
+  notebookAgentExecutionPermissionSet: "notebook.agentExecutionPermission.set",
 
   // VCS methods
   vcsPull: "vcs.pull",
@@ -526,6 +531,24 @@ export const WsNotebookSessionEventsRpc = Rpc.make(WS_METHODS.notebookSessionEve
   success: NotebookExecutionReplay,
   error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
 });
+
+export const WsNotebookAgentExecutionPermissionGetRpc = Rpc.make(
+  WS_METHODS.notebookAgentExecutionPermissionGet,
+  {
+    payload: NotebookAgentExecutionPermissionGetInput,
+    success: NotebookAgentExecutionPermission,
+    error: EnvironmentAuthorizationError,
+  },
+);
+
+export const WsNotebookAgentExecutionPermissionSetRpc = Rpc.make(
+  WS_METHODS.notebookAgentExecutionPermissionSet,
+  {
+    payload: NotebookAgentExecutionPermissionSetInput,
+    success: NotebookAgentExecutionPermission,
+    error: EnvironmentAuthorizationError,
+  },
+);
 
 export const WsSubscribeVcsStatusRpc = Rpc.make(WS_METHODS.subscribeVcsStatus, {
   payload: VcsStatusInput,
@@ -852,6 +875,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsNotebookKernelRestartRpc,
   WsNotebookSessionDisposeRpc,
   WsNotebookSessionEventsRpc,
+  WsNotebookAgentExecutionPermissionGetRpc,
+  WsNotebookAgentExecutionPermissionSetRpc,
   WsSubscribeVcsStatusRpc,
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,

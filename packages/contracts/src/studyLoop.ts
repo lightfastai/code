@@ -2,6 +2,13 @@ import * as Schema from "effect/Schema";
 
 import { IsoDateTime, NonNegativeInt, PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { StudyDocumentId } from "./study.ts";
+import { NotebookExecutionEvent } from "./notebook.ts";
+import {
+  NotebookCellId,
+  NotebookContentHash,
+  NotebookDocumentId,
+  NotebookRevisionId,
+} from "@t3tools/lightfast-artifact-notebook/contracts";
 
 const BoundedName = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
 const BoundedText = Schema.String.check(Schema.isMaxLength(1_000_000));
@@ -53,9 +60,75 @@ export const StudyTraceEventType = Schema.Literals([
   "interruption",
   "environment_observation",
   "checkpoint",
+  "notebook_execution",
   "run_finished",
 ]);
 export type StudyTraceEventType = typeof StudyTraceEventType.Type;
+
+export const StudyNotebookOperation = Schema.Literals(["execute_cell", "execute_all"]);
+export type StudyNotebookOperation = typeof StudyNotebookOperation.Type;
+
+export const StudyNotebookRuntimeEventType = Schema.Literals([
+  "accepted",
+  "rejected",
+  "kernel",
+  "execution",
+  "stream",
+  "display",
+  "result",
+  "error",
+  "limit",
+]);
+export type StudyNotebookRuntimeEventType = typeof StudyNotebookRuntimeEventType.Type;
+
+export const StudyNotebookCommandType = Schema.Literals(["open", "execute", "dispose"]);
+export type StudyNotebookCommandType = typeof StudyNotebookCommandType.Type;
+
+export const StudyNotebookBinding = Schema.Struct({
+  documentId: NotebookDocumentId,
+  revisionId: NotebookRevisionId,
+  contentHash: NotebookContentHash,
+  runtimeImageDigest: Schema.String.check(Schema.isPattern(/^sha256:[0-9a-f]{64}$/)),
+  kernelLockHash: StudyArtifactHash,
+  kernelName: BoundedName,
+});
+export type StudyNotebookBinding = typeof StudyNotebookBinding.Type;
+
+export const StudyNotebookCommand = Schema.Struct({
+  type: StudyNotebookCommandType,
+  commandId: BoundedName,
+  executionId: Schema.optional(BoundedName),
+  cellId: Schema.optional(NotebookCellId),
+  codeHash: Schema.optional(StudyArtifactHash),
+  startedAt: IsoDateTime,
+});
+export type StudyNotebookCommand = typeof StudyNotebookCommand.Type;
+
+export const StudyNotebookExecutionEvent = Schema.Struct({
+  type: Schema.Literal("notebook_execution"),
+  operation: StudyNotebookOperation,
+  outcome: Schema.Literals(["completed", "failed"]),
+  permissionGranted: Schema.Literal(true),
+  binding: StudyNotebookBinding,
+  sessionId: BoundedName,
+  isolation: Schema.Struct({
+    session: Schema.Literal("ephemeral-exclusive"),
+    network: Schema.Literal("disabled"),
+    hostWorkspace: Schema.Literal("not-mounted"),
+  }),
+  commands: Schema.Array(StudyNotebookCommand).check(Schema.isMaxLength(2_002)),
+  runtimeEvents: Schema.Array(NotebookExecutionEvent).check(Schema.isMaxLength(16_384)),
+  outputHash: StudyArtifactHash,
+  startedAt: IsoDateTime,
+  finishedAt: IsoDateTime,
+  durationMs: NonNegativeInt,
+  cleanup: Schema.Struct({
+    attempted: Schema.Boolean,
+    succeeded: Schema.Boolean,
+    commandId: Schema.optional(BoundedName),
+  }),
+});
+export type StudyNotebookExecutionEvent = typeof StudyNotebookExecutionEvent.Type;
 
 export const StudyTraceEvent = Schema.Union([
   Schema.Struct({
@@ -114,6 +187,7 @@ export const StudyTraceEvent = Schema.Union([
     outcome: Schema.Literals(["accepted", "rejected", "corrected", "skipped"]),
     note: Schema.optional(Schema.String.check(Schema.isMaxLength(20_000))),
   }),
+  StudyNotebookExecutionEvent,
   Schema.Struct({
     type: Schema.Literal("run_finished"),
     reason: Schema.Literals(["completed", "cancelled", "disconnected", "error"]),
@@ -166,6 +240,42 @@ export const StudyEvalAssertion = Schema.Union([
     maxMs: PositiveInt,
     weight: AssertionWeight,
   }),
+  Schema.Struct({
+    type: Schema.Literal("notebook_output_order"),
+    operation: StudyNotebookOperation,
+    commandOrder: Schema.Array(StudyNotebookCommandType).check(Schema.isMinLength(1)),
+    runtimeEventOrder: Schema.Array(StudyNotebookRuntimeEventType).check(Schema.isMinLength(1)),
+    outputHash: StudyArtifactHash,
+    weight: AssertionWeight,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("notebook_max_latency"),
+    operation: StudyNotebookOperation,
+    maxMs: PositiveInt,
+    weight: AssertionWeight,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("notebook_permission"),
+    operation: StudyNotebookOperation,
+    required: Schema.Boolean,
+    weight: AssertionWeight,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("notebook_isolation"),
+    operation: StudyNotebookOperation,
+    weight: AssertionWeight,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("notebook_cleanup"),
+    operation: StudyNotebookOperation,
+    weight: AssertionWeight,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("notebook_identity"),
+    operation: StudyNotebookOperation,
+    binding: StudyNotebookBinding,
+    weight: AssertionWeight,
+  }),
 ]);
 export type StudyEvalAssertion = typeof StudyEvalAssertion.Type;
 
@@ -173,6 +283,12 @@ export const StudyEvalAssertionType = Schema.Literals([
   "event_count",
   "event_order",
   "max_latency",
+  "notebook_output_order",
+  "notebook_max_latency",
+  "notebook_permission",
+  "notebook_isolation",
+  "notebook_cleanup",
+  "notebook_identity",
 ]);
 export type StudyEvalAssertionType = typeof StudyEvalAssertionType.Type;
 

@@ -416,12 +416,28 @@ export function createNotebookEnvironmentAtoms<R, E>(
 ) {
   const revisionScheduler = createAtomCommandScheduler();
   const executionScheduler = createAtomCommandScheduler();
+  const permissionScheduler = createAtomCommandScheduler();
   return {
     revision: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:notebook:revision",
       tag: WS_METHODS.notebookRevisionRead,
       staleTimeMs: Number.POSITIVE_INFINITY,
       idleTtlMs: 10 * 60_000,
+    }),
+    agentExecutionPermission: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:notebook:agent-execution-permission",
+      tag: WS_METHODS.notebookAgentExecutionPermissionGet,
+      staleTimeMs: 5_000,
+      idleTtlMs: 10 * 60_000,
+    }),
+    setAgentExecutionPermission: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:notebook:agent-execution-permission-set",
+      tag: WS_METHODS.notebookAgentExecutionPermissionSet,
+      scheduler: permissionScheduler,
+      concurrency: {
+        mode: "serial",
+        key: ({ environmentId, input }) => `${environmentId}:${input.threadId}`,
+      },
     }),
     readRevision: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:notebook:revision-read",

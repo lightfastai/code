@@ -30,6 +30,7 @@ const scope = {
   providerSessionId: "provider-session-1",
   providerInstanceId: ProviderInstanceId.make("codex"),
   capabilities: new Set(["preview"] as const),
+  allowNotebookExecution: false,
   issuedAt: 1,
   expiresAt: Number.MAX_SAFE_INTEGER,
 };

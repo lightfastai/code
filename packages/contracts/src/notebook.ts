@@ -1,6 +1,8 @@
 import {
   NOTEBOOK_DOCUMENT_MAX_BYTES,
   NotebookCellId,
+  NotebookContentHash,
+  NotebookInitialView,
   NotebookMimeBundle,
   NotebookDocument,
   NotebookDocumentId,
@@ -11,7 +13,7 @@ import {
 import * as Schema from "effect/Schema";
 
 import { ScopedProjectRef } from "./environment.ts";
-import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 const NotebookRuntimeIdentifier = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
 export const NotebookSessionId = TrimmedNonEmptyString.check(
@@ -177,6 +179,73 @@ export const NotebookRevisionRef = Schema.Struct({
   revisionId: NotebookRevisionId,
 });
 export type NotebookRevisionRef = typeof NotebookRevisionRef.Type;
+
+export const NotebookAgentExecutionPermission = Schema.Struct({
+  threadId: ThreadId,
+  allowNotebookExecution: Schema.Boolean,
+});
+export type NotebookAgentExecutionPermission = typeof NotebookAgentExecutionPermission.Type;
+
+export const NotebookAgentExecutionPermissionGetInput = Schema.Struct({
+  threadId: ThreadId,
+});
+export type NotebookAgentExecutionPermissionGetInput =
+  typeof NotebookAgentExecutionPermissionGetInput.Type;
+
+export const NotebookAgentExecutionPermissionSetInput = NotebookAgentExecutionPermission;
+export type NotebookAgentExecutionPermissionSetInput =
+  typeof NotebookAgentExecutionPermissionSetInput.Type;
+
+export const PublishNotebookArtifactInput = Schema.Struct({
+  ...NotebookRevisionRef.fields,
+  title: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(255))),
+  initialView: NotebookInitialView,
+});
+export type PublishNotebookArtifactInput = typeof PublishNotebookArtifactInput.Type;
+
+export const PublishNotebookArtifactResult = Schema.Struct({
+  artifactId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  messageId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+});
+export type PublishNotebookArtifactResult = typeof PublishNotebookArtifactResult.Type;
+
+export const NotebookAgentExecuteCellInput = Schema.Struct({
+  ...NotebookRevisionRef.fields,
+  cellId: NotebookCellId,
+});
+export type NotebookAgentExecuteCellInput = typeof NotebookAgentExecuteCellInput.Type;
+
+export const NotebookAgentExecuteAllInput = NotebookRevisionRef;
+export type NotebookAgentExecuteAllInput = typeof NotebookAgentExecuteAllInput.Type;
+
+export const NotebookAgentExecutionResult = Schema.Struct({
+  documentId: NotebookDocumentId,
+  revisionId: NotebookRevisionId,
+  contentHash: NotebookContentHash,
+  traceRunId: TrimmedNonEmptyString.check(
+    Schema.isMaxLength(160),
+    Schema.isPattern(/^[a-z0-9][a-z0-9_-]*$/i),
+  ),
+  outputHash: NotebookContentHash,
+  durationMs: NonNegativeInt,
+});
+export type NotebookAgentExecutionResult = typeof NotebookAgentExecutionResult.Type;
+
+export class NotebookAgentToolError extends Schema.TaggedErrorClass<NotebookAgentToolError>()(
+  "NotebookAgentToolError",
+  {
+    reason: Schema.Literals([
+      "permission-denied",
+      "scope-mismatch",
+      "revision-not-found",
+      "cell-not-found",
+      "runtime-unavailable",
+      "execution-failed",
+      "trace-failed",
+    ]),
+    message: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
+  },
+) {}
 
 export const NotebookRevisionCreateInput = Schema.Struct({
   scope: ScopedProjectRef,

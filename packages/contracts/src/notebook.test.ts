@@ -2,6 +2,12 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
 import {
+  NotebookAgentExecutionPermission,
+  NotebookAgentExecutionPermissionGetInput,
+  NotebookAgentExecutionPermissionSetInput,
+  NotebookAgentExecuteAllInput,
+  NotebookAgentExecuteCellInput,
+  PublishNotebookArtifactInput,
   NotebookCellExecuteInput,
   NotebookExecutionEvent,
   NotebookExecutionReplay,
@@ -10,6 +16,12 @@ import {
 const decodeExecuteInput = Schema.decodeUnknownSync(NotebookCellExecuteInput);
 const decodeExecutionEvent = Schema.decodeUnknownSync(NotebookExecutionEvent);
 const decodeExecutionReplay = Schema.decodeUnknownSync(NotebookExecutionReplay);
+const decodePermission = Schema.decodeUnknownSync(NotebookAgentExecutionPermission);
+const decodePermissionGet = Schema.decodeUnknownSync(NotebookAgentExecutionPermissionGetInput);
+const decodePermissionSet = Schema.decodeUnknownSync(NotebookAgentExecutionPermissionSetInput);
+const decodePublishNotebook = Schema.decodeUnknownSync(PublishNotebookArtifactInput);
+const decodeExecuteCell = Schema.decodeUnknownSync(NotebookAgentExecuteCellInput);
+const decodeExecuteAll = Schema.decodeUnknownSync(NotebookAgentExecuteAllInput);
 
 describe("notebook execution contracts", () => {
   it("requires a cell ID on execute requests and accepted execute events", () => {
@@ -116,5 +128,43 @@ describe("notebook execution contracts", () => {
     expect(replay.baselineSequence).toBe(3);
     expect(replay.events[0]?.sequence).toBe(4);
     expect(() => decodeExecutionReplay({ events: replay.events })).toThrow();
+  });
+});
+
+describe("notebook agent contracts", () => {
+  const revisionRef = {
+    scope: { environmentId: "environment-1", projectId: "project-1" },
+    documentId: "notebook-1",
+    revisionId: "a".repeat(64),
+  };
+
+  it("requires explicit thread-scoped permission updates", () => {
+    expect(decodePermissionGet({ threadId: "thread-1" })).toEqual({ threadId: "thread-1" });
+    expect(decodePermissionSet({ threadId: "thread-1", allowNotebookExecution: true })).toEqual({
+      threadId: "thread-1",
+      allowNotebookExecution: true,
+    });
+    expect(decodePermission({ threadId: "thread-1", allowNotebookExecution: false })).toEqual({
+      threadId: "thread-1",
+      allowNotebookExecution: false,
+    });
+    expect(() => decodePermissionSet({ threadId: "thread-1" })).toThrow();
+  });
+
+  it("binds publication and execution to immutable notebook revisions", () => {
+    expect(
+      decodePublishNotebook({
+        ...revisionRef,
+        title: "Exact notebook",
+        initialView: { mode: "cell", cellId: "cell-1" },
+      }),
+    ).toMatchObject({ documentId: "notebook-1", revisionId: "a".repeat(64) });
+    expect(decodeExecuteCell({ ...revisionRef, cellId: "cell-1" })).toMatchObject({
+      cellId: "cell-1",
+    });
+    expect(decodeExecuteAll(revisionRef)).toMatchObject({ documentId: "notebook-1" });
+    expect(() =>
+      decodeExecuteCell({ ...revisionRef, revisionId: "latest", cellId: "cell-1" }),
+    ).toThrow();
   });
 });

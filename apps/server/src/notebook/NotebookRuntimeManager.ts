@@ -297,6 +297,7 @@ export class NotebookRuntimeManager {
   readonly #disposeTombstones = new Map<string, DisposeTombstone>();
   #disposeTombstoneBytes = 0;
   #closing = false;
+  #runtimeImageDigest: Promise<string> | undefined;
 
   constructor(options: NotebookRuntimeManagerOptions) {
     this.#docker = options.docker ?? new DockerCliCommandRunner();
@@ -380,6 +381,26 @@ export class NotebookRuntimeManager {
       if (!runtime.opened) await this.#removeContainer(runtime).catch(() => undefined);
       throw error;
     }
+  }
+
+  resolveRuntimeImageDigest(): Promise<string> {
+    this.#runtimeImageDigest ??= this.#docker
+      .run(["image", "inspect", "--format", "{{.Id}}", this.#image])
+      .then(({ stdout }) => {
+        const digest = stdout.trim();
+        if (!/^sha256:[0-9a-f]{64}$/.test(digest)) {
+          throw new NotebookRuntimeManagerError({
+            reason: "runtime-unavailable",
+            message: "Notebook runtime image did not resolve to an exact digest.",
+          });
+        }
+        return digest;
+      })
+      .catch((cause) => {
+        this.#runtimeImageDigest = undefined;
+        throw cause;
+      });
+    return this.#runtimeImageDigest;
   }
 
   execute(input: NotebookManagerExecuteInput): AsyncIterable<NotebookExecutionEvent> {

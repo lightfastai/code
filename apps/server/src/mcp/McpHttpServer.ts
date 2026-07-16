@@ -26,6 +26,8 @@ import { ArtifactToolkitHandlersLive } from "./toolkits/artifacts/handlers.ts";
 import { ArtifactToolkit } from "./toolkits/artifacts/tools.ts";
 import { StudyToolkitHandlersLive } from "./toolkits/study/handlers.ts";
 import { StudyToolkit } from "./toolkits/study/tools.ts";
+import { NotebookToolkitHandlersLive } from "./toolkits/notebook/handlers.ts";
+import { NotebookToolkit } from "./toolkits/notebook/tools.ts";
 
 const unauthorized = HttpServerResponse.jsonUnsafe(
   {
@@ -220,6 +222,10 @@ export const StudyToolkitRegistrationLive = McpServer.toolkit(StudyToolkit).pipe
   Layer.provide(StudyToolkitHandlersLive),
 );
 
+export const NotebookToolkitRegistrationLive = McpServer.toolkit(NotebookToolkit).pipe(
+  Layer.provide(NotebookToolkitHandlersLive),
+);
+
 const McpTransportLive = McpServer.layerHttp({
   name: "T3 Code",
   version: packageJson.version,
@@ -230,4 +236,5 @@ export const layer = Layer.mergeAll(
   PreviewToolkitRegistrationLive,
   ArtifactToolkitRegistrationLive,
   StudyToolkitRegistrationLive,
+  NotebookToolkitRegistrationLive,
 ).pipe(Layer.provideMerge(McpTransportLive));

@@ -22,6 +22,7 @@ const invocation = {
   providerSessionId: "provider-session-mcp-test",
   providerInstanceId: ProviderInstanceId.make("codex"),
   capabilities: new Set(["preview"] as const),
+  allowNotebookExecution: false,
   issuedAt: 1,
   expiresAt: Number.MAX_SAFE_INTEGER,
 };
@@ -42,6 +43,7 @@ const ToolkitRegistrationTestLayer = Layer.mergeAll(
   McpHttpServer.PreviewToolkitRegistrationLive,
   McpHttpServer.ArtifactToolkitRegistrationLive,
   McpHttpServer.StudyToolkitRegistrationLive,
+  McpHttpServer.NotebookToolkitRegistrationLive,
 ).pipe(
   Layer.provideMerge(McpServer.McpServer.layer),
   Layer.provideMerge(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
@@ -59,7 +61,7 @@ it("normalizes empty successful notification responses to accepted", () => {
   expect(resultResponse.status).toBe(200);
 });
 
-it.effect("registers the study and semantic artifact tools with safe annotations", () =>
+it.effect("registers study, semantic artifact, and notebook tools with safe annotations", () =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
 
@@ -86,6 +88,25 @@ it.effect("registers the study and semantic artifact tools with safe annotations
       idempotentHint: false,
       openWorldHint: false,
     });
+
+    const publishNotebook = server.tools.find(
+      ({ tool }) => tool.name === "artifact_publish_notebook",
+    );
+    expect(publishNotebook?.tool.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    });
+
+    for (const name of ["notebook_execute_cell", "notebook_execute_all"]) {
+      expect(server.tools.find(({ tool }) => tool.name === name)?.tool.annotations).toMatchObject({
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      });
+    }
   }).pipe(Effect.provide(ToolkitRegistrationTestLayer)),
 );
 

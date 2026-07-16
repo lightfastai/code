@@ -18,6 +18,7 @@ it.effect("reports the scoped credential context when preview capability is unav
     providerSessionId: "provider-session-1",
     providerInstanceId: ProviderInstanceId.make("codex"),
     capabilities: new Set(),
+    allowNotebookExecution: false,
     issuedAt: 1,
     expiresAt: 2,
   };
@@ -47,6 +48,7 @@ it.effect("rejects artifact publication without the scoped capability", () => {
     providerSessionId: "provider-session-1",
     providerInstanceId: ProviderInstanceId.make("codex"),
     capabilities: new Set(["study"]),
+    allowNotebookExecution: false,
     issuedAt: 1,
     expiresAt: 2,
   };
@@ -69,6 +71,7 @@ it.effect("rejects study access without the scoped capability", () => {
     providerSessionId: "provider-session-1",
     providerInstanceId: ProviderInstanceId.make("codex"),
     capabilities: new Set(["artifacts"]),
+    allowNotebookExecution: false,
     issuedAt: 1,
     expiresAt: 2,
   };
@@ -81,5 +84,37 @@ it.effect("rejects study access without the scoped capability", () => {
 
     expect(error).toBeInstanceOf(StudyToolError);
     expect(error.message).toBe("MCP credential does not grant the study capability.");
+  });
+});
+
+it.effect("requires the explicit thread-scoped notebook execution grant", () => {
+  const invocation: McpInvocationContext.McpInvocationScope = {
+    environmentId: EnvironmentId.make("environment-1"),
+    threadId: ThreadId.make("thread-1"),
+    providerSessionId: "provider-session-1",
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    capabilities: new Set(["artifacts"]),
+    allowNotebookExecution: false,
+    issuedAt: 1,
+    expiresAt: 2,
+  };
+
+  return Effect.gen(function* () {
+    const denied = yield* McpInvocationContext.requireNotebookExecution().pipe(
+      Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+      Effect.flip,
+    );
+    expect(denied).toMatchObject({
+      _tag: "NotebookAgentToolError",
+      reason: "permission-denied",
+    });
+
+    const allowed = yield* McpInvocationContext.requireNotebookExecution().pipe(
+      Effect.provideService(McpInvocationContext.McpInvocationContext, {
+        ...invocation,
+        allowNotebookExecution: true,
+      }),
+    );
+    expect(allowed.threadId).toBe(invocation.threadId);
   });
 });

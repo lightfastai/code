@@ -123,6 +123,7 @@ import * as NotebookRevisionStore from "./notebook/NotebookRevisionStore.ts";
 import { makeNotebookRevisionRpcHandlers } from "./notebook/NotebookRevisionRpc.ts";
 import * as NotebookRuntimeManager from "./notebook/NotebookRuntimeManager.ts";
 import { makeNotebookRuntimeRpcHandlers } from "./notebook/NotebookRuntimeRpc.ts";
+import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 const isStudyVoiceSessionError = Schema.is(StudyVoiceSessionError);
 
@@ -327,6 +328,8 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.notebookKernelRestart, AuthOrchestrationOperateScope],
   [WS_METHODS.notebookSessionDispose, AuthOrchestrationOperateScope],
   [WS_METHODS.notebookSessionEvents, AuthOrchestrationReadScope],
+  [WS_METHODS.notebookAgentExecutionPermissionGet, AuthOrchestrationReadScope],
+  [WS_METHODS.notebookAgentExecutionPermissionSet, AuthOrchestrationOperateScope],
   [WS_METHODS.subscribeVcsStatus, AuthOrchestrationReadScope],
   [WS_METHODS.vcsRefreshStatus, AuthOrchestrationReadScope],
   [WS_METHODS.vcsPull, AuthOrchestrationOperateScope],
@@ -1616,6 +1619,18 @@ const makeWsRpcLayer = (
           ),
         ...notebookRevisionRpcHandlers,
         ...notebookRuntimeRpcHandlers,
+        [WS_METHODS.notebookAgentExecutionPermissionGet]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.notebookAgentExecutionPermissionGet,
+            McpSessionRegistry.getActiveNotebookExecutionPermission(input.threadId),
+            { "rpc.aggregate": "notebook" },
+          ),
+        [WS_METHODS.notebookAgentExecutionPermissionSet]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.notebookAgentExecutionPermissionSet,
+            McpSessionRegistry.setActiveNotebookExecutionPermission(input),
+            { "rpc.aggregate": "notebook" },
+          ),
         [WS_METHODS.subscribeVcsStatus]: (input) =>
           observeRpcStream(
             WS_METHODS.subscribeVcsStatus,

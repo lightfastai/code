@@ -88,3 +88,39 @@ it.effect("expires credentials after inactivity", () =>
     expect(yield* registry.resolve(token)).toBeUndefined();
   }),
 );
+
+it.effect("defaults notebook execution to denied and updates every credential for one thread", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const threadId = ThreadId.make("thread-notebook-grant");
+    const otherThreadId = ThreadId.make("thread-notebook-other");
+    const issued = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const other = yield* registry.issue({
+      threadId: otherThreadId,
+      providerInstanceId: ProviderInstanceId.make("claude"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    const otherToken = other.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    expect((yield* registry.resolve(token))?.allowNotebookExecution).toBe(false);
+    expect(yield* registry.getNotebookExecutionPermission(threadId)).toEqual({
+      threadId,
+      allowNotebookExecution: false,
+    });
+
+    yield* registry.setNotebookExecutionPermission({
+      threadId,
+      allowNotebookExecution: true,
+    });
+
+    expect((yield* registry.resolve(token))?.allowNotebookExecution).toBe(true);
+    expect((yield* registry.resolve(otherToken))?.allowNotebookExecution).toBe(false);
+    expect(yield* registry.getNotebookExecutionPermission(threadId)).toEqual({
+      threadId,
+      allowNotebookExecution: true,
+    });
+  }),
+);

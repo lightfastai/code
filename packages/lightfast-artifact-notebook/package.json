@@ -11,6 +11,10 @@
       "types": "./src/nbformat.ts",
       "import": "./src/nbformat.ts"
     },
+    "./server": {
+      "types": "./src/server.ts",
+      "import": "./src/server.ts"
+    },
     "./web": {
       "types": "./src/web.tsx",
       "import": "./src/web.tsx"

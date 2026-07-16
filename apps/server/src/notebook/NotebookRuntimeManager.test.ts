@@ -70,6 +70,9 @@ class FakeDocker implements DockerCommandRunner {
       this.runCount += 1;
       return { stdout: `container-id-${this.runCount}\n` };
     }
+    if (args[0] === "image") {
+      return { stdout: `sha256:${"a".repeat(64)}\n` };
+    }
     return {
       stdout: args[0] === "exec" ? "fake-bootstrap-token-with-sufficient-entropy\n" : "",
     };
@@ -565,6 +568,21 @@ it("uses one hardened container per session and deduplicates concurrent session 
     .filter((call) => call.args[0] === "exec")
     .map((call) => call.args[3]);
   expect(bootstrapContainerIds).toEqual(["container-id-1", "container-id-2"]);
+  await manager.close();
+});
+
+it("resolves and caches the exact immutable runtime image digest", async () => {
+  const { docker, manager } = await makeHarness();
+  const expected = `sha256:${"a".repeat(64)}`;
+
+  expect(await manager.resolveRuntimeImageDigest()).toBe(expected);
+  expect(await manager.resolveRuntimeImageDigest()).toBe(expected);
+  expect(docker.calls.filter((call) => call.args[0] === "image")).toEqual([
+    {
+      args: ["image", "inspect", "--format", "{{.Id}}", "lightfast/notebook-runtime:test"],
+    },
+  ]);
+
   await manager.close();
 });
 
