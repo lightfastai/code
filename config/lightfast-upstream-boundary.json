@@ -1,0 +1,39 @@
+{
+  "lightfastOwnedPrefixes": [
+    "packages/lightfast-",
+    "apps/server/src/lightfast/",
+    "apps/web/src/lightfast/",
+    "apps/mobile/src/lightfast/",
+    "apps/voice-agent/",
+    "apps/notebook-runtime/",
+    "config/lightfast-",
+    "scripts/lightfast-",
+    ".github/workflows/lightfast-",
+    "docs/lightfast/",
+    "docs/superpowers/specs/2026-07-16-lightfast-"
+  ],
+  "bridgePaths": [
+    "apps/server/src/lightfast/register.ts",
+    "apps/web/src/lightfast/register.tsx",
+    "apps/mobile/src/lightfast/register.ts"
+  ],
+  "sharedSurfacePaths": [
+    ".npmrc",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "tsconfig.base.json"
+  ],
+  "sharedSurfacePrefixes": [
+    ".github/workflows/release",
+    "apps/desktop/resources/",
+    "apps/marketing/public/",
+    "apps/web/public/",
+    "apps/web/src/assets/",
+    "scripts/release-",
+    "scripts/resolve-nightly-release",
+    "scripts/resolve-previous-release-tag",
+    "scripts/update-release-package-versions"
+  ],
+  "sharedSurfaceSuffixes": ["/package.json"]
+}

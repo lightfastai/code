@@ -1,0 +1,297 @@
+name: Lightfast Upstream Sync
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: lightfast-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream into an integration pull request
+    if: github.repository == 'lightfastai/code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Lightfast main with full history
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch origin and upstream main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "lightfast-upstream-bot"
+          git config user.email "lightfast-upstream-bot@users.noreply.github.com"
+          git fetch --prune origin "+refs/heads/main:refs/remotes/origin/main"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/pingdotgg/t3code.git
+          else
+            git remote add upstream https://github.com/pingdotgg/t3code.git
+          fi
+          git fetch --prune upstream "+refs/heads/main:refs/remotes/upstream/main"
+
+      - id: preflight
+        name: Check whether upstream has new commits
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            echo "Lightfast main already contains upstream main."
+          else
+            echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: branch
+        name: Prepare the integration branch
+        if: steps.preflight.outputs.needs_sync == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          existing_pr="$(
+            gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --state open \
+              --json number,headRefName \
+              --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))][0] // empty'
+          )"
+
+          if [[ -n "$existing_pr" ]]; then
+            branch="$(jq -r '.headRefName' <<< "$existing_pr")"
+            pr_number="$(jq -r '.number' <<< "$existing_pr")"
+          else
+            branch="sync/upstream-$(date -u +%Y%m%d)"
+            pr_number=""
+          fi
+
+          git switch --force-create "$branch" origin/main
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+          git log --no-merges --format='- `%h` %s' origin/main..upstream/main \
+            > "$RUNNER_TEMP/upstream-commits.md"
+          git diff --name-only origin/main...upstream/main > "$RUNNER_TEMP/upstream-paths.txt"
+
+          if grep -Eq '^apps/mobile/(app\.config\.ts|ios/|android/|modules/)' \
+            "$RUNNER_TEMP/upstream-paths.txt"; then
+            echo "mobile_native_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mobile_native_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: merge
+        name: Merge upstream main
+        if: steps.preflight.outputs.needs_sync == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          set +e
+          git merge --no-ff --no-edit upstream/main
+          merge_exit=$?
+          set -e
+
+          if [[ "$merge_exit" -eq 0 ]]; then
+            echo "outcome=merged" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          conflicts="$(git diff --name-only --diff-filter=U)"
+          if [[ -z "$conflicts" ]]; then
+            echo "The upstream merge failed without producing semantic conflicts." >&2
+            exit "$merge_exit"
+          fi
+
+          sync_date="$(date -u +%Y%m%d)"
+          upstream_sha="$(git rev-parse upstream/main)"
+          brief="docs/lightfast/upstream-conflicts/$sync_date.md"
+          git merge --abort
+          mkdir -p "$(dirname "$brief")"
+
+          {
+            echo "# Upstream conflict brief — $sync_date"
+            echo
+            echo "The automated merge of \`pingdotgg/t3code:main\` at \`$upstream_sha\` into Lightfast \`main\` produced semantic conflicts. The merge was aborted; this brief records the files requiring a reviewed resolution."
+            echo
+            echo "## Conflicting paths"
+            echo
+            while IFS= read -r path; do
+              [[ -n "$path" ]] && printf -- '- `%s`\n' "$path"
+            done <<< "$conflicts"
+            echo
+            echo "## Incoming upstream commits"
+            echo
+            cat "$RUNNER_TEMP/upstream-commits.md"
+          } > "$brief"
+
+          git add -- "$brief"
+          git commit -m "docs: record upstream merge conflicts for $sync_date"
+          echo "outcome=conflict" >> "$GITHUB_OUTPUT"
+          echo "conflict_brief=$brief" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Vite+
+        if: steps.merge.outputs.outcome == 'merged'
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Audit Lightfast divergence
+        if: steps.merge.outputs.outcome == 'merged'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/lightfast-upstream-audit.ts --base upstream/main --head HEAD \
+            | tee "$RUNNER_TEMP/upstream-audit.json"
+
+      - name: Check formatting and lint
+        if: steps.merge.outputs.outcome == 'merged'
+        run: vp check
+
+      - name: Typecheck
+        if: steps.merge.outputs.outcome == 'merged'
+        run: vp run typecheck
+
+      - name: Run unit tests
+        if: steps.merge.outputs.outcome == 'merged'
+        run: vp run test
+
+      - name: Check mobile native code
+        if: >-
+          steps.merge.outputs.outcome == 'merged' &&
+          steps.branch.outputs.mobile_native_changed == 'true'
+        run: vp run lint:mobile
+
+      - id: pr
+        name: Build the pull request summary
+        if: >-
+          always() &&
+          steps.preflight.outputs.needs_sync == 'true' &&
+          (steps.merge.outputs.outcome == 'conflict' || success())
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          body="$RUNNER_TEMP/upstream-pr.md"
+          sync_date="$(date -u +%Y-%m-%d)"
+          upstream_sha="$(git rev-parse upstream/main)"
+          {
+            echo "## Upstream integration"
+            echo
+            echo "- Upstream: \`pingdotgg/t3code@${upstream_sha}\`"
+            echo "- Prepared: \`$sync_date\` (UTC)"
+            echo
+
+            if [[ "${{ steps.merge.outputs.outcome }}" == "conflict" ]]; then
+              echo "### Status"
+              echo
+              echo "The automated merge found semantic conflicts and was aborted. Resolve the paths documented in \`${{ steps.merge.outputs.conflict_brief }}\`, then recreate the merge commit on this branch."
+              echo
+              echo "### Validation"
+              echo
+              echo "- Not run: the upstream merge did not complete."
+            else
+              echo "### Changed Lightfast bridges"
+              echo
+              jq -r 'if (.bridges | length) == 0 then "- None" else .bridges[] | "- `" + . + "`" end' \
+                "$RUNNER_TEMP/upstream-audit.json"
+              echo
+              echo "### Validation"
+              echo
+              echo "- Lightfast boundary audit"
+              echo "- \`vp check\`"
+              echo "- \`vp run typecheck\`"
+              echo "- \`vp run test\`"
+              if [[ "${{ steps.branch.outputs.mobile_native_changed }}" == "true" ]]; then
+                echo "- \`vp run lint:mobile\`"
+              fi
+            fi
+
+            echo
+            echo "### Incoming upstream commits"
+            echo
+            cat "$RUNNER_TEMP/upstream-commits.md"
+          } > "$body"
+
+          echo "body=$body" >> "$GITHUB_OUTPUT"
+          if [[ "${{ steps.merge.outputs.outcome }}" == "conflict" ]]; then
+            echo "draft=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "draft=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push only the integration branch
+        if: steps.pr.outcome == 'success'
+        shell: bash
+        env:
+          BRANCH: ${{ steps.branch.outputs.name }}
+        run: |
+          set -euo pipefail
+
+          remote_sha="$(
+            git ls-remote --heads origin "refs/heads/$BRANCH" | awk '{print $1}'
+          )"
+          if [[ -n "$remote_sha" ]]; then
+            git push \
+              --force-with-lease="refs/heads/$BRANCH:$remote_sha" \
+              origin "HEAD:refs/heads/$BRANCH"
+          else
+            git push origin "HEAD:refs/heads/$BRANCH"
+          fi
+
+      - name: Open or update the integration pull request
+        if: steps.pr.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          PR_NUMBER: ${{ steps.branch.outputs.pr_number }}
+          PR_BODY: ${{ steps.pr.outputs.body }}
+          DRAFT: ${{ steps.pr.outputs.draft }}
+        run: |
+          set -euo pipefail
+
+          title="chore: sync pingdotgg/t3code upstream"
+          if [[ -n "$PR_NUMBER" ]]; then
+            gh pr edit "$PR_NUMBER" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --body-file "$PR_BODY"
+
+            if [[ "$DRAFT" == "true" ]]; then
+              gh pr ready "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --undo || true
+            else
+              gh pr ready "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" || true
+            fi
+            exit 0
+          fi
+
+          draft_args=()
+          if [[ "$DRAFT" == "true" ]]; then
+            draft_args+=(--draft)
+          fi
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$BRANCH" \
+            --title "$title" \
+            --body-file "$PR_BODY" \
+            "${draft_args[@]}"
