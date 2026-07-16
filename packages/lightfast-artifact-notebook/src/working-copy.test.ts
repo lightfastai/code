@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import type { NotebookRevision } from "./contracts.ts";
 import {
   addNotebookCell,
+  applyNotebookRuntimeToWorkingCopy,
   applySavedNotebookRevision,
   createNotebookWorkingCopy,
   duplicateNotebookCell,
@@ -97,5 +98,50 @@ describe("notebook working copy", () => {
     const latestView = openLatestNotebookRevision(referencedView);
     expect(latestView.documentId).toBe(savedRevision.documentId);
     expect(latestView.document.cells[1]?.source).toBe("print('saved')");
+  });
+
+  it("projects runtime state across 1,000 cells with one cell-array pass", () => {
+    const original = revision();
+    const cells = Array.from({ length: 1_000 }, (_, index) => ({
+      cell_type: "code" as const,
+      id: `code-${index}`,
+      metadata: {},
+      source: `print(${index})`,
+      execution_count: null,
+      outputs: [],
+    }));
+    let indexedCellReads = 0;
+    const instrumentedCells = new Proxy(cells, {
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^\d+$/.test(property)) indexedCellReads += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const clonedWorking = createNotebookWorkingCopy({
+      ...original,
+      document: { ...original.document, cells },
+    });
+    const working = {
+      ...clonedWorking,
+      document: { ...clonedWorking.document, cells: instrumentedCells },
+    };
+    indexedCellReads = 0;
+    const executionCountByCell = new Map(cells.map((cell, index) => [cell.id, index + 1] as const));
+    const outputsByCell = new Map([
+      ["code-999", [{ output_type: "stream" as const, name: "stdout" as const, text: "done\n" }]],
+    ]);
+
+    const projected = applyNotebookRuntimeToWorkingCopy(working, {
+      outputsByCell,
+      executionCountByCell,
+    });
+
+    expect(indexedCellReads).toBe(1_000);
+    expect(projected.document.cells[0]).toMatchObject({ execution_count: 1 });
+    expect(projected.document.cells[999]).toMatchObject({
+      execution_count: 1_000,
+      outputs: [{ output_type: "stream", text: "done\n" }],
+    });
+    expect(original.document.cells).toHaveLength(2);
   });
 });

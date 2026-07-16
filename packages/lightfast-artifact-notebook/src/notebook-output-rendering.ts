@@ -8,6 +8,9 @@ export const NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_SESSION = 256;
 export const NOTEBOOK_OUTPUT_RENDER_MAX_BYTES_PER_SESSION = 2 * 1024 * 1024;
 export const NOTEBOOK_OUTPUT_RENDER_MAX_CHARACTERS = 100_000;
 export const NOTEBOOK_OUTPUT_RENDER_MAX_LINES = 2_000;
+export const NOTEBOOK_TABLE_RENDER_MAX_COLUMNS = 50;
+export const NOTEBOOK_TABLE_RENDER_MAX_ROWS = 200;
+export const NOTEBOOK_TABLE_RENDER_MAX_CELLS = 2_000;
 
 export type NotebookOutputRetentionNotice = {
   readonly omittedEntries: number;

@@ -8,6 +8,7 @@ import {
 } from "./contracts.ts";
 import {
   addNotebookCell,
+  applyNotebookRuntimeToWorkingCopy,
   applySavedNotebookRevision,
   duplicateNotebookCell,
   isNotebookWorkingCopyDirty,
@@ -15,7 +16,6 @@ import {
   openLatestNotebookRevision,
   removeNotebookCell,
   updateNotebookCellSource,
-  updateNotebookCodeCellExecution,
   viewReferencedNotebookRevision,
   type NotebookWorkingCopy,
 } from "./working-copy.ts";
@@ -71,26 +71,6 @@ const isNotebookPayload = (value: unknown): value is NotebookArtifactPayload => 
   );
 };
 
-function applyRuntimeToWorkingCopy(
-  working: NotebookWorkingCopy,
-  runtime: NotebookRuntimeView,
-): NotebookWorkingCopy {
-  let next = working;
-  for (const cell of working.document.cells) {
-    if (cell.cell_type !== "code") continue;
-    const outputs = runtime.outputsByCell.get(cell.id);
-    const executionCount = runtime.executionCountByCell.get(cell.id);
-    if (outputs === undefined && executionCount === undefined) continue;
-    next = updateNotebookCodeCellExecution(
-      next,
-      cell.id,
-      executionCount === undefined ? cell.execution_count : executionCount,
-      outputs === undefined ? cell.outputs : outputs,
-    );
-  }
-  return next;
-}
-
 export function NotebookArtifactEnvelopeRenderer({
   artifact,
 }: {
@@ -115,7 +95,7 @@ export function NotebookArtifactEnvelopeRenderer({
     if (!mounted.current) return;
     setRuntime(next);
     setWorking((current) =>
-      current === null ? current : applyRuntimeToWorkingCopy(current, next),
+      current === null ? current : applyNotebookRuntimeToWorkingCopy(current, next),
     );
   }, []);
 

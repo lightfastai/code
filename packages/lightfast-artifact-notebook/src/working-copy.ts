@@ -15,6 +15,11 @@ export interface NotebookWorkingCopy {
 
 export type NotebookCellIdFactory = () => string;
 
+export type NotebookRuntimeExecutionProjection = {
+  readonly outputsByCell: ReadonlyMap<string, ReadonlyArray<NotebookOutput>>;
+  readonly executionCountByCell: ReadonlyMap<string, number | null>;
+};
+
 const cloneDocument = (document: NotebookDocument): NotebookDocument => structuredClone(document);
 
 const replaceCells = (
@@ -69,14 +74,31 @@ export function updateNotebookCodeCellExecution(
   executionCount: number | null,
   outputs: ReadonlyArray<NotebookOutput>,
 ): NotebookWorkingCopy {
-  return replaceCells(
-    state,
-    state.document.cells.map((cell) =>
-      cell.id === cellId && cell.cell_type === "code"
-        ? { ...cell, execution_count: executionCount, outputs }
-        : cell,
-    ),
-  );
+  return applyNotebookRuntimeToWorkingCopy(state, {
+    outputsByCell: new Map([[cellId, outputs]]),
+    executionCountByCell: new Map([[cellId, executionCount]]),
+  });
+}
+
+export function applyNotebookRuntimeToWorkingCopy(
+  state: NotebookWorkingCopy,
+  runtime: NotebookRuntimeExecutionProjection,
+): NotebookWorkingCopy {
+  let changed = false;
+  const cells = state.document.cells.map((cell) => {
+    if (cell.cell_type !== "code") return cell;
+    const outputs = runtime.outputsByCell.get(cell.id);
+    const hasExecutionCount = runtime.executionCountByCell.has(cell.id);
+    if (outputs === undefined && !hasExecutionCount) return cell;
+    const executionCount = hasExecutionCount
+      ? (runtime.executionCountByCell.get(cell.id) ?? null)
+      : cell.execution_count;
+    const nextOutputs = outputs ?? cell.outputs;
+    if (executionCount === cell.execution_count && nextOutputs === cell.outputs) return cell;
+    changed = true;
+    return { ...cell, execution_count: executionCount, outputs: nextOutputs };
+  });
+  return changed ? replaceCells(state, cells) : state;
 }
 
 export function addNotebookCell(

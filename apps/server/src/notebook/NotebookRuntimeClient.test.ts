@@ -41,11 +41,11 @@ it("authenticates every request and parses split NDJSON in order", async () => {
         executeBodies.push(JSON.parse(Buffer.concat(chunks).toString()));
         response.writeHead(200, { "content-type": "application/x-ndjson" });
         response.write(
-          '{"type":"accepted","sessionId":"session-1","commandId":"command-1","executionId":"execution-1","cellId":"cell-1","sequence":4,"commandType":"execute"}\n{"type":"stream",',
+          '{"type":"accepted","sessionId":"session-1","commandId":"command-1","executionId":"execution-1","cellId":"cell-1","sequence":4,"commandType":"execute"}\n{"type":"execution","sessionId":"session-1","commandId":"command-1","executionId":"execution-1","cellId":"cell-1","sequence":5,"executionCount":7}\n{"type":"stream",',
         );
         setImmediate(() => {
           response.end(
-            '"sessionId":"session-1","commandId":"command-1","executionId":"execution-1","cellId":"cell-1","sequence":5,"name":"stdout","text":"hello\\n"}\n',
+            '"sessionId":"session-1","commandId":"command-1","executionId":"execution-1","cellId":"cell-1","sequence":6,"name":"stdout","text":"hello\\n"}\n',
           );
         });
       });
@@ -70,9 +70,11 @@ it("authenticates every request and parses split NDJSON in order", async () => {
   expect(authorizations).toEqual(["Bearer runtime-secret", "Bearer runtime-secret"]);
   expect(events.map((event) => [event.sequence, event.type])).toEqual([
     [4, "accepted"],
-    [5, "stream"],
+    [5, "execution"],
+    [6, "stream"],
   ]);
-  expect(events[1]).toMatchObject({ type: "stream", name: "stdout", text: "hello\n" });
+  expect(events[1]).toMatchObject({ type: "execution", executionCount: 7 });
+  expect(events[2]).toMatchObject({ type: "stream", name: "stdout", text: "hello\n" });
   expect(events[0]).toMatchObject({ type: "accepted", cellId: "cell-1" });
   expect(executeBodies).toEqual([
     expect.objectContaining({ executionId: "execution-1", cellId: "cell-1" }),

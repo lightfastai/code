@@ -11,6 +11,7 @@ import {
   beginNotebookCellExecution,
   clearNotebookRuntimeError,
   createNotebookRuntimeState,
+  failNotebookCellExecution,
   failNotebookRuntime,
 } from "./notebook.ts";
 
@@ -252,6 +253,119 @@ describe("notebook runtime client state", () => {
     expect(state.executionCountByCell.get("code-trimmed")).toBe(9);
   });
 
+  it("reconstructs active execution state from a mid-execution replay suffix", () => {
+    let state = applyNotebookExecutionReplay(createNotebookRuntimeState(), {
+      baselineSequence: 5,
+      events: [
+        event(6, {
+          type: "stream",
+          executionId: "execution-suffix",
+          cellId: "code-suffix",
+          name: "stdout",
+          text: "still running\n",
+        }),
+      ],
+    });
+
+    expect(state.kernelStatus).toBe("busy");
+    expect(state.runningCellIds.has("code-suffix")).toBe(true);
+
+    state = applyNotebookExecutionEvents(state, [
+      event(7, {
+        type: "kernel",
+        executionId: "execution-suffix",
+        cellId: "code-suffix",
+        state: "idle",
+      }),
+    ]);
+
+    expect(state.kernelStatus).toBe("idle");
+    expect(state.runningCellIds.has("code-suffix")).toBe(false);
+  });
+
+  it("treats every scoped nonterminal suffix as active and terminal errors as finished", () => {
+    const nonterminalEvents: ReadonlyArray<EventInput> = [
+      {
+        type: "kernel",
+        executionId: "execution-active",
+        cellId: "code-active",
+        state: "busy",
+      },
+      {
+        type: "display",
+        executionId: "execution-active",
+        cellId: "code-active",
+        data: { "text/plain": "display" },
+        metadata: {},
+      },
+      {
+        type: "result",
+        executionId: "execution-active",
+        cellId: "code-active",
+        executionCount: 4,
+        data: { "text/plain": "result" },
+        metadata: {},
+      },
+      {
+        type: "limit",
+        executionId: "execution-active",
+        cellId: "code-active",
+        kind: "output",
+        limit: 1024,
+        message: "truncated",
+      },
+    ];
+
+    for (const nonterminalEvent of nonterminalEvents) {
+      const state = applyNotebookExecutionReplay(createNotebookRuntimeState(), {
+        baselineSequence: 9,
+        events: [event(10, nonterminalEvent)],
+      });
+      expect(state.kernelStatus).toBe("busy");
+      expect(state.runningCellIds.has("code-active")).toBe(true);
+    }
+
+    const errored = applyNotebookExecutionReplay(createNotebookRuntimeState(), {
+      baselineSequence: 9,
+      events: [
+        event(10, {
+          type: "error",
+          executionId: "execution-active",
+          cellId: "code-active",
+          ename: "ValueError",
+          evalue: "bad",
+          traceback: ["ValueError: bad"],
+        }),
+      ],
+    });
+    expect(errored.kernelStatus).toBe("idle");
+    expect(errored.runningCellIds.has("code-active")).toBe(false);
+  });
+
+  it("records execute_input counts before any result output", () => {
+    const state = applyNotebookExecutionReplay(createNotebookRuntimeState(), {
+      baselineSequence: 20,
+      events: [
+        event(21, {
+          type: "execution",
+          executionId: "execution-counted",
+          cellId: "code-counted",
+          executionCount: 12,
+        }),
+        event(22, {
+          type: "stream",
+          executionId: "execution-counted",
+          cellId: "code-counted",
+          name: "stdout",
+          text: "printed\n",
+        }),
+      ],
+    });
+
+    expect(state.executionCountByCell.get("code-counted")).toBe(12);
+    expect(state.runningCellIds.has("code-counted")).toBe(true);
+  });
+
   it("bounds output entries and bytes per cell and per session with stable retained keys", () => {
     let state = createNotebookRuntimeState();
     let sequence = 0;
@@ -380,5 +494,31 @@ describe("notebook runtime client state", () => {
     const failed = failNotebookRuntime(createNotebookRuntimeState(), "Runtime unavailable");
     expect(failed.error).toBe("Runtime unavailable");
     expect(clearNotebookRuntimeError(failed).error).toBeNull();
+  });
+
+  it("rolls back only the optimistic execution whose RPC failed before any event", () => {
+    const optimistic = beginNotebookCellExecution(
+      createNotebookRuntimeState(),
+      "code-rpc",
+      "execution-rpc",
+    );
+    const failed = failNotebookCellExecution(
+      optimistic,
+      "code-rpc",
+      "execution-rpc",
+      "RPC rejected before streaming.",
+    );
+
+    expect(failed.runningCellIds.has("code-rpc")).toBe(false);
+    expect(failed.error).toBe("RPC rejected before streaming.");
+
+    const superseded = beginNotebookCellExecution(optimistic, "code-rpc", "execution-newer");
+    const staleFailure = failNotebookCellExecution(
+      superseded,
+      "code-rpc",
+      "execution-rpc",
+      "Late failure.",
+    );
+    expect(staleFailure.runningCellIds.has("code-rpc")).toBe(true);
   });
 });

@@ -8,6 +8,9 @@ import { sandboxedNotebookHtmlDocument, sanitizeNotebookSvg } from "./notebook-s
 import {
   NOTEBOOK_OUTPUT_RENDER_MAX_CHARACTERS,
   NOTEBOOK_OUTPUT_RENDER_MAX_LINES,
+  NOTEBOOK_TABLE_RENDER_MAX_CELLS,
+  NOTEBOOK_TABLE_RENDER_MAX_COLUMNS,
+  NOTEBOOK_TABLE_RENDER_MAX_ROWS,
   boundedNotebookText,
 } from "./notebook-output-rendering.ts";
 
@@ -96,28 +99,54 @@ export function NotebookMarkdown({ children }: { readonly children: string }) {
   );
 }
 
-type DataResource = {
-  readonly schema?: { readonly fields?: ReadonlyArray<{ readonly name?: unknown }> };
-  readonly data?: ReadonlyArray<Readonly<Record<string, unknown>>>;
-};
+type DataResourceRow = Readonly<Record<string, unknown>>;
+
+const isRecord = (value: unknown): value is DataResourceRow =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
 
 const asDataResource = (
   value: unknown,
 ): {
   readonly columns: readonly string[];
-  readonly rows: ReadonlyArray<Readonly<Record<string, unknown>>>;
+  readonly rows: ReadonlyArray<DataResourceRow>;
+  readonly truncated: boolean;
 } | null => {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const resource = value as DataResource;
-  if (!Array.isArray(resource.data)) return null;
-  const declared = resource.schema?.fields
-    ?.map((field) => field.name)
-    .filter((name): name is string => typeof name === "string" && name.length > 0);
-  const columns =
-    declared && declared.length > 0
-      ? declared
-      : [...new Set(resource.data.flatMap((row) => Object.keys(row)))];
-  return { columns: columns.slice(0, 100), rows: resource.data.slice(0, 1_000) };
+  if (!isRecord(value) || !Array.isArray(value.data) || !value.data.every(isRecord)) return null;
+
+  let allColumns: string[];
+  if (value.schema !== undefined) {
+    if (!isRecord(value.schema) || !Array.isArray(value.schema.fields)) return null;
+    const declaredColumns: string[] = [];
+    const seenColumns = new Set<string>();
+    for (const field of value.schema.fields) {
+      if (!isRecord(field) || typeof field.name !== "string" || field.name.length === 0)
+        return null;
+      if (!seenColumns.has(field.name)) {
+        seenColumns.add(field.name);
+        declaredColumns.push(field.name);
+      }
+    }
+    allColumns = declaredColumns;
+  } else {
+    const discovered = new Set<string>();
+    for (const row of value.data) {
+      for (const key of Object.keys(row)) discovered.add(key);
+    }
+    allColumns = [...discovered];
+  }
+
+  const columns = allColumns.slice(0, NOTEBOOK_TABLE_RENDER_MAX_COLUMNS);
+  const productRowLimit =
+    columns.length === 0
+      ? NOTEBOOK_TABLE_RENDER_MAX_ROWS
+      : Math.floor(NOTEBOOK_TABLE_RENDER_MAX_CELLS / columns.length);
+  const rowLimit = Math.min(NOTEBOOK_TABLE_RENDER_MAX_ROWS, productRowLimit);
+  const rows = value.data.slice(0, rowLimit);
+  return {
+    columns,
+    rows,
+    truncated: allColumns.length > columns.length || value.data.length > rows.length,
+  };
 };
 
 const cellValue = (value: unknown): string =>
@@ -129,37 +158,55 @@ const cellValue = (value: unknown): string =>
 
 function NotebookTable({ value }: { readonly value: unknown }) {
   const table = asDataResource(value);
-  if (table === null) return null;
+  if (table === null) {
+    return (
+      <div
+        className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground"
+        role="alert"
+      >
+        <p>Invalid notebook table data</p>
+        <p>Data is preserved for export and was not rendered.</p>
+      </div>
+    );
+  }
   const rowKeys = stableValueKeys(table.rows);
   return (
-    <div
-      className="max-h-80 overflow-auto"
-      role="region"
-      aria-label="Notebook table output"
-      tabIndex={0}
-    >
-      <table className="w-full border-collapse text-left text-xs">
-        <thead className="sticky top-0 bg-card">
-          <tr>
-            {table.columns.map((column) => (
-              <th className="border border-border px-2 py-1 font-medium" key={column}>
-                {column}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {table.rows.map((row, rowIndex) => (
-            <tr key={rowKeys[rowIndex]}>
+    <div>
+      {table.truncated ? (
+        <p className="mb-1 text-xs text-muted-foreground" role="status">
+          Table output truncated to {table.rows.length} rows × {table.columns.length} columns.
+          Export the notebook for complete data.
+        </p>
+      ) : null}
+      <div
+        className="max-h-80 overflow-auto"
+        role="region"
+        aria-label="Notebook table output"
+        tabIndex={0}
+      >
+        <table className="w-full border-collapse text-left text-xs">
+          <thead className="sticky top-0 bg-card">
+            <tr>
               {table.columns.map((column) => (
-                <td className="border border-border px-2 py-1" key={column}>
-                  {cellValue(row[column])}
-                </td>
+                <th className="border border-border px-2 py-1 font-medium" key={column}>
+                  {column}
+                </th>
               ))}
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {table.rows.map((row, rowIndex) => (
+              <tr key={rowKeys[rowIndex]}>
+                {table.columns.map((column) => (
+                  <td className="border border-border px-2 py-1" key={column}>
+                    {cellValue(row[column])}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -167,8 +214,7 @@ function NotebookTable({ value }: { readonly value: unknown }) {
 function MimeOutput({ data }: { readonly data: NotebookMimeBundle }) {
   const tableValue = data["application/vnd.dataresource+json"];
   if (tableValue !== undefined) {
-    const table = <NotebookTable value={tableValue} />;
-    if (table !== null) return table;
+    return <NotebookTable value={tableValue} />;
   }
   const html = data["text/html"];
   if (typeof html === "string") {

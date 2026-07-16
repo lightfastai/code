@@ -18,6 +18,9 @@ export {
   NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_CELL,
   NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_SESSION,
   NOTEBOOK_OUTPUT_RENDER_MAX_LINES,
+  NOTEBOOK_TABLE_RENDER_MAX_CELLS,
+  NOTEBOOK_TABLE_RENDER_MAX_COLUMNS,
+  NOTEBOOK_TABLE_RENDER_MAX_ROWS,
   boundedNotebookText,
   planNotebookOutputRendering,
   type NotebookOutputRenderInput,
@@ -25,6 +28,7 @@ export {
   type NotebookOutputRetentionNotice,
 } from "./notebook-output-rendering.ts";
 export { sanitizeNotebookSvg } from "./notebook-sanitize.ts";
+export { isNotebookRevisionSwitchDisabled } from "./runtime-lifecycle.ts";
 
 export type NotebookProjectScope = {
   readonly environmentId: string;

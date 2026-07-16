@@ -16,6 +16,9 @@ import {
   NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_CELL,
   NOTEBOOK_OUTPUT_RENDER_MAX_ENTRIES_PER_SESSION,
   NOTEBOOK_OUTPUT_RENDER_MAX_LINES,
+  NOTEBOOK_TABLE_RENDER_MAX_CELLS,
+  NOTEBOOK_TABLE_RENDER_MAX_COLUMNS,
+  NOTEBOOK_TABLE_RENDER_MAX_ROWS,
   boundedNotebookText,
   notebookOutputKey,
   notebookWebCapability,
@@ -185,6 +188,34 @@ describe("NotebookOutput", () => {
     expect(html).not.toMatch(/script|onload|tracker\.example/i);
   });
 
+  it("preserves the safe SVG namespace and canonical case required by XML renderers", () => {
+    const svg = [
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">',
+      '<defs><linearGradient id="paint" gradientUnits="userSpaceOnUse">',
+      '<stop offset="0" stop-color="#fff"/>',
+      "</linearGradient></defs>",
+      '<rect width="10" height="10" fill="#fff"/>',
+      "</svg>",
+    ].join("");
+    const sanitized = sanitizeNotebookSvg(svg);
+
+    expect(sanitized).toContain('xmlns="http://www.w3.org/2000/svg"');
+    expect(sanitized).toContain('viewBox="0 0 10 10"');
+    expect(sanitized).toContain("<linearGradient");
+    expect(sanitized).toContain('gradientUnits="userSpaceOnUse"');
+    expect(sanitized).not.toContain("viewbox");
+    expect(sanitized).not.toContain("lineargradient");
+
+    const html = renderOutput({
+      output_type: "display_data",
+      metadata: {},
+      data: { "image/svg+xml": svg },
+    });
+    expect(html).toContain("data:image/svg+xml");
+    expect(html).toContain("viewBox");
+    expect(html).toContain("linearGradient");
+  });
+
   it("renders tabular data with named columns and rows", () => {
     const html = renderOutput({
       output_type: "display_data",
@@ -205,6 +236,53 @@ describe("NotebookOutput", () => {
     expect(html).toContain("score");
     expect(html).toContain("Ada");
     expect(html).toContain("Grace");
+  });
+
+  it("renders an invalid-data fallback for malformed table fields and rows", () => {
+    const malformedValues = [
+      {
+        schema: { fields: [null] },
+        data: [{}],
+      },
+      {
+        schema: { fields: [{ name: "name" }] },
+        data: [null],
+      },
+    ];
+
+    for (const value of malformedValues) {
+      const html = renderOutput({
+        output_type: "display_data",
+        metadata: {},
+        data: { "application/vnd.dataresource+json": value },
+      });
+      expect(html).toContain("Invalid notebook table data");
+      expect(html).toContain("preserved for export");
+      expect(html).not.toContain("<table");
+    }
+  });
+
+  it("caps rows, columns, and their product for compact wide table payloads", () => {
+    const columns = Array.from({ length: 100 }, (_, index) => `column-${index}`);
+    const row = Object.fromEntries(columns.map((column, index) => [column, index]));
+    const html = renderOutput({
+      output_type: "display_data",
+      metadata: {},
+      data: {
+        "application/vnd.dataresource+json": {
+          schema: { fields: columns.map((name) => ({ name })) },
+          data: Array.from({ length: 1_000 }, () => row),
+        },
+      },
+    });
+    const renderedColumns = html.match(/<th(?:\s|>)/g)?.length ?? 0;
+    const renderedCells = html.match(/<td(?:\s|>)/g)?.length ?? 0;
+    const renderedRows = html.match(/<tr(?:\s|>)/g)?.length ?? 1;
+
+    expect(renderedColumns).toBeLessThanOrEqual(NOTEBOOK_TABLE_RENDER_MAX_COLUMNS);
+    expect(renderedRows - 1).toBeLessThanOrEqual(NOTEBOOK_TABLE_RENDER_MAX_ROWS);
+    expect(renderedCells).toBeLessThanOrEqual(NOTEBOOK_TABLE_RENDER_MAX_CELLS);
+    expect(html).toContain("Table output truncated");
   });
 
   it("renders tracebacks as text without interpreting terminal markup", () => {

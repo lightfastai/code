@@ -75,6 +75,11 @@ export const NotebookExecutionEvent = Schema.Union([
   }),
   Schema.Struct({
     ...NotebookExecutionScopedEventBase.fields,
+    type: Schema.Literal("execution"),
+    executionCount: NonNegativeInt,
+  }),
+  Schema.Struct({
+    ...NotebookExecutionScopedEventBase.fields,
     type: Schema.Literal("stream"),
     name: Schema.Literals(["stdout", "stderr"]),
     text: Schema.String,

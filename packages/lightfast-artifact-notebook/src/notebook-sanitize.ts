@@ -1,68 +1,74 @@
-const SVG_ELEMENTS = new Set([
-  "svg",
-  "g",
-  "path",
-  "rect",
-  "circle",
-  "ellipse",
-  "line",
-  "polyline",
-  "polygon",
-  "text",
-  "tspan",
-  "defs",
-  "lineargradient",
-  "radialgradient",
-  "stop",
-  "clippath",
-  "mask",
-  "title",
-  "desc",
-]);
+const SVG_ELEMENTS = new Map(
+  [
+    "svg",
+    "g",
+    "path",
+    "rect",
+    "circle",
+    "ellipse",
+    "line",
+    "polyline",
+    "polygon",
+    "text",
+    "tspan",
+    "defs",
+    "linearGradient",
+    "radialGradient",
+    "stop",
+    "clipPath",
+    "mask",
+    "title",
+    "desc",
+  ].map((name) => [name.toLowerCase(), name] as const),
+);
 
-const SVG_ATTRIBUTES = new Set([
-  "xmlns",
-  "viewbox",
-  "width",
-  "height",
-  "x",
-  "y",
-  "x1",
-  "x2",
-  "y1",
-  "y2",
-  "cx",
-  "cy",
-  "r",
-  "rx",
-  "ry",
-  "d",
-  "points",
-  "fill",
-  "fill-opacity",
-  "fill-rule",
-  "stroke",
-  "stroke-width",
-  "stroke-linecap",
-  "stroke-linejoin",
-  "stroke-opacity",
-  "stroke-dasharray",
-  "opacity",
-  "transform",
-  "font-family",
-  "font-size",
-  "font-weight",
-  "text-anchor",
-  "dominant-baseline",
-  "offset",
-  "stop-color",
-  "stop-opacity",
-  "gradientunits",
-  "gradienttransform",
-  "id",
-  "role",
-  "aria-label",
-]);
+const SVG_ATTRIBUTES = new Map(
+  [
+    "xmlns",
+    "viewBox",
+    "width",
+    "height",
+    "x",
+    "y",
+    "x1",
+    "x2",
+    "y1",
+    "y2",
+    "cx",
+    "cy",
+    "r",
+    "rx",
+    "ry",
+    "d",
+    "points",
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "stroke",
+    "stroke-width",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-opacity",
+    "stroke-dasharray",
+    "opacity",
+    "transform",
+    "font-family",
+    "font-size",
+    "font-weight",
+    "text-anchor",
+    "dominant-baseline",
+    "offset",
+    "stop-color",
+    "stop-opacity",
+    "gradientUnits",
+    "gradientTransform",
+    "id",
+    "role",
+    "aria-label",
+  ].map((name) => [name.toLowerCase(), name] as const),
+);
+
+const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 
 const escapeXml = (value: string): string =>
   value
@@ -97,9 +103,10 @@ export function sanitizeNotebookSvg(input: string): string {
     cursor = tokenPattern.lastIndex;
 
     const closing = match[1] === "/";
-    const name = (match[2] ?? "").toLowerCase();
+    const normalizedName = (match[2] ?? "").toLowerCase();
+    const name = SVG_ELEMENTS.get(normalizedName);
     const rawAttributes = match[3] ?? "";
-    if (!SVG_ELEMENTS.has(name)) continue;
+    if (name === undefined) continue;
     if (closing) {
       if (stack.at(-1) !== name) return "";
       stack.pop();
@@ -116,12 +123,15 @@ export function sanitizeNotebookSvg(input: string): string {
     while ((attributeMatch = attributePattern.exec(attributeSource)) !== null) {
       if (attributeSource.slice(attributeCursor, attributeMatch.index).trim().length > 0) return "";
       attributeCursor = attributePattern.lastIndex;
-      const attributeName = (attributeMatch[1] ?? "").toLowerCase();
+      const normalizedAttributeName = (attributeMatch[1] ?? "").toLowerCase();
+      const attributeName = SVG_ATTRIBUTES.get(normalizedAttributeName);
       const attributeValue = attributeMatch[2] ?? attributeMatch[3] ?? "";
       if (
-        SVG_ATTRIBUTES.has(attributeName) &&
-        !attributeName.startsWith("on") &&
-        !/(?:url\s*\(|javascript:|data:|https?:|\/\/)/i.test(attributeValue)
+        attributeName !== undefined &&
+        !normalizedAttributeName.startsWith("on") &&
+        ((attributeName === "xmlns" && name === "svg" && attributeValue === SVG_NAMESPACE) ||
+          (attributeName !== "xmlns" &&
+            !/(?:url\s*\(|javascript:|data:|https?:|\/\/)/i.test(attributeValue)))
       ) {
         attributes.push(`${attributeName}="${escapeXml(attributeValue)}"`);
       }

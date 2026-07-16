@@ -1,7 +1,6 @@
 import {
   applyNotebookExecutionEvents,
   applyNotebookExecutionReplay,
-  beginNotebookCellExecution,
   clearNotebookRuntimeError,
   createNotebookRuntimeState,
   failNotebookRuntime,
@@ -18,6 +17,10 @@ import { useMemo } from "react";
 
 import { notebookEnvironment } from "~/state/notebook";
 import { useAtomCommand } from "~/state/use-atom-command";
+import {
+  executeNotebookCellWithState,
+  notebookExecutionFailureMessage,
+} from "./notebookExecutionController";
 import { NotebookRuntimeCache } from "./notebookRuntimeCache";
 
 const runtimeStates = new NotebookRuntimeCache<NotebookRuntimeState>();
@@ -102,8 +105,10 @@ export function useNotebookArtifactController(): NotebookArtifactController {
       replay: Parameters<typeof applyNotebookExecutionReplay>[1],
     ) => publish(request, applyNotebookExecutionReplay(current(request), replay));
     const fail = (request: RuntimeRequest, cause: unknown): never => {
-      const message = cause instanceof Error ? cause.message : String(cause);
-      publish(request, failNotebookRuntime(current(request), message));
+      publish(
+        request,
+        failNotebookRuntime(current(request), notebookExecutionFailureMessage(cause)),
+      );
       throw cause;
     };
     const recoverSession = async (request: RuntimeRequest) => {
@@ -239,28 +244,30 @@ export function useNotebookArtifactController(): NotebookArtifactController {
       },
       executeCell: async (request) => {
         const executionId = commandId("execution");
-        publish(request, beginNotebookCellExecution(current(request), request.cellId, executionId));
-        try {
-          await unwrapCommand(
-            executeCell({
-              environmentId: EnvironmentId.make(request.scope.environmentId),
-              input: {
-                request: {
-                  scope: rpcScope(request.scope),
-                  sessionId: request.sessionId,
-                  commandId: commandId("execute"),
-                  executionId,
-                  cellId: request.cellId,
-                  code: request.code,
+        await executeNotebookCellWithState({
+          cellId: request.cellId,
+          executionId,
+          current: () => current(request),
+          publish: (state) => publish(request, state),
+          execute: (onEvent) =>
+            unwrapCommand(
+              executeCell({
+                environmentId: EnvironmentId.make(request.scope.environmentId),
+                input: {
+                  request: {
+                    scope: rpcScope(request.scope),
+                    sessionId: request.sessionId,
+                    commandId: commandId("execute"),
+                    executionId,
+                    cellId: request.cellId,
+                    code: request.code,
+                  },
+                  onEvent,
                 },
-                onEvent: (event) => apply(request, [event]),
-              },
-            }),
-          );
-          if (current(request).recoveryAfterSequence !== null) await recoverSession(request);
-        } catch (cause) {
-          fail(request, cause);
-        }
+              }),
+            ),
+          recover: () => recoverSession(request),
+        });
       },
       interrupt: (request) => control(request, "interrupt", interrupt),
       restart: (request) => control(request, "restart", restart),

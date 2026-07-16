@@ -59,6 +59,7 @@ class FakeKernelClient:
                 [
                     message("stream", {"name": "stdout", "text": "ignored"}, parent_id="other"),
                     message("status", {"execution_state": "busy"}, parent_id=msg_id),
+                    message("execute_input", {"execution_count": 7}, parent_id=msg_id),
                     message("stream", {"name": "stdout", "text": "one\n"}, parent_id=msg_id),
                     message(
                         "display_data",
@@ -81,11 +82,29 @@ class FakeKernelClient:
             self.messages.extend(
                 [
                     message("status", {"execution_state": "busy"}, parent_id=msg_id),
+                    message("execute_input", {"execution_count": 10}, parent_id=msg_id),
                     message(
                         "error",
                         {"ename": "ValueError", "evalue": "boom", "traceback": ["trace"]},
                         parent_id=msg_id,
                     ),
+                    message("status", {"execution_state": "idle"}, parent_id=msg_id),
+                ]
+            )
+        elif code == "print":
+            self.messages.extend(
+                [
+                    message("status", {"execution_state": "busy"}, parent_id=msg_id),
+                    message("execute_input", {"execution_count": 8}, parent_id=msg_id),
+                    message("stream", {"name": "stdout", "text": "printed\n"}, parent_id=msg_id),
+                    message("status", {"execution_state": "idle"}, parent_id=msg_id),
+                ]
+            )
+        elif code == "assignment":
+            self.messages.extend(
+                [
+                    message("status", {"execution_state": "busy"}, parent_id=msg_id),
+                    message("execute_input", {"execution_count": 9}, parent_id=msg_id),
                     message("status", {"execution_state": "idle"}, parent_id=msg_id),
                 ]
             )
@@ -294,17 +313,39 @@ async def test_orders_matching_iopub_messages_through_idle(service: RuntimeServi
     assert [event["type"] for event in events] == [
         "accepted",
         "kernel",
+        "execution",
         "stream",
         "display",
         "result",
         "kernel",
     ]
     assert events[1]["state"] == "busy"
-    assert events[2]["text"] == "one\n"
-    assert events[3]["data"] == {"image/png": "cG5n"}
-    assert events[4]["executionCount"] == 7
+    assert events[2]["executionCount"] == 7
+    assert events[3]["text"] == "one\n"
+    assert events[4]["data"] == {"image/png": "cG5n"}
+    assert events[5]["executionCount"] == 7
     assert events[-1]["state"] == "idle"
-    assert [event["sequence"] for event in [*opened, *events]] == list(range(1, 10))
+    assert [event["sequence"] for event in [*opened, *events]] == list(range(1, 11))
+
+
+async def test_reports_execution_counts_without_result_outputs(service: RuntimeService) -> None:
+    await open_session(service)
+    for index, (code, expected_count) in enumerate(
+        [("print", 8), ("assignment", 9), ("error", 10)], start=1
+    ):
+        events = [
+            event
+            async for event in service.execute(
+                "session-1",
+                f"count-command-{index}",
+                f"count-execution-{index}",
+                f"cell-{index}",
+                code,
+            )
+        ]
+        execution = next(event for event in events if event["type"] == "execution")
+        assert execution["executionCount"] == expected_count
+        assert execution["cellId"] == f"cell-{index}"
 
 
 async def test_normalizes_kernel_errors(service: RuntimeService) -> None:

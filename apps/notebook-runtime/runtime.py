@@ -607,6 +607,14 @@ class RuntimeService:
                                 emit("kernel", state=state)
                             if state == "idle":
                                 break
+                    elif msg_type == "execute_input":
+                        execution_count = content.get("execution_count")
+                        if (
+                            isinstance(execution_count, int)
+                            and not isinstance(execution_count, bool)
+                            and execution_count >= 0
+                        ):
+                            emit("execution", executionCount=execution_count)
                     elif msg_type == "stream" and not output_limited:
                         name = content.get("name")
                         text = content.get("text")

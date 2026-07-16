@@ -56,6 +56,7 @@ describe("notebook execution contracts", () => {
       sequence: 1,
     };
     const executionEvents = [
+      { ...base, type: "execution", executionCount: 1 },
       { ...base, type: "stream", name: "stdout", text: "hello" },
       { ...base, type: "display", data: { "text/plain": "hello" }, metadata: {} },
       {
