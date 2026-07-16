@@ -211,6 +211,7 @@ class DeferredDisposeRuntimeClient extends FakeRuntimeClient {
   readonly #markDisposeStarted: () => void;
   readonly #disposeReleased: Promise<void>;
   readonly releaseDispose: () => void;
+  disposeCallStarted = false;
 
   constructor() {
     super();
@@ -229,6 +230,7 @@ class DeferredDisposeRuntimeClient extends FakeRuntimeClient {
   override async dispose(
     input: RuntimeSessionCommandRequest,
   ): Promise<readonly NotebookExecutionEvent[]> {
+    this.disposeCallStarted = true;
     this.#markDisposeStarted();
     await this.#disposeReleased;
     return super.dispose(input);
@@ -893,6 +895,138 @@ it("close waits for a racing project start and prevents it from being published"
   expect(
     docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id-1"),
   ).toHaveLength(1);
+});
+
+it("orders close and dispose by whichever lifecycle barrier is registered first", async () => {
+  const disposingFirstClient = new DeferredDisposeRuntimeClient();
+  const disposingFirst = await makeHarness({ createClient: () => disposingFirstClient });
+  await disposingFirst.manager.open({
+    projectId: "project-dispose-first",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+  const disposeBeforeClose = disposingFirst.manager.dispose({
+    projectId: "project-dispose-first",
+    sessionId: "session-1",
+    commandId: "dispose-1",
+  });
+  await disposingFirstClient.disposeStarted;
+  let closeSettled = false;
+  const closeAfterDispose = disposingFirst.manager.close().then(() => {
+    closeSettled = true;
+  });
+
+  try {
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+  } finally {
+    disposingFirstClient.releaseDispose();
+  }
+  await Promise.all([disposeBeforeClose, closeAfterDispose]);
+  expect(disposingFirstClient.disposeCount).toBe(1);
+
+  const closingFirstClient = new DeferredDisposeRuntimeClient();
+  const closingFirst = await makeHarness({ createClient: () => closingFirstClient });
+  await closingFirst.manager.open({
+    projectId: "project-close-first",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+  const closeBeforeDispose = closingFirst.manager.close();
+  const disposeAfterClose = closingFirst.manager
+    .dispose({
+      projectId: "project-close-first",
+      sessionId: "session-1",
+      commandId: "dispose-1",
+    })
+    .then(
+      (value) => ({ status: "fulfilled" as const, value }),
+      (reason: unknown) => ({ status: "rejected" as const, reason }),
+    );
+  await Promise.resolve();
+  await Promise.resolve();
+  const disposeStartedAfterClose = closingFirstClient.disposeCallStarted;
+  closingFirstClient.releaseDispose();
+  await expect(disposeAfterClose).resolves.toMatchObject({
+    status: "rejected",
+    reason: { reason: "runtime-unavailable" },
+  });
+  expect(disposeStartedAfterClose).toBe(false);
+  await closeBeforeDispose;
+});
+
+it("orders idle reaping and dispose by whichever lifecycle barrier is registered first", async () => {
+  const disposingFirstClient = new DeferredDisposeRuntimeClient();
+  const disposingFirst = await makeHarness({
+    createClient: () => disposingFirstClient,
+    idleTimeoutMs: 10,
+  });
+  await disposingFirst.manager.open({
+    projectId: "project-dispose-first",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+  const disposeBeforeReap = disposingFirst.manager.dispose({
+    projectId: "project-dispose-first",
+    sessionId: "session-1",
+    commandId: "dispose-1",
+  });
+  await disposingFirstClient.disposeStarted;
+  disposingFirst.setNow(2_000);
+  let reapSettled = false;
+  const reapAfterDispose = disposingFirst.manager.reapIdle().then(() => {
+    reapSettled = true;
+  });
+
+  try {
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(reapSettled).toBe(false);
+  } finally {
+    disposingFirstClient.releaseDispose();
+  }
+  await Promise.all([disposeBeforeReap, reapAfterDispose]);
+  expect(disposingFirstClient.disposeCount).toBe(1);
+  await disposingFirst.manager.close();
+
+  const reapingFirstClient = new DeferredDisposeRuntimeClient();
+  const reapingFirst = await makeHarness({
+    createClient: () => reapingFirstClient,
+    idleTimeoutMs: 10,
+  });
+  await reapingFirst.manager.open({
+    projectId: "project-reap-first",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+  reapingFirst.setNow(2_000);
+  const reapBeforeDispose = reapingFirst.manager.reapIdle();
+  const disposeAfterReap = reapingFirst.manager
+    .dispose({
+      projectId: "project-reap-first",
+      sessionId: "session-1",
+      commandId: "dispose-1",
+    })
+    .then(
+      (value) => ({ status: "fulfilled" as const, value }),
+      (reason: unknown) => ({ status: "rejected" as const, reason }),
+    );
+  await Promise.resolve();
+  await Promise.resolve();
+  const disposeStartedAfterReap = reapingFirstClient.disposeCallStarted;
+  reapingFirstClient.releaseDispose();
+  await expect(disposeAfterReap).resolves.toMatchObject({
+    status: "rejected",
+    reason: { reason: "runtime-unavailable" },
+  });
+  expect(disposeStartedAfterReap).toBe(false);
+  await reapBeforeDispose;
+  await reapingFirst.manager.close();
 });
 
 it("reconciles a partial stream once for concurrent duplicates without repeating effects", async () => {

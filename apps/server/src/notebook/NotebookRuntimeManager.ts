@@ -505,6 +505,7 @@ export class NotebookRuntimeManager {
   async dispose(
     input: NotebookManagerControlInput,
   ): Promise<ReadonlyArray<NotebookExecutionEvent>> {
+    this.#assertCanDispose(input.projectId);
     const sessionKey = this.#sessionKey(input.projectId, input.sessionId);
     const fingerprint = this.#fingerprint("dispose", input);
     const tombstone = this.#getDisposeTombstone(sessionKey, input.commandId);
@@ -1170,11 +1171,26 @@ export class NotebookRuntimeManager {
     });
   }
 
+  #assertCanDispose(projectId: string): void {
+    if (this.#closing) {
+      throw new NotebookRuntimeManagerError({
+        reason: "runtime-unavailable",
+        message: "Notebook runtime manager is closing.",
+      });
+    }
+    if (this.#projectRemovals.has(projectId)) {
+      throw new NotebookRuntimeManagerError({
+        reason: "runtime-unavailable",
+        message: "Notebook project runtime is being removed.",
+      });
+    }
+  }
+
   async #removeProject(project: ProjectState): Promise<void> {
     if (this.#projects.get(project.projectId) !== project) return;
     const activeRemoval = this.#projectRemovals.get(project.projectId);
     if (activeRemoval !== undefined) return activeRemoval;
-    const removal = this.#removeProjectOnce(project);
+    const removal = Promise.resolve().then(() => this.#removeProjectOnce(project));
     this.#projectRemovals.set(project.projectId, removal);
     try {
       await removal;
