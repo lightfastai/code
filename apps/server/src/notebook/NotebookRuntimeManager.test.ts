@@ -29,6 +29,7 @@ afterEach(async () => {
 class FakeDocker implements DockerCommandRunner {
   readonly calls: Array<{ args: readonly string[]; env?: Readonly<Record<string, string>> }> = [];
   removeFailures = 0;
+  runCount = 0;
 
   async run(
     args: readonly string[],
@@ -42,21 +43,24 @@ class FakeDocker implements DockerCommandRunner {
       this.removeFailures -= 1;
       throw new Error("injected remove failure");
     }
+    if (args[0] === "run") {
+      this.runCount += 1;
+      return { stdout: `container-id-${this.runCount}\n` };
+    }
     return {
-      stdout:
-        args[0] === "run"
-          ? "container-id\n"
-          : args[0] === "exec"
-            ? "fake-bootstrap-token-with-sufficient-entropy\n"
-            : "",
+      stdout: args[0] === "exec" ? "fake-bootstrap-token-with-sufficient-entropy\n" : "",
     };
   }
 }
 
 class FakeRuntimeClient implements NotebookRuntimeClientLike {
+  disposeCount = 0;
   executeCount = 0;
   healthCount = 0;
+  interruptCount = 0;
   interruptFailures = 0;
+  restartCount = 0;
+  readonly openedSessionIds: string[] = [];
   nextSequence = new Map<string, number>();
 
   async health(): Promise<void> {
@@ -64,6 +68,7 @@ class FakeRuntimeClient implements NotebookRuntimeClientLike {
   }
 
   async open(input: RuntimeSessionOpenRequest): Promise<readonly NotebookExecutionEvent[]> {
+    this.openedSessionIds.push(input.sessionId);
     const events = [
       event(input.sessionId, input.commandId, 1, "accepted", { commandType: "open" }),
       event(input.sessionId, input.commandId, 2, "kernel", { state: "starting" }),
@@ -96,6 +101,7 @@ class FakeRuntimeClient implements NotebookRuntimeClientLike {
   }
 
   async interrupt(input: RuntimeSessionCommandRequest): Promise<readonly NotebookExecutionEvent[]> {
+    this.interruptCount += 1;
     if (this.interruptFailures > 0) {
       this.interruptFailures -= 1;
       throw new NotebookRuntimeClientError({
@@ -107,6 +113,7 @@ class FakeRuntimeClient implements NotebookRuntimeClientLike {
   }
 
   async restart(input: RuntimeSessionCommandRequest): Promise<readonly NotebookExecutionEvent[]> {
+    this.restartCount += 1;
     const restarted = this.control(input, "restart", "restarted");
     const sequence = this.nextSequence.get(input.sessionId) ?? 1;
     this.nextSequence.set(input.sessionId, sequence + 1);
@@ -117,6 +124,7 @@ class FakeRuntimeClient implements NotebookRuntimeClientLike {
   }
 
   async dispose(input: RuntimeSessionCommandRequest): Promise<readonly NotebookExecutionEvent[]> {
+    this.disposeCount += 1;
     return this.control(input, "dispose", "terminated");
   }
 
@@ -278,15 +286,16 @@ const makeHarness = async (options?: {
   return { docker, clients, manager, setNow: (value: number) => (now = value) };
 };
 
-it("uses one hardened project container for separate notebook sessions", async () => {
+it("uses one hardened container per session and deduplicates concurrent session starts", async () => {
   const { docker, clients, manager } = await makeHarness();
-  await manager.open({
+  const firstOpen = {
     projectId: "project-1",
     sessionId: "session-1",
     commandId: "open-1",
     kernelName: "python3",
     bookPaths: ["/safe/books/physics.pdf"],
-  });
+  } as const;
+  await Promise.all([manager.open(firstOpen), manager.open(firstOpen)]);
   await manager.open({
     projectId: "project-1",
     sessionId: "session-2",
@@ -294,52 +303,44 @@ it("uses one hardened project container for separate notebook sessions", async (
     kernelName: "python3",
   });
 
-  expect(clients).toHaveLength(1);
-  expect(clients[0]?.healthCount).toBe(1);
-  const run = docker.calls.find((call) => call.args[0] === "run");
-  expect(run).toBeDefined();
-  expect(run?.args).toEqual(
-    expect.arrayContaining([
-      "--network",
-      "none",
-      "--cap-drop",
-      "ALL",
-      "--read-only",
-      "--pids-limit",
-      "64",
-      "--memory",
-      "512m",
-      "--cpus",
-      "1",
-    ]),
-  );
-  expect(run?.args).toContain("no-new-privileges:true");
-  expect(run?.args.some((arg) => arg.startsWith("/workspace:") && arg.includes("size=256m"))).toBe(
-    true,
-  );
-  expect(
-    run?.args.some(
-      (arg) => arg.includes("src=/safe/books/physics.pdf") && arg.includes("readonly"),
-    ),
-  ).toBe(true);
-  expect(run?.env?.NOTEBOOK_RUNTIME_TOKEN).toBeUndefined();
-  expect(run?.args).not.toContain("NOTEBOOK_RUNTIME_TOKEN");
-  expect(docker.calls).toEqual(
-    expect.arrayContaining([
-      expect.objectContaining({
-        args: [
-          "exec",
-          "--user",
-          "10002:10002",
-          "container-id",
-          "python",
-          "-m",
-          "runtime",
-          "bootstrap",
-        ],
-      }),
-    ]),
-  );
+  expect(clients).toHaveLength(2);
+  expect(clients.map((client) => client.healthCount)).toEqual([1, 1]);
+  expect(clients.map((client) => client.openedSessionIds)).toEqual([["session-1"], ["session-2"]]);
+  const runs = docker.calls.filter((call) => call.args[0] === "run");
+  expect(runs).toHaveLength(2);
+  for (const run of runs) {
+    expect(run.args).toEqual(
+      expect.arrayContaining([
+        "--network",
+        "none",
+        "--cap-drop",
+        "ALL",
+        "--read-only",
+        "--pids-limit",
+        "64",
+        "--memory",
+        "512m",
+        "--cpus",
+        "1",
+      ]),
+    );
+    expect(run.args).toContain("no-new-privileges:true");
+    expect(run.args.some((arg) => arg.startsWith("/workspace:") && arg.includes("size=256m"))).toBe(
+      true,
+    );
+    expect(
+      run.args.some(
+        (arg) => arg.includes("src=/safe/books/physics.pdf") && arg.includes("readonly"),
+      ),
+    ).toBe(true);
+    expect(run.env?.NOTEBOOK_RUNTIME_TOKEN).toBeUndefined();
+    expect(run.args).not.toContain("NOTEBOOK_RUNTIME_TOKEN");
+  }
+  expect(new Set(runs.map((run) => run.args[run.args.indexOf("--name") + 1])).size).toBe(2);
+  const bootstrapContainerIds = docker.calls
+    .filter((call) => call.args[0] === "exec")
+    .map((call) => call.args[3]);
+  expect(bootstrapContainerIds).toEqual(["container-id-1", "container-id-2"]);
   await manager.close();
 });
 
@@ -371,13 +372,28 @@ it("streams in sequence and replays completed command IDs without re-execution",
 });
 
 it("forwards controls, disposes sessions, reaps idle projects, and removes containers", async () => {
-  const { docker, manager, setNow } = await makeHarness({ idleTimeoutMs: 10 });
+  const { docker, clients, manager, setNow } = await makeHarness({ idleTimeoutMs: 10 });
   await manager.open({
     projectId: "project-1",
     sessionId: "session-1",
     commandId: "open-1",
     kernelName: "python3",
   });
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-2",
+    commandId: "open-2",
+    kernelName: "python3",
+  });
+  await Array.fromAsync(
+    manager.execute({
+      projectId: "project-1",
+      sessionId: "session-2",
+      commandId: "execute-2",
+      executionId: "execution-2",
+      code: "print('session-2')",
+    }),
+  );
   await manager.interrupt({ projectId: "project-1", sessionId: "session-1", commandId: "i-1" });
   await manager.restart({ projectId: "project-1", sessionId: "session-1", commandId: "r-1" });
   const disposed = await manager.dispose({
@@ -386,10 +402,26 @@ it("forwards controls, disposes sessions, reaps idle projects, and removes conta
     commandId: "d-1",
   });
   expect(disposed.at(-1)).toMatchObject({ type: "kernel", state: "terminated" });
+  expect(
+    clients.map((client) => ({
+      dispose: client.disposeCount,
+      execute: client.executeCount,
+      interrupt: client.interruptCount,
+      restart: client.restartCount,
+    })),
+  ).toEqual([
+    { dispose: 1, execute: 0, interrupt: 1, restart: 1 },
+    { dispose: 0, execute: 1, interrupt: 0, restart: 0 },
+  ]);
+  expect(docker.calls.some((call) => call.args.join(" ") === "rm --force container-id-1")).toBe(
+    true,
+  );
 
   setNow(2_000);
   await manager.reapIdle();
-  expect(docker.calls.some((call) => call.args.join(" ") === "rm --force container-id")).toBe(true);
+  expect(docker.calls.some((call) => call.args.join(" ") === "rm --force container-id-2")).toBe(
+    true,
+  );
 });
 
 it("rejects non-monotonic sidecar events", async () => {
@@ -447,7 +479,7 @@ it("bounds retained event history and command results by serialized bytes", asyn
   await manager.close();
 });
 
-it("keeps failed container cleanup tracked so close can retry", async () => {
+it("waits for sibling cleanup and keeps failed container ownership so close can retry", async () => {
   const { docker, manager } = await makeHarness();
   await manager.open({
     projectId: "project-1",
@@ -455,14 +487,26 @@ it("keeps failed container cleanup tracked so close can retry", async () => {
     commandId: "open-1",
     kernelName: "python3",
   });
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-2",
+    commandId: "open-2",
+    kernelName: "python3",
+  });
   docker.removeFailures = 1;
 
   await expect(manager.close()).rejects.toThrow("injected remove failure");
+  expect(
+    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id-2"),
+  ).toHaveLength(1);
   await manager.close();
 
   expect(
-    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id"),
+    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id-1"),
   ).toHaveLength(2);
+  expect(
+    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id-2"),
+  ).toHaveLength(1);
 });
 
 it("retains startup container ownership when readiness and initial removal both fail", async () => {
@@ -485,7 +529,7 @@ it("retains startup container ownership when readiness and initial removal both 
   await manager.close();
 
   expect(
-    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id"),
+    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id-1"),
   ).toHaveLength(2);
 });
 
@@ -516,7 +560,7 @@ it("close waits for a racing project start and prevents it from being published"
   expect(settledBeforeRelease).toBe(false);
   expect(openResult).toMatchObject({ reason: "runtime-unavailable" });
   expect(
-    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id"),
+    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id-1"),
   ).toHaveLength(1);
 });
 

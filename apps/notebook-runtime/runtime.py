@@ -355,6 +355,12 @@ class RuntimeService:
                 self._complete(record, events)
                 return events
 
+            if self.sessions:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Runtime already owns a different notebook session.",
+                )
+
             workspace = self.workspace_root / session_id
             workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
             runtime_directory = self.runtime_root / session_id
@@ -430,8 +436,14 @@ class RuntimeService:
             return
         assert record is not None
         if is_new:
-            record.task = asyncio.create_task(
+            task = asyncio.create_task(
                 self._run_execution(session, command_id, execution_id, code, record)
+            )
+            record.task = task
+            task.add_done_callback(
+                lambda completed_task: self._finalize_execution_task(
+                    session, command_id, execution_id, record, completed_task
+                )
             )
         index = 0
         while True:
@@ -657,11 +669,50 @@ class RuntimeService:
                             continue
                         output_bytes += encoded_size
                         emit("error", **error_fields)
+        except asyncio.CancelledError:
+            emit("kernel", state="terminated")
         except BaseException as error:
             record.error = error
         finally:
             record.completed.set()
             record.updated.set()
+
+    def _finalize_execution_task(
+        self,
+        session: KernelSession,
+        command_id: str,
+        execution_id: str,
+        record: CommandRecord,
+        task: asyncio.Task[None],
+    ) -> None:
+        if record.completed.is_set():
+            if not task.cancelled():
+                task.exception()
+            return
+        if task.cancelled():
+            accepted = any(event["type"] == "accepted" for event in record.events)
+            event = (
+                self._event(
+                    session,
+                    command_id,
+                    "kernel",
+                    execution_id=execution_id,
+                    state="terminated",
+                )
+                if accepted
+                else self._rejected(
+                    session,
+                    command_id,
+                    execution_id=execution_id,
+                    reason="execution-cancelled",
+                    message="Execution was cancelled before it started.",
+                )
+            )
+            record.events.append(event)
+        else:
+            record.error = task.exception()
+        record.completed.set()
+        record.updated.set()
 
     async def interrupt(self, session_id: str, command_id: str) -> list[Event]:
         session = self._get_session(session_id)

@@ -103,24 +103,26 @@ const textResult = (events: ReadonlyArray<NotebookExecutionEvent>): string | und
 };
 
 liveIt(
-  "executes and isolates a live Jupyter project container",
+  "executes and isolates live Jupyter session containers",
   async () => {
     const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "notebook-runtime-live-"));
     const bookPath = NodePath.join(root, "book.txt");
     await NodeFSP.writeFile(bookPath, "readonly-book", { mode: 0o444 });
-    let directClient: DockerExecNotebookRuntimeClient | undefined;
-    let directClientOptions: { readonly containerId: string; readonly token: string } | undefined;
+    const directClients: Array<{
+      readonly client: DockerExecNotebookRuntimeClient;
+      readonly options: { readonly containerId: string; readonly token: string };
+    }> = [];
     const manager = new NotebookRuntimeManager({
       docker: new FailFirstRemoveDocker(),
       image,
       runtimeRoot: NodePath.join(root, "control"),
       clientFactory: (options) => {
-        directClientOptions = options;
-        directClient = new DockerExecNotebookRuntimeClient({
+        const client = new DockerExecNotebookRuntimeClient({
           ...options,
           requestTimeoutMs: 130_000,
         });
-        return directClient;
+        directClients.push({ client, options });
+        return client;
       },
       readinessTimeoutMs: 30_000,
       executionTimeoutSeconds: 1,
@@ -134,7 +136,8 @@ liveIt(
         kernelName: "python3",
         bookPaths: [bookPath],
       });
-      if (directClient === undefined || directClientOptions === undefined) {
+      const primaryRuntime = directClients[0];
+      if (primaryRuntime === undefined) {
         throw new Error("missing direct runtime client");
       }
 
@@ -158,12 +161,31 @@ liveIt(
         commandId: "open-sibling",
         kernelName: "python3",
       });
-      await execute(manager, 45, "sibling_secret = 'private'", "sibling-state", "sibling-session");
+      const siblingRuntime = directClients[1];
+      if (siblingRuntime === undefined) throw new Error("missing sibling runtime client");
+      expect(siblingRuntime.options.containerId).not.toBe(primaryRuntime.options.containerId);
+
+      await execute(
+        manager,
+        45,
+        "import http.server, subprocess, sys, threading\nfrom pathlib import Path\nsibling_secret = 'private'\nPath('/workspace/sibling-workspace-marker').write_text('private')\nPath('/tmp/sibling-tmpfs-marker').write_text('private')\nsibling_process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', 'sibling-process-marker'])\nsibling_server = http.server.ThreadingHTTPServer(('127.0.0.1', 8765), http.server.SimpleHTTPRequestHandler)\nthreading.Thread(target=sibling_server.serve_forever, daemon=True).start()",
+        "sibling-state",
+        "sibling-session",
+      );
+      await execFilePromise("docker", [
+        "exec",
+        "--user",
+        "10001:10001",
+        siblingRuntime.options.containerId,
+        "python",
+        "-c",
+        "from pathlib import Path; Path('/tmp/notebook-sessions/sibling-runtime-marker').write_text('private')",
+      ]);
       expect(textResult(await execute(manager, 46, "'sibling_secret' in globals()"))).toBe("False");
       const connectionIsolation = await execute(
         manager,
         47,
-        "import glob, os\npaths=[]\nfor path in glob.glob('/proc/[0-9]*/cmdline'):\n try:\n  parts=open(path,'rb').read().split(b'\\0')\n  if b'-f' in parts:\n   index=parts.index(b'-f')\n   if index + 1 < len(parts): paths.append(parts[index + 1].decode())\n except OSError:\n  pass\npaths=sorted(set(paths))\nprint(f'connection-count={len(paths)}')\nprint(f'runtime-dir-count={len(set(map(os.path.dirname, paths)))}')\nprint(f'readable-connections={sum(os.path.isfile(path) and os.access(path, os.R_OK) for path in paths)}')",
+        "import glob, os, socket\npaths=[]\nsibling_processes=0\nfor path in glob.glob('/proc/[0-9]*/cmdline'):\n try:\n  command=open(path,'rb').read()\n  sibling_processes += int(b'sibling-process-marker' in command)\n  parts=command.split(b'\\0')\n  if b'-f' in parts:\n   index=parts.index(b'-f')\n   if index + 1 < len(parts): paths.append(parts[index + 1].decode())\n except OSError:\n  pass\npaths=sorted(set(paths))\nprobe=socket.socket(); probe.settimeout(0.2)\ntry:\n probe.connect(('127.0.0.1',8765)); sibling_loopback=True\nexcept OSError:\n sibling_loopback=False\nfinally:\n probe.close()\nprint(f'connection-count={len(paths)}')\nprint(f'runtime-dir-count={len(set(map(os.path.dirname, paths)))}')\nprint(f'readable-connections={sum(os.path.isfile(path) and os.access(path, os.R_OK) for path in paths)}')\nprint(f'sibling-processes={sibling_processes}')\nprint(f'sibling-workspace={os.path.exists(\"/workspace/sibling-workspace-marker\")}')\nprint(f'sibling-tmpfs={os.path.exists(\"/tmp/sibling-tmpfs-marker\")}')\nprint(f'sibling-runtime={os.path.exists(\"/tmp/notebook-sessions/sibling-runtime-marker\")}')\nprint(f'sibling-loopback={sibling_loopback}')",
         "connection-isolation",
       );
       const connectionOutput = connectionIsolation
@@ -171,10 +193,10 @@ liveIt(
         .map((event) => (event.type === "stream" ? event.text : ""))
         .join("");
       expect(connectionOutput).toContain(
-        "connection-count=2\nruntime-dir-count=2\nreadable-connections=0\n",
+        "connection-count=1\nruntime-dir-count=1\nreadable-connections=0\nsibling-processes=0\nsibling-workspace=False\nsibling-tmpfs=False\nsibling-runtime=False\nsibling-loopback=False\n",
       );
 
-      const beforeDisconnect = await directClient.eventsAfter("live-session", 0);
+      const beforeDisconnect = await primaryRuntime.client.eventsAfter("live-session", 0);
       const afterSequence = beforeDisconnect.at(-1)?.sequence ?? 0;
       const disconnectRequest = {
         sessionId: "live-session",
@@ -183,19 +205,24 @@ liveIt(
         code: "import time\ntime.sleep(0.6)\ndisconnect_counter = globals().get('disconnect_counter', 0) + 1\ndisconnect_counter",
       } as const;
       const disconnectedOutput = await executeUntilSocketTimeout({
-        ...directClientOptions,
+        ...primaryRuntime.options,
         body: disconnectRequest,
       });
       expect(disconnectedOutput).toContain('"commandId":"disconnect-live"');
       await NodeTimersPromises.setTimeout(900);
-      const recoveredEvents = await directClient.eventsAfter("live-session", afterSequence);
+      const recoveredEvents = await primaryRuntime.client.eventsAfter(
+        "live-session",
+        afterSequence,
+      );
       expect(recoveredEvents).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ commandId: "disconnect-live", type: "result" }),
           expect.objectContaining({ commandId: "disconnect-live", type: "kernel", state: "idle" }),
         ]),
       );
-      const replayedDisconnect = await Array.fromAsync(directClient.execute(disconnectRequest));
+      const replayedDisconnect = await Array.fromAsync(
+        primaryRuntime.client.execute(disconnectRequest),
+      );
       expect(textResult(replayedDisconnect)).toBe("1");
 
       await execute(manager, 1, "value = 40");
@@ -295,92 +322,111 @@ liveIt(
         expect.arrayContaining([expect.objectContaining({ type: "stream", text: "False\n" })]),
       );
 
-      const { stdout: containerId } = await execFilePromise("docker", [
+      const { stdout: containerOutput } = await execFilePromise("docker", [
         "ps",
         "-q",
         "--filter",
         "label=lightfast.notebook.project=5b5cd5d2405ffcf3",
       ]);
-      expect(containerId.trim()).not.toBe("");
-      const { stdout: inspection } = await execFilePromise("docker", [
-        "inspect",
-        "--format",
-        "{{json .HostConfig}}",
-        containerId.trim(),
-      ]);
-      const hostConfig = JSON.parse(inspection) as {
-        readonly CapDrop: readonly string[];
-        readonly Memory: number;
-        readonly NanoCpus: number;
-        readonly NetworkMode: string;
-        readonly PidsLimit: number;
-        readonly ReadonlyRootfs: boolean;
-        readonly SecurityOpt: readonly string[];
-        readonly Tmpfs: Readonly<Record<string, string>>;
-      };
-      expect(hostConfig).toMatchObject({
-        CapDrop: ["ALL"],
-        Memory: 512 * 1024 * 1024,
-        NanoCpus: 1_000_000_000,
-        NetworkMode: "none",
-        PidsLimit: 64,
-        ReadonlyRootfs: true,
-      });
-      expect(hostConfig.SecurityOpt).toContain("no-new-privileges:true");
-      expect(Object.keys(hostConfig.Tmpfs).toSorted()).toEqual(["/tmp", "/workspace"]);
-      const { stdout: mountsJson } = await execFilePromise("docker", [
-        "inspect",
-        "--format",
-        "{{json .Mounts}}",
-        containerId.trim(),
-      ]);
-      const mounts = JSON.parse(mountsJson) as ReadonlyArray<{
-        readonly Destination: string;
-        readonly RW: boolean;
-        readonly Source: string;
-        readonly Type: string;
-      }>;
-      expect(mounts).toEqual([
-        expect.objectContaining({ Destination: "/books/book-0", RW: false, Type: "bind" }),
-      ]);
-      expect(mounts[0]?.Source).toBe(bookPath);
-      expect(mounts.some((mount) => /docker\.sock|workspace/i.test(mount.Source))).toBe(false);
-
-      const { stdout: configuredEnvironment } = await execFilePromise("docker", [
-        "inspect",
-        "--format",
-        "{{json .Config.Env}}",
-        containerId.trim(),
-      ]);
-      expect(JSON.parse(configuredEnvironment) as string[]).not.toEqual(
-        expect.arrayContaining([expect.stringMatching(/^NOTEBOOK_RUNTIME_TOKEN=/)]),
+      const containerIds = containerOutput.trim().split(/\s+/).filter(Boolean);
+      expect(containerIds).toHaveLength(2);
+      expect(new Set(containerIds)).toEqual(
+        new Set([
+          primaryRuntime.options.containerId.slice(0, 12),
+          siblingRuntime.options.containerId.slice(0, 12),
+        ]),
       );
-      const bootstrapReplay = await execFilePromise("docker", [
-        "exec",
-        "--user",
-        "10002:10002",
-        containerId.trim(),
-        "python",
-        "-m",
-        "runtime",
-        "bootstrap",
-      ]).catch((error: unknown) => error);
-      expect(bootstrapReplay).toBeInstanceOf(Error);
-      expect(String(bootstrapReplay)).toContain("bootstrap unavailable");
-      expect(String(bootstrapReplay)).not.toContain("NOTEBOOK_RUNTIME_TOKEN");
+      const containerNames = await Promise.all(
+        containerIds.map(async (containerId) => {
+          const { stdout } = await execFilePromise("docker", [
+            "inspect",
+            "--format",
+            "{{.Name}}",
+            containerId,
+          ]);
+          return stdout.trim();
+        }),
+      );
+      expect(new Set(containerNames).size).toBe(2);
+
+      for (const containerId of containerIds) {
+        const { stdout: inspection } = await execFilePromise("docker", [
+          "inspect",
+          "--format",
+          "{{json .HostConfig}}",
+          containerId,
+        ]);
+        const hostConfig = JSON.parse(inspection) as {
+          readonly CapDrop: readonly string[];
+          readonly Memory: number;
+          readonly NanoCpus: number;
+          readonly NetworkMode: string;
+          readonly PidsLimit: number;
+          readonly ReadonlyRootfs: boolean;
+          readonly SecurityOpt: readonly string[];
+          readonly Tmpfs: Readonly<Record<string, string>>;
+        };
+        expect(hostConfig).toMatchObject({
+          CapDrop: ["ALL"],
+          Memory: 512 * 1024 * 1024,
+          NanoCpus: 1_000_000_000,
+          NetworkMode: "none",
+          PidsLimit: 64,
+          ReadonlyRootfs: true,
+        });
+        expect(hostConfig.SecurityOpt).toContain("no-new-privileges:true");
+        expect(Object.keys(hostConfig.Tmpfs).toSorted()).toEqual(["/tmp", "/workspace"]);
+        const { stdout: mountsJson } = await execFilePromise("docker", [
+          "inspect",
+          "--format",
+          "{{json .Mounts}}",
+          containerId,
+        ]);
+        const mounts = JSON.parse(mountsJson) as ReadonlyArray<{
+          readonly Destination: string;
+          readonly RW: boolean;
+          readonly Source: string;
+          readonly Type: string;
+        }>;
+        expect(mounts).toEqual([
+          expect.objectContaining({ Destination: "/books/book-0", RW: false, Type: "bind" }),
+        ]);
+        expect(mounts[0]?.Source).toBe(bookPath);
+        expect(mounts.some((mount) => /docker\.sock|workspace/i.test(mount.Source))).toBe(false);
+
+        const { stdout: configuredEnvironment } = await execFilePromise("docker", [
+          "inspect",
+          "--format",
+          "{{json .Config.Env}}",
+          containerId,
+        ]);
+        expect(JSON.parse(configuredEnvironment) as string[]).not.toEqual(
+          expect.arrayContaining([expect.stringMatching(/^NOTEBOOK_RUNTIME_TOKEN=/)]),
+        );
+        const bootstrapReplay = await execFilePromise("docker", [
+          "exec",
+          "--user",
+          "10002:10002",
+          containerId,
+          "python",
+          "-m",
+          "runtime",
+          "bootstrap",
+        ]).catch((error: unknown) => error);
+        expect(bootstrapReplay).toBeInstanceOf(Error);
+        expect(String(bootstrapReplay)).toContain("bootstrap unavailable");
+        expect(String(bootstrapReplay)).not.toContain("NOTEBOOK_RUNTIME_TOKEN");
+      }
 
       await expect(manager.close()).rejects.toThrow("injected live remove failure");
-      await expect(
-        execFilePromise("docker", ["inspect", containerId.trim()]),
-      ).resolves.toBeDefined();
-      await manager.close();
-      const { stdout: containerAfterRetry } = await execFilePromise("docker", [
+      const { stdout: retainedAfterFailure } = await execFilePromise("docker", [
         "ps",
         "-q",
         "--filter",
-        `id=${containerId.trim()}`,
+        "label=lightfast.notebook.project=5b5cd5d2405ffcf3",
       ]);
-      expect(containerAfterRetry.trim()).toBe("");
+      expect(retainedAfterFailure.trim().split(/\s+/).filter(Boolean)).toHaveLength(1);
+      await manager.close();
       const { stdout: remainingContainers } = await execFilePromise("docker", [
         "ps",
         "-aq",
@@ -389,6 +435,7 @@ liveIt(
       ]);
       expect(remainingContainers.trim()).toBe("");
     } finally {
+      await manager.close().catch(() => undefined);
       await manager.close().catch(() => undefined);
       const { stdout: leakedContainers } = await execFilePromise("docker", [
         "ps",
@@ -478,6 +525,7 @@ liveIt(
       expect(remainingContainers.trim()).toBe("");
     } finally {
       releaseHealth();
+      await manager.close().catch(() => undefined);
       await manager.close().catch(() => undefined);
       const { stdout: leakedContainers } = await execFilePromise("docker", [
         "ps",

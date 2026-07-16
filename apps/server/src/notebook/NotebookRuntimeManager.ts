@@ -143,17 +143,30 @@ interface SessionState {
   disposed: boolean;
 }
 
-interface OwnedProjectContainer {
+interface OwnedSessionContainer {
+  readonly sessionKey: string;
   readonly projectId: string;
+  readonly sessionId: string;
   readonly containerId: string;
   readonly controlDirectory: string;
 }
 
-interface ProjectRuntime extends OwnedProjectContainer {
+interface SessionRuntime extends OwnedSessionContainer {
   readonly client: NotebookRuntimeClientLike;
+  readonly session: SessionState;
+  opened: boolean;
+}
+
+interface ProjectState {
+  readonly projectId: string;
   readonly books: ReadonlyArray<string>;
-  readonly sessions: Map<string, SessionState>;
+  readonly sessionKeys: Set<string>;
   lastUsedAt: number;
+}
+
+interface SessionStart {
+  readonly projectId: string;
+  readonly promise: Promise<SessionRuntime>;
 }
 
 class ExecutionEventQueue implements AsyncIterable<NotebookExecutionEvent> {
@@ -244,9 +257,11 @@ export class NotebookRuntimeManager {
   readonly #commandCacheLimitBytes: number;
   readonly #executionTimeoutSeconds: number;
   readonly #timeoutIdleGraceSeconds: number;
-  readonly #projects = new Map<string, ProjectRuntime>();
-  readonly #containers = new Map<string, OwnedProjectContainer>();
-  readonly #projectStarts = new Map<string, Promise<ProjectRuntime>>();
+  readonly #projects = new Map<string, ProjectState>();
+  readonly #sessions = new Map<string, SessionRuntime>();
+  readonly #containers = new Map<string, OwnedSessionContainer>();
+  readonly #sessionStarts = new Map<string, SessionStart>();
+  readonly #sessionRemovals = new Map<string, Promise<void>>();
   readonly #projectRemovals = new Map<string, Promise<void>>();
   #closing = false;
 
@@ -280,58 +295,35 @@ export class NotebookRuntimeManager {
   async open(
     input: NotebookManagerSessionOpenInput,
   ): Promise<ReadonlyArray<NotebookExecutionEvent>> {
-    const project = await this.#ensureProject(input.projectId, input.bookPaths ?? []);
+    const activeRemoval = this.#projectRemovals.get(input.projectId);
+    if (activeRemoval !== undefined) await activeRemoval;
+    this.#assertCanStart();
+    const project = this.#selectProject(input.projectId, input.bookPaths ?? []);
+    const runtime = await this.#ensureSession(project, input.sessionId);
     project.lastUsedAt = this.#now();
-    const existing = project.sessions.get(input.sessionId);
-    if (existing !== undefined) {
-      if (existing.disposed) {
-        throw new NotebookRuntimeManagerError({
-          reason: "session-not-found",
-          message: "Notebook session has already been disposed.",
-        });
-      }
-      return this.#runCached(
-        existing,
-        input.commandId,
-        this.#fingerprint("open", input),
-        "open",
-        () => project.client.open(input),
-      );
-    }
-    const session: SessionState = {
-      sessionId: input.sessionId,
-      events: [],
-      commands: new Map(),
-      commandOrder: [],
-      eventSizes: [],
-      pendingEvents: new Map(),
-      eventHistoryBytes: 0,
-      commandCacheBytes: 0,
-      pendingEventBytes: 0,
-      lastSequence: 0,
-      disposed: false,
-    };
-    project.sessions.set(input.sessionId, session);
     try {
       const events = await this.#runCached(
-        session,
+        runtime.session,
         input.commandId,
         this.#fingerprint("open", input),
         "open",
-        () => project.client.open(input),
+        () => runtime.client.open(input),
       );
-      if (this.#commandResultState(events, input.commandId, "open") !== "accepted-terminal") {
-        project.sessions.delete(input.sessionId);
+      const state = this.#commandResultState(events, input.commandId, "open");
+      if (state === "accepted-terminal") {
+        runtime.opened = true;
+      } else if (!runtime.opened) {
+        await this.#removeContainer(runtime);
       }
       return events;
     } catch (error) {
-      project.sessions.delete(input.sessionId);
+      if (!runtime.opened) await this.#removeContainer(runtime).catch(() => undefined);
       throw error;
     }
   }
 
   execute(input: NotebookManagerExecuteInput): AsyncIterable<NotebookExecutionEvent> {
-    const { project, session } = this.#getSession(input);
+    const { project, runtime, session } = this.#getSession(input);
     project.lastUsedAt = this.#now();
     const fingerprint = this.#fingerprint("execute", input);
     const cached = session.commands.get(input.commandId);
@@ -373,7 +365,7 @@ export class NotebookRuntimeManager {
       };
       let failure: unknown;
       try {
-        for await (const event of project.client.execute(input)) {
+        for await (const event of runtime.client.execute(input)) {
           recordEvent(event, true);
         }
       } catch (error) {
@@ -391,7 +383,7 @@ export class NotebookRuntimeManager {
       if (state === "incomplete" && recoverableFailure) {
         try {
           try {
-            const resumed = await project.client.eventsAfter(input.sessionId, session.lastSequence);
+            const resumed = await runtime.client.eventsAfter(input.sessionId, session.lastSequence);
             for (const event of resumed) recordEvent(event, true);
           } catch (error) {
             failure = error;
@@ -401,7 +393,7 @@ export class NotebookRuntimeManager {
           );
           state = this.#commandResultState(events, input.commandId, "execute");
           if (state === "incomplete") {
-            for await (const event of project.client.execute(input)) recordEvent(event, true);
+            for await (const event of runtime.client.execute(input)) recordEvent(event, true);
             events = [...eventsBySequence.values()].toSorted(
               (left, right) => left.sequence - right.sequence,
             );
@@ -453,17 +445,18 @@ export class NotebookRuntimeManager {
   async dispose(
     input: NotebookManagerControlInput,
   ): Promise<ReadonlyArray<NotebookExecutionEvent>> {
-    const { project, session } = this.#getSession(input, true);
+    const { project, runtime, session } = this.#getSession(input, true);
     project.lastUsedAt = this.#now();
     const events = await this.#runCached(
       session,
       input.commandId,
       this.#fingerprint("dispose", input),
       "dispose",
-      () => project.client.dispose(input),
+      () => runtime.client.dispose(input),
     );
     if (this.#commandResultState(events, input.commandId, "dispose") === "accepted-terminal") {
       session.disposed = true;
+      await this.#removeContainer(runtime);
     }
     return events;
   }
@@ -485,10 +478,8 @@ export class NotebookRuntimeManager {
 
   async close(): Promise<void> {
     this.#closing = true;
-    await Promise.allSettled(this.#projectStarts.values());
-    await Promise.all(
-      [...this.#containers.values()].map((container) => this.#removeContainer(container)),
-    );
+    await Promise.allSettled([...this.#sessionStarts.values()].map((start) => start.promise));
+    await this.#removeContainers([...this.#containers.values()]);
   }
 
   startIdleReaper(intervalMs = Math.min(this.#idleTimeoutMs, 60_000)): () => void {
@@ -503,7 +494,7 @@ export class NotebookRuntimeManager {
     command: "interrupt" | "restart",
     input: NotebookManagerControlInput,
   ): Promise<ReadonlyArray<NotebookExecutionEvent>> {
-    const { project, session } = this.#getSession(input);
+    const { project, runtime, session } = this.#getSession(input);
     project.lastUsedAt = this.#now();
     return this.#runCached(
       session,
@@ -511,23 +502,35 @@ export class NotebookRuntimeManager {
       this.#fingerprint(command, input),
       command,
       () =>
-        command === "interrupt" ? project.client.interrupt(input) : project.client.restart(input),
+        command === "interrupt" ? runtime.client.interrupt(input) : runtime.client.restart(input),
     );
   }
 
   #getSession(
     input: { readonly projectId: string; readonly sessionId: string },
     allowDisposed = false,
-  ): { readonly project: ProjectRuntime; readonly session: SessionState } {
+  ): {
+    readonly project: ProjectState;
+    readonly runtime: SessionRuntime;
+    readonly session: SessionState;
+  } {
     const project = this.#projects.get(input.projectId);
-    const session = project?.sessions.get(input.sessionId);
-    if (project === undefined || session === undefined || (session.disposed && !allowDisposed)) {
+    const runtime = this.#sessions.get(this.#sessionKey(input.projectId, input.sessionId));
+    const session = runtime?.session;
+    if (
+      project === undefined ||
+      runtime === undefined ||
+      runtime.projectId !== input.projectId ||
+      runtime.sessionId !== input.sessionId ||
+      session === undefined ||
+      (session.disposed && !allowDisposed)
+    ) {
       throw new NotebookRuntimeManagerError({
         reason: "session-not-found",
         message: "Notebook session was not found.",
       });
     }
-    return { project, session };
+    return { project, runtime, session };
   }
 
   async #runCached(
@@ -737,14 +740,10 @@ export class NotebookRuntimeManager {
     return NodeCrypto.createHash("sha256").update(JSON.stringify({ command, input })).digest("hex");
   }
 
-  async #ensureProject(
-    projectId: string,
-    bookPaths: ReadonlyArray<string>,
-  ): Promise<ProjectRuntime> {
-    this.#assertCanStart();
+  #selectProject(projectId: string, bookPaths: ReadonlyArray<string>): ProjectState {
+    const requestedBooks = this.#normalizeBooks(bookPaths);
     const existing = this.#projects.get(projectId);
     if (existing !== undefined) {
-      const requestedBooks = this.#normalizeBooks(bookPaths);
       if (requestedBooks.some((book) => !existing.books.includes(book))) {
         throw new NotebookRuntimeManagerError({
           reason: "invalid-mount",
@@ -753,37 +752,64 @@ export class NotebookRuntimeManager {
       }
       return existing;
     }
-    const starting = this.#projectStarts.get(projectId);
-    if (starting !== undefined) return starting;
-    const orphaned = this.#containers.get(projectId);
-    if (orphaned !== undefined) {
-      await this.#removeContainer(orphaned);
-      this.#assertCanStart();
-      const racedProject = this.#projects.get(projectId);
-      if (racedProject !== undefined) return racedProject;
-      const racedStart = this.#projectStarts.get(projectId);
-      if (racedStart !== undefined) return racedStart;
-    }
-    const promise = this.#startProject(projectId, bookPaths);
-    this.#projectStarts.set(projectId, promise);
+    const project: ProjectState = {
+      projectId,
+      books: requestedBooks,
+      sessionKeys: new Set(),
+      lastUsedAt: this.#now(),
+    };
+    this.#projects.set(projectId, project);
+    return project;
+  }
+
+  #sessionKey(projectId: string, sessionId: string): string {
+    return NodeCrypto.createHash("sha256")
+      .update(JSON.stringify({ projectId, sessionId }))
+      .digest("hex");
+  }
+
+  async #ensureSession(project: ProjectState, sessionId: string): Promise<SessionRuntime> {
+    this.#assertCanStart();
+    const sessionKey = this.#sessionKey(project.projectId, sessionId);
+    const existing = this.#sessions.get(sessionKey);
+    if (existing !== undefined) return existing;
+    const starting = this.#sessionStarts.get(sessionKey);
+    if (starting !== undefined) return starting.promise;
+    const promise = (async () => {
+      const orphaned = this.#containers.get(sessionKey);
+      if (orphaned !== undefined) {
+        await this.#removeContainer(orphaned);
+        this.#assertCanStart();
+        const racedSession = this.#sessions.get(sessionKey);
+        if (racedSession !== undefined) return racedSession;
+      }
+      return this.#startSession(project, sessionId, sessionKey);
+    })();
+    this.#sessionStarts.set(sessionKey, { projectId: project.projectId, promise });
     try {
       return await promise;
     } finally {
-      this.#projectStarts.delete(projectId);
+      const current = this.#sessionStarts.get(sessionKey);
+      if (current?.promise === promise) this.#sessionStarts.delete(sessionKey);
     }
   }
 
-  async #startProject(
-    projectId: string,
-    bookPaths: ReadonlyArray<string>,
-  ): Promise<ProjectRuntime> {
+  async #startSession(
+    project: ProjectState,
+    sessionId: string,
+    sessionKey: string,
+  ): Promise<SessionRuntime> {
+    const projectId = project.projectId;
     const projectHash = NodeCrypto.createHash("sha256")
       .update(projectId)
       .digest("hex")
       .slice(0, 16);
-    const controlDirectory = NodePath.join(this.#runtimeRoot, projectHash);
-    const containerName = `lightfast-notebook-${projectHash}-${NodeCrypto.randomBytes(4).toString("hex")}`;
-    const books = this.#normalizeBooks(bookPaths);
+    const sessionHash = NodeCrypto.createHash("sha256")
+      .update(sessionKey)
+      .digest("hex")
+      .slice(0, 16);
+    const controlDirectory = NodePath.join(this.#runtimeRoot, `${projectHash}-${sessionHash}`);
+    const containerName = `lightfast-notebook-${projectHash}-${sessionHash}-${NodeCrypto.randomBytes(4).toString("hex")}`;
     await NodeFSP.mkdir(controlDirectory, { mode: 0o700, recursive: true });
     const args = [
       "run",
@@ -793,6 +819,8 @@ export class NotebookRuntimeManager {
       containerName,
       "--label",
       `lightfast.notebook.project=${projectHash}`,
+      "--label",
+      `lightfast.notebook.session=${sessionHash}`,
       "--network",
       "none",
       "--cap-drop",
@@ -819,17 +847,23 @@ export class NotebookRuntimeManager {
       "--env",
       `NOTEBOOK_TIMEOUT_IDLE_GRACE_SECONDS=${this.#timeoutIdleGraceSeconds}`,
     ];
-    for (const [index, book] of books.entries()) {
+    for (const [index, book] of project.books.entries()) {
       args.push("--mount", `type=bind,src=${book},dst=/books/book-${index},readonly`);
     }
     args.push(this.#image);
 
-    let ownedContainer: OwnedProjectContainer | undefined;
+    let ownedContainer: OwnedSessionContainer | undefined;
     try {
       const launched = await this.#docker.run(args);
       const containerId = launched.stdout.trim().split(/\s/)[0] || containerName;
-      ownedContainer = { projectId, containerId, controlDirectory };
-      this.#containers.set(projectId, ownedContainer);
+      ownedContainer = {
+        sessionKey,
+        projectId,
+        sessionId,
+        containerId,
+        controlDirectory,
+      };
+      this.#containers.set(sessionKey, ownedContainer);
       const bootstrapped = await this.#docker.run([
         "exec",
         "--user",
@@ -850,17 +884,38 @@ export class NotebookRuntimeManager {
       const client = this.#clientFactory({ containerId, token });
       await this.#waitUntilReady(client);
       this.#assertCanStart();
-      const project: ProjectRuntime = {
+      if (this.#projects.get(projectId) !== project) {
+        throw new NotebookRuntimeManagerError({
+          reason: "runtime-unavailable",
+          message: "Notebook project runtime was removed during startup.",
+        });
+      }
+      const session: SessionState = {
+        sessionId,
+        events: [],
+        commands: new Map(),
+        commandOrder: [],
+        eventSizes: [],
+        pendingEvents: new Map(),
+        eventHistoryBytes: 0,
+        commandCacheBytes: 0,
+        pendingEventBytes: 0,
+        lastSequence: 0,
+        disposed: false,
+      };
+      const runtime: SessionRuntime = {
+        sessionKey,
         projectId,
+        sessionId,
         containerId,
         controlDirectory,
         client,
-        books,
-        sessions: new Map(),
-        lastUsedAt: this.#now(),
+        session,
+        opened: false,
       };
-      this.#projects.set(projectId, project);
-      return project;
+      this.#sessions.set(sessionKey, runtime);
+      project.sessionKeys.add(sessionKey);
+      return runtime;
     } catch (error) {
       if (ownedContainer !== undefined) {
         await this.#removeContainer(ownedContainer).catch(() => undefined);
@@ -912,39 +967,75 @@ export class NotebookRuntimeManager {
     });
   }
 
-  async #removeProject(project: ProjectRuntime): Promise<void> {
+  async #removeProject(project: ProjectState): Promise<void> {
     if (this.#projects.get(project.projectId) !== project) return;
-    const ownedContainer = this.#containers.get(project.projectId);
-    if (ownedContainer === undefined || ownedContainer.containerId !== project.containerId) return;
-    return this.#removeContainer(ownedContainer);
-  }
-
-  async #removeContainer(container: OwnedProjectContainer): Promise<void> {
-    const ownedContainer = this.#containers.get(container.projectId);
-    if (ownedContainer === undefined || ownedContainer.containerId !== container.containerId)
-      return;
-    const activeRemoval = this.#projectRemovals.get(container.projectId);
+    const activeRemoval = this.#projectRemovals.get(project.projectId);
     if (activeRemoval !== undefined) return activeRemoval;
-    const removal = this.#removeContainerOnce(container);
-    this.#projectRemovals.set(container.projectId, removal);
+    const removal = this.#removeProjectOnce(project);
+    this.#projectRemovals.set(project.projectId, removal);
     try {
       await removal;
     } finally {
-      if (this.#projectRemovals.get(container.projectId) === removal) {
-        this.#projectRemovals.delete(container.projectId);
+      if (this.#projectRemovals.get(project.projectId) === removal) {
+        this.#projectRemovals.delete(project.projectId);
       }
     }
   }
 
-  async #removeContainerOnce(container: OwnedProjectContainer): Promise<void> {
-    await this.#docker.run(["rm", "--force", container.containerId]);
-    const project = this.#projects.get(container.projectId);
-    if (project?.containerId === container.containerId) {
-      this.#projects.delete(container.projectId);
+  async #removeProjectOnce(project: ProjectState): Promise<void> {
+    const starts = [...this.#sessionStarts.values()]
+      .filter((start) => start.projectId === project.projectId)
+      .map((start) => start.promise);
+    await Promise.allSettled(starts);
+    const containers = [...this.#containers.values()].filter(
+      (container) => container.projectId === project.projectId,
+    );
+    await this.#removeContainers(containers);
+    if (
+      this.#projects.get(project.projectId) === project &&
+      ![...this.#containers.values()].some((container) => container.projectId === project.projectId)
+    ) {
+      this.#projects.delete(project.projectId);
     }
-    const ownedContainer = this.#containers.get(container.projectId);
+  }
+
+  async #removeContainers(containers: ReadonlyArray<OwnedSessionContainer>): Promise<void> {
+    const results = await Promise.allSettled(
+      containers.map((container) => this.#removeContainer(container)),
+    );
+    const failure = results.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (failure !== undefined) throw failure.reason;
+  }
+
+  async #removeContainer(container: OwnedSessionContainer): Promise<void> {
+    const ownedContainer = this.#containers.get(container.sessionKey);
+    if (ownedContainer === undefined || ownedContainer.containerId !== container.containerId)
+      return;
+    const activeRemoval = this.#sessionRemovals.get(container.sessionKey);
+    if (activeRemoval !== undefined) return activeRemoval;
+    const removal = this.#removeContainerOnce(container);
+    this.#sessionRemovals.set(container.sessionKey, removal);
+    try {
+      await removal;
+    } finally {
+      if (this.#sessionRemovals.get(container.sessionKey) === removal) {
+        this.#sessionRemovals.delete(container.sessionKey);
+      }
+    }
+  }
+
+  async #removeContainerOnce(container: OwnedSessionContainer): Promise<void> {
+    await this.#docker.run(["rm", "--force", container.containerId]);
+    const runtime = this.#sessions.get(container.sessionKey);
+    if (runtime?.containerId === container.containerId) {
+      this.#sessions.delete(container.sessionKey);
+      this.#projects.get(container.projectId)?.sessionKeys.delete(container.sessionKey);
+    }
+    const ownedContainer = this.#containers.get(container.sessionKey);
     if (ownedContainer?.containerId === container.containerId) {
-      this.#containers.delete(container.projectId);
+      this.#containers.delete(container.sessionKey);
     }
     await NodeFSP.rm(container.controlDirectory, { force: true, recursive: true }).catch(
       () => undefined,

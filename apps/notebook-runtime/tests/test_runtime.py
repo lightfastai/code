@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 from runtime import RuntimeService, build_app_from_environment, create_app
 
@@ -231,32 +232,53 @@ async def test_open_failure_shuts_down_started_kernel_and_removes_session(
     assert created[0].shutdown_count == 1
 
 
-async def test_sessions_use_unique_removed_connection_files_including_restart(
+async def test_session_uses_removed_connection_file_including_restart(
     service: RuntimeService,
 ) -> None:
     first, _ = await open_session(service)
-    await service.open_session("session-2", "open-2", "python3")
-    second = service.sessions["session-2"].manager
-    assert isinstance(second, FakeKernelManager)
 
     assert first.connection_file is not None
-    assert second.connection_file is not None
-    assert first.connection_file != second.connection_file
-    assert __import__("os").path.dirname(first.connection_file) != __import__("os").path.dirname(
-        second.connection_file
-    )
     assert not __import__("os").path.exists(first.connection_file)
-    assert not __import__("os").path.exists(second.connection_file)
 
     await service.restart("session-1", "restart-connection-file")
     assert not __import__("os").path.exists(first.connection_file)
 
     first_runtime = __import__("pathlib").Path(first.connection_file).parent
-    second_runtime = __import__("pathlib").Path(second.connection_file).parent
     await service.dispose("session-1", "dispose-connection-file")
     assert not first_runtime.exists()
-    await service.close()
-    assert not second_runtime.exists()
+
+
+async def test_sidecar_rejects_a_second_distinct_session(tmp_path: Any) -> None:
+    created: list[FakeKernelManager] = []
+
+    def factory(kernel_name: str, connection_file: str | None = None) -> FakeKernelManager:
+        manager = FakeKernelManager(kernel_name, connection_file)
+        created.append(manager)
+        return manager
+
+    service = RuntimeService(
+        kernel_factory=factory,
+        workspace_root=tmp_path / "workspace",
+        runtime_root=tmp_path / "runtime",
+    )
+    first, _ = await open_session(service)
+    reopened = await service.open_session("session-1", "open-again", "python3")
+
+    with pytest.raises(HTTPException) as raised:
+        await service.open_session("session-2", "open-2", "python3")
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail == "Runtime already owns a different notebook session."
+    assert reopened[-1] == {
+        "type": "kernel",
+        "sessionId": "session-1",
+        "commandId": "open-again",
+        "sequence": reopened[-1]["sequence"],
+        "state": "idle",
+    }
+    assert len(created) == 1
+    assert list(service.sessions) == ["session-1"]
+    assert service.sessions["session-1"].manager is first
 
 
 async def test_orders_matching_iopub_messages_through_idle(service: RuntimeService) -> None:
@@ -399,6 +421,53 @@ async def test_execution_survives_subscriber_cancellation_and_replays_terminal_e
     assert any(
         event["type"] == "kernel" and event["state"] in {"idle", "terminated"} for event in replay
     )
+
+
+async def test_dispose_finalizes_execution_cancelled_before_owner_task_starts(
+    service: RuntimeService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await open_session(service)
+    original_create_task = asyncio.create_task
+    owner_created = asyncio.Event()
+    owner_release = asyncio.Event()
+
+    def intercept_owner(coroutine: Any, *args: Any, **kwargs: Any) -> asyncio.Task[Any]:
+        code = getattr(coroutine, "cr_code", None)
+        if getattr(code, "co_name", None) != "_run_execution":
+            return original_create_task(coroutine, *args, **kwargs)
+
+        async def held_owner() -> None:
+            try:
+                await owner_release.wait()
+                await coroutine
+            finally:
+                if getattr(coroutine, "cr_frame", None) is not None:
+                    coroutine.close()
+
+        task = original_create_task(held_owner(), *args, **kwargs)
+        owner_created.set()
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", intercept_owner)
+    stream = service.execute(
+        "session-1", "pre-start-cancel", "pre-start-cancel-execution", "ordered"
+    )
+    subscriber = original_create_task(anext(stream))
+    await asyncio.wait_for(owner_created.wait(), timeout=0.1)
+    record = service.sessions["session-1"].commands["pre-start-cancel"]
+    owner_task = record.task
+    assert owner_task is not None
+
+    await service.dispose("session-1", "dispose-pre-start")
+    cancelled = await asyncio.wait_for(subscriber, timeout=0.1)
+
+    assert cancelled["type"] == "rejected"
+    assert cancelled["reason"] == "execution-cancelled"
+    assert record.completed.is_set()
+    assert owner_task.done()
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
 
 
 async def test_interrupt_restart_and_dispose_are_ordered(service: RuntimeService) -> None:
