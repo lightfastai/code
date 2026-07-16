@@ -326,7 +326,7 @@ export interface DockerExecNotebookRuntimeClientOptions {
 
 /**
  * Docker Desktop cannot carry a live Unix socket through its VM bind mount.
- * This transport preserves `--network none`: a same-UID `docker exec` helper
+ * This transport preserves `--network none`: a dedicated control-UID `docker exec` helper
  * connects to container loopback and receives the bearer token on stdin only.
  */
 export class DockerExecNotebookRuntimeClient implements NotebookRuntimeClientLike {
@@ -435,7 +435,17 @@ export class DockerExecNotebookRuntimeClient implements NotebookRuntimeClientLik
   async *#request(method: "GET" | "POST", path: string, body?: unknown): AsyncIterable<Buffer> {
     const child = NodeChildProcess.spawn(
       "docker",
-      ["exec", "--interactive", this.#containerId, "python", "-m", "runtime", "proxy"],
+      [
+        "exec",
+        "--interactive",
+        "--user",
+        "10002:10002",
+        this.#containerId,
+        "python",
+        "-m",
+        "runtime",
+        "proxy",
+      ],
       { stdio: ["pipe", "pipe", "pipe"] },
     );
     const timer = setTimeout(() => child.kill("SIGKILL"), this.#requestTimeoutMs);

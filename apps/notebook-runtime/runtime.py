@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import hashlib
 import hmac
 import http.client
 import json
 import os
 import re
+import secrets
+import shutil
 import sys
+import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
@@ -34,11 +38,8 @@ ERROR_VALUE_LIMIT_BYTES = 128 * 1024
 TRACEBACK_LIMIT_BYTES = 512 * 1024
 TRACEBACK_LINE_LIMIT_BYTES = 16 * 1024
 KERNEL_ENVIRONMENT_ALLOWLIST = (
-    "IPYTHONDIR",
-    "JUPYTER_RUNTIME_DIR",
     "LANG",
     "LC_ALL",
-    "MPLCONFIGDIR",
     "PATH",
     "PYTHONDONTWRITEBYTECODE",
     "PYTHONHASHSEED",
@@ -78,6 +79,9 @@ class CommandRecord:
     fingerprint: str
     events: list[Event] = field(default_factory=list)
     completed: asyncio.Event = field(default_factory=asyncio.Event)
+    updated: asyncio.Event = field(default_factory=asyncio.Event)
+    task: asyncio.Task[None] | None = None
+    error: BaseException | None = None
 
 
 @dataclass
@@ -86,6 +90,8 @@ class KernelSession:
     manager: KernelManager
     client: KernelClient
     workspace: Path
+    runtime_directory: Path
+    connection_file: Path
     sequence: int = 0
     events: deque[Event] = field(default_factory=deque)
     commands: dict[str, CommandRecord] = field(default_factory=dict)
@@ -154,7 +160,7 @@ def _bounded_traceback(value: Any) -> list[str]:
     return result
 
 
-def _kernel_environment() -> dict[str, str]:
+def _kernel_environment(runtime_directory: Path) -> dict[str, str]:
     environment = {
         name: value
         for name in KERNEL_ENVIRONMENT_ALLOWLIST
@@ -163,7 +169,19 @@ def _kernel_environment() -> dict[str, str]:
     environment["HOME"] = os.environ.get("HOME", str(Path.home()))
     environment["PATH"] = environment.get("PATH", os.defpath)
     environment["PYTHONNOUSERSITE"] = "1"
+    environment["IPYTHONDIR"] = str(runtime_directory / "ipython")
+    environment["JUPYTER_RUNTIME_DIR"] = str(runtime_directory / "jupyter")
+    environment["MPLCONFIGDIR"] = str(runtime_directory / "matplotlib")
     return environment
+
+
+def _set_non_dumpable() -> None:
+    if sys.platform != "linux":
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
 
 
 class RuntimeService:
@@ -172,6 +190,7 @@ class RuntimeService:
         *,
         kernel_factory: Callable[..., KernelManager] = AsyncKernelManager,
         workspace_root: str | Path = "/workspace",
+        runtime_root: str | Path = "/tmp/notebook-sessions",
         output_limit_bytes: int = DEFAULT_OUTPUT_LIMIT_BYTES,
         event_limit_bytes: int = DEFAULT_EVENT_LIMIT_BYTES,
         execution_timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
@@ -181,6 +200,7 @@ class RuntimeService:
     ) -> None:
         self.kernel_factory = kernel_factory
         self.workspace_root = Path(workspace_root)
+        self.runtime_root = Path(runtime_root)
         self.output_limit_bytes = output_limit_bytes
         self.event_limit_bytes = event_limit_bytes
         self.execution_timeout_seconds = execution_timeout_seconds
@@ -263,6 +283,12 @@ class RuntimeService:
             await existing.completed.wait()
             return None, list(existing.events)
 
+        record = self._new_command_record(session, command_id, fingerprint)
+        return record, None
+
+    def _new_command_record(
+        self, session: KernelSession, command_id: str, fingerprint: str
+    ) -> CommandRecord:
         record = CommandRecord(fingerprint=fingerprint)
         session.commands[command_id] = record
         session.command_order.append(command_id)
@@ -273,12 +299,39 @@ class RuntimeService:
                 break
             session.command_order.popleft()
             del session.commands[oldest]
-        return record, None
+        return record
+
+    def _begin_execution_command(
+        self,
+        session: KernelSession,
+        command_id: str,
+        fingerprint: str,
+        execution_id: str,
+    ) -> tuple[CommandRecord | None, list[Event] | None, bool]:
+        existing = session.commands.get(command_id)
+        if existing is not None:
+            if not hmac.compare_digest(existing.fingerprint, fingerprint):
+                return (
+                    None,
+                    [
+                        self._rejected(
+                            session,
+                            command_id,
+                            execution_id=execution_id,
+                            reason="command-id-conflict",
+                            message="The command ID was already used with a different payload.",
+                        )
+                    ],
+                    False,
+                )
+            return existing, None, False
+        return self._new_command_record(session, command_id, fingerprint), None, True
 
     @staticmethod
     def _complete(record: CommandRecord, events: list[Event]) -> None:
         record.events.extend(events)
         record.completed.set()
+        record.updated.set()
 
     async def open_session(
         self,
@@ -304,13 +357,21 @@ class RuntimeService:
 
             workspace = self.workspace_root / session_id
             workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
-            manager = self.kernel_factory(kernel_name=kernel_name)
+            runtime_directory = self.runtime_root / session_id
+            runtime_directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+            connection_file = runtime_directory / "connection.json"
+            manager = self.kernel_factory(
+                kernel_name=kernel_name,
+                connection_file=str(connection_file),
+            )
             client: KernelClient | None = None
             session = KernelSession(
                 session_id=session_id,
                 manager=manager,
                 client=None,  # type: ignore[arg-type]
                 workspace=workspace,
+                runtime_directory=runtime_directory,
+                connection_file=connection_file,
             )
             record = CommandRecord(fingerprint=fingerprint)
             session.commands[command_id] = record
@@ -321,10 +382,13 @@ class RuntimeService:
                 self._event(session, command_id, "kernel", state="starting"),
             ]
             try:
-                await manager.start_kernel(cwd=str(workspace), env=_kernel_environment())
+                await manager.start_kernel(
+                    cwd=str(workspace), env=_kernel_environment(runtime_directory)
+                )
                 client = manager.client()
                 client.start_channels()
                 await client.wait_for_ready(timeout=30)
+                connection_file.unlink(missing_ok=True)
                 session.client = client
                 events.append(self._event(session, command_id, "kernel", state="idle"))
                 self._complete(record, events)
@@ -335,6 +399,7 @@ class RuntimeService:
                 with suppress(BaseException):
                     await manager.shutdown_kernel(now=True)
                 self.sessions.pop(session_id, None)
+                shutil.rmtree(runtime_directory, ignore_errors=True)
                 record.completed.set()
                 raise
 
@@ -356,16 +421,38 @@ class RuntimeService:
         fingerprint = _fingerprint(
             "execute", {"code": code, "executionId": execution_id, "sessionId": session_id}
         )
-        record, replay = await self._begin_command(
-            session, command_id, fingerprint, execution_id=execution_id
+        record, replay, is_new = self._begin_execution_command(
+            session, command_id, fingerprint, execution_id
         )
         if replay is not None:
             for event in replay:
                 yield event
             return
         assert record is not None
+        if is_new:
+            record.task = asyncio.create_task(
+                self._run_execution(session, command_id, execution_id, code, record)
+            )
+        index = 0
+        while True:
+            record.updated.clear()
+            while index < len(record.events):
+                yield record.events[index]
+                index += 1
+            if record.completed.is_set():
+                if record.error is not None:
+                    raise record.error
+                return
+            await record.updated.wait()
 
-        emitted: list[Event] = []
+    async def _run_execution(
+        self,
+        session: KernelSession,
+        command_id: str,
+        execution_id: str,
+        code: str,
+        record: CommandRecord,
+    ) -> None:
         output_bytes = 0
         output_limited = False
 
@@ -373,7 +460,8 @@ class RuntimeService:
             event = self._event(
                 session, command_id, event_type, execution_id=execution_id, **fields
             )
-            emitted.append(event)
+            record.events.append(event)
+            record.updated.set()
             return event
 
         def emit_output_limit() -> Event | None:
@@ -420,7 +508,7 @@ class RuntimeService:
                     high = midpoint - 1
             return text[:low], True
 
-        yield emit("accepted", commandType="execute")
+        emit("accepted", commandType="execute")
         try:
             async with session.lock:
                 msg_id = session.client.execute(code, allow_stdin=False, stop_on_error=True)
@@ -432,7 +520,7 @@ class RuntimeService:
                     if remaining <= 0:
                         if not timed_out:
                             await session.manager.interrupt_kernel()
-                            yield emit(
+                            emit(
                                 "limit",
                                 kind="time",
                                 limit=self.execution_timeout_seconds,
@@ -442,22 +530,23 @@ class RuntimeService:
                                     "interrupted."
                                 ),
                             )
-                            yield emit("kernel", state="interrupted")
+                            emit("kernel", state="interrupted")
                             timed_out = True
                             deadline = loop.time() + self.timeout_idle_grace_seconds
                             continue
 
-                        yield emit("kernel", state="starting")
+                        emit("kernel", state="starting")
                         try:
                             await session.manager.restart_kernel(now=True)
                             await session.client.wait_for_ready(timeout=30)
+                            session.connection_file.unlink(missing_ok=True)
                         except BaseException:
                             session.client.stop_channels()
                             with suppress(BaseException):
                                 await session.manager.shutdown_kernel(now=True)
-                            if self.sessions.get(session_id) is session:
-                                self.sessions.pop(session_id)
-                            yield emit(
+                            if self.sessions.get(session.session_id) is session:
+                                self.sessions.pop(session.session_id)
+                            emit(
                                 "error",
                                 ename="RuntimeRecoveryError",
                                 evalue=(
@@ -466,10 +555,10 @@ class RuntimeService:
                                 ),
                                 traceback=[],
                             )
-                            yield emit("kernel", state="terminated")
+                            emit("kernel", state="terminated")
                             break
-                        yield emit("kernel", state="restarted")
-                        yield emit("kernel", state="idle")
+                        emit("kernel", state="restarted")
+                        emit("kernel", state="idle")
                         break
                     try:
                         message = await session.client.get_iopub_msg(timeout=min(remaining, 1.0))
@@ -483,7 +572,7 @@ class RuntimeService:
                         state = content.get("execution_state")
                         if state in {"busy", "idle"}:
                             if state == "idle" or not timed_out:
-                                yield emit("kernel", state=state)
+                                emit("kernel", state=state)
                             if state == "idle":
                                 break
                     elif msg_type == "stream" and not output_limited:
@@ -497,21 +586,17 @@ class RuntimeService:
                             bounded_text, event_truncated = bounded_stream_text(name, text)
                             if bounded_text:
                                 output_bytes += len(bounded_text.encode())
-                                yield emit("stream", name=name, text=bounded_text)
+                                emit("stream", name=name, text=bounded_text)
                             if event_truncated:
-                                limit_event = emit_output_limit()
-                                if limit_event is not None:
-                                    yield limit_event
+                                emit_output_limit()
                         else:
                             truncated = encoded[:remaining_bytes].decode(errors="ignore")
                             if truncated:
                                 bounded_text, _ = bounded_stream_text(name, truncated)
                                 if bounded_text:
                                     output_bytes += len(bounded_text.encode())
-                                    yield emit("stream", name=name, text=bounded_text)
-                            limit_event = emit_output_limit()
-                            if limit_event is not None:
-                                yield limit_event
+                                    emit("stream", name=name, text=bounded_text)
+                            emit_output_limit()
                     elif msg_type in {"display_data", "execute_result"} and not output_limited:
                         data = content.get("data")
                         metadata = content.get("metadata", {})
@@ -526,9 +611,7 @@ class RuntimeService:
                             continue
                         encoded_size = data_size + metadata_size
                         if output_bytes + encoded_size > self.output_limit_bytes:
-                            limit_event = emit_output_limit()
-                            if limit_event is not None:
-                                yield limit_event
+                            emit_output_limit()
                             continue
                         execution_count = content.get("execution_count")
                         if (
@@ -543,15 +626,13 @@ class RuntimeService:
                         if not event_fits(
                             "display" if msg_type == "display_data" else "result", **fields
                         ):
-                            limit_event = emit_output_limit()
-                            if limit_event is not None:
-                                yield limit_event
+                            emit_output_limit()
                             continue
                         output_bytes += encoded_size
                         if msg_type == "display_data":
-                            yield emit("display", data=data, metadata=metadata)
+                            emit("display", data=data, metadata=metadata)
                         else:
-                            yield emit(
+                            emit(
                                 "result",
                                 data=data,
                                 metadata=metadata,
@@ -572,14 +653,15 @@ class RuntimeService:
                             encoded_size is None
                             or output_bytes + encoded_size > self.output_limit_bytes
                         ):
-                            limit_event = emit_output_limit()
-                            if limit_event is not None:
-                                yield limit_event
+                            emit_output_limit()
                             continue
                         output_bytes += encoded_size
-                        yield emit("error", **error_fields)
+                        emit("error", **error_fields)
+        except BaseException as error:
+            record.error = error
         finally:
-            self._complete(record, emitted)
+            record.completed.set()
+            record.updated.set()
 
     async def interrupt(self, session_id: str, command_id: str) -> list[Event]:
         session = self._get_session(session_id)
@@ -611,6 +693,7 @@ class RuntimeService:
             async with session.lock:
                 await session.manager.restart_kernel(now=True)
                 await session.client.wait_for_ready(timeout=30)
+                session.connection_file.unlink(missing_ok=True)
             events.extend(
                 [
                     self._event(session, command_id, "kernel", state="restarted"),
@@ -635,11 +718,13 @@ class RuntimeService:
         assert record is not None
         events = [self._event(session, command_id, "accepted", commandType="dispose")]
         try:
+            await self._cancel_session_tasks(session)
             async with session.lock:
                 session.client.stop_channels()
                 await session.manager.shutdown_kernel(now=True)
             events.append(self._event(session, command_id, "kernel", state="terminated"))
             self.sessions.pop(session_id, None)
+            shutil.rmtree(session.runtime_directory, ignore_errors=True)
             self.disposed_commands[(session_id, command_id)] = (fingerprint, list(events))
             return events
         finally:
@@ -653,11 +738,27 @@ class RuntimeService:
         sessions = list(self.sessions.values())
         self.sessions.clear()
         for session in sessions:
-            session.client.stop_channels()
-            await session.manager.shutdown_kernel(now=True)
+            try:
+                await self._cancel_session_tasks(session)
+                session.client.stop_channels()
+                await session.manager.shutdown_kernel(now=True)
+            finally:
+                shutil.rmtree(session.runtime_directory, ignore_errors=True)
+
+    @staticmethod
+    async def _cancel_session_tasks(session: KernelSession) -> None:
+        tasks = {
+            record.task
+            for record in session.commands.values()
+            if record.task is not None and not record.task.done()
+        }
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def create_app(*, service: RuntimeService, token: str) -> FastAPI:
+def create_app(*, service: RuntimeService, token: str, bootstrap_enabled: bool = False) -> FastAPI:
     if not token:
         raise ValueError("A non-empty NOTEBOOK_RUNTIME_TOKEN is required.")
 
@@ -672,6 +773,18 @@ def create_app(*, service: RuntimeService, token: str) -> FastAPI:
         redoc_url=None,
         lifespan=lifespan,
     )
+    bootstrap_claimed = not bootstrap_enabled
+    bootstrap_lock = asyncio.Lock()
+
+    @app.post("/v1/bootstrap")
+    async def bootstrap_endpoint() -> dict[str, str]:
+        nonlocal bootstrap_claimed
+        async with bootstrap_lock:
+            if bootstrap_claimed or service.sessions:
+                bootstrap_claimed = True
+                raise HTTPException(status.HTTP_409_CONFLICT, "Bootstrap unavailable.")
+            bootstrap_claimed = True
+            return {"token": token}
 
     def authenticate(authorization: str | None = Header(default=None)) -> None:
         expected = f"Bearer {token}"
@@ -764,7 +877,8 @@ def _positive_float_env(name: str, default: float) -> float:
 
 
 def build_app_from_environment() -> FastAPI:
-    token = os.environ.pop("NOTEBOOK_RUNTIME_TOKEN", "")
+    os.environ.pop("NOTEBOOK_RUNTIME_TOKEN", None)
+    token = secrets.token_urlsafe(32)
     service = RuntimeService(
         workspace_root=os.environ.get("NOTEBOOK_WORKSPACE_ROOT", "/workspace"),
         output_limit_bytes=_positive_int_env(
@@ -780,10 +894,11 @@ def build_app_from_environment() -> FastAPI:
             "NOTEBOOK_TIMEOUT_IDLE_GRACE_SECONDS", DEFAULT_TIMEOUT_IDLE_GRACE_SECONDS
         ),
     )
-    return create_app(service=service, token=token)
+    return create_app(service=service, token=token, bootstrap_enabled=True)
 
 
 def serve() -> None:
+    _set_non_dumpable()
     uvicorn.run(
         "runtime:build_app_from_environment",
         factory=True,
@@ -796,6 +911,7 @@ def serve() -> None:
 
 
 def proxy() -> None:
+    _set_non_dumpable()
     envelope = json.loads(sys.stdin.buffer.readline())
     method = envelope["method"]
     path = envelope["path"]
@@ -826,8 +942,39 @@ def proxy() -> None:
         connection.close()
 
 
+def bootstrap() -> None:
+    _set_non_dumpable()
+    deadline = time.monotonic() + 30
+    while True:
+        connection = http.client.HTTPConnection("127.0.0.1", 8080, timeout=1)
+        try:
+            connection.request("POST", "/v1/bootstrap")
+            response = connection.getresponse()
+            payload = response.read(1024)
+            if response.status != status.HTTP_200_OK:
+                raise RuntimeError("bootstrap unavailable")
+            decoded = json.loads(payload)
+            token = decoded.get("token")
+            if not isinstance(token, str) or not token:
+                raise RuntimeError("bootstrap unavailable")
+            sys.stdout.write(f"{token}\n")
+            return
+        except ConnectionError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("bootstrap unavailable") from None
+            time.sleep(0.025)
+        finally:
+            connection.close()
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "proxy":
         proxy()
+    elif len(sys.argv) == 2 and sys.argv[1] == "bootstrap":
+        try:
+            bootstrap()
+        except BaseException:
+            sys.stderr.write("bootstrap unavailable\n")
+            raise SystemExit(1) from None
     else:
         serve()

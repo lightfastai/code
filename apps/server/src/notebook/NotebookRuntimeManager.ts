@@ -143,10 +143,13 @@ interface SessionState {
   disposed: boolean;
 }
 
-interface ProjectRuntime {
+interface OwnedProjectContainer {
   readonly projectId: string;
   readonly containerId: string;
   readonly controlDirectory: string;
+}
+
+interface ProjectRuntime extends OwnedProjectContainer {
   readonly client: NotebookRuntimeClientLike;
   readonly books: ReadonlyArray<string>;
   readonly sessions: Map<string, SessionState>;
@@ -242,8 +245,10 @@ export class NotebookRuntimeManager {
   readonly #executionTimeoutSeconds: number;
   readonly #timeoutIdleGraceSeconds: number;
   readonly #projects = new Map<string, ProjectRuntime>();
+  readonly #containers = new Map<string, OwnedProjectContainer>();
   readonly #projectStarts = new Map<string, Promise<ProjectRuntime>>();
   readonly #projectRemovals = new Map<string, Promise<void>>();
+  #closing = false;
 
   constructor(options: NotebookRuntimeManagerOptions) {
     this.#docker = options.docker ?? new DockerCliCommandRunner();
@@ -479,7 +484,11 @@ export class NotebookRuntimeManager {
   }
 
   async close(): Promise<void> {
-    await Promise.all([...this.#projects.values()].map((project) => this.#removeProject(project)));
+    this.#closing = true;
+    await Promise.allSettled(this.#projectStarts.values());
+    await Promise.all(
+      [...this.#containers.values()].map((container) => this.#removeContainer(container)),
+    );
   }
 
   startIdleReaper(intervalMs = Math.min(this.#idleTimeoutMs, 60_000)): () => void {
@@ -732,6 +741,7 @@ export class NotebookRuntimeManager {
     projectId: string,
     bookPaths: ReadonlyArray<string>,
   ): Promise<ProjectRuntime> {
+    this.#assertCanStart();
     const existing = this.#projects.get(projectId);
     if (existing !== undefined) {
       const requestedBooks = this.#normalizeBooks(bookPaths);
@@ -745,6 +755,15 @@ export class NotebookRuntimeManager {
     }
     const starting = this.#projectStarts.get(projectId);
     if (starting !== undefined) return starting;
+    const orphaned = this.#containers.get(projectId);
+    if (orphaned !== undefined) {
+      await this.#removeContainer(orphaned);
+      this.#assertCanStart();
+      const racedProject = this.#projects.get(projectId);
+      if (racedProject !== undefined) return racedProject;
+      const racedStart = this.#projectStarts.get(projectId);
+      if (racedStart !== undefined) return racedStart;
+    }
     const promise = this.#startProject(projectId, bookPaths);
     this.#projectStarts.set(projectId, promise);
     try {
@@ -763,7 +782,6 @@ export class NotebookRuntimeManager {
       .digest("hex")
       .slice(0, 16);
     const controlDirectory = NodePath.join(this.#runtimeRoot, projectHash);
-    const token = NodeCrypto.randomBytes(32).toString("base64url");
     const containerName = `lightfast-notebook-${projectHash}-${NodeCrypto.randomBytes(4).toString("hex")}`;
     const books = this.#normalizeBooks(bookPaths);
     await NodeFSP.mkdir(controlDirectory, { mode: 0o700, recursive: true });
@@ -795,8 +813,6 @@ export class NotebookRuntimeManager {
       "--tmpfs",
       "/workspace:rw,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700",
       "--env",
-      "NOTEBOOK_RUNTIME_TOKEN",
-      "--env",
       "NOTEBOOK_OUTPUT_LIMIT_BYTES=10485760",
       "--env",
       `NOTEBOOK_EXECUTION_TIMEOUT_SECONDS=${this.#executionTimeoutSeconds}`,
@@ -808,20 +824,32 @@ export class NotebookRuntimeManager {
     }
     args.push(this.#image);
 
-    let containerId: string | undefined;
+    let ownedContainer: OwnedProjectContainer | undefined;
     try {
-      const launched = await this.#docker.run(args, {
-        env: { NOTEBOOK_RUNTIME_TOKEN: token },
-      });
-      containerId = launched.stdout.trim().split(/\s/)[0];
-      if (!containerId) {
+      const launched = await this.#docker.run(args);
+      const containerId = launched.stdout.trim().split(/\s/)[0] || containerName;
+      ownedContainer = { projectId, containerId, controlDirectory };
+      this.#containers.set(projectId, ownedContainer);
+      const bootstrapped = await this.#docker.run([
+        "exec",
+        "--user",
+        "10002:10002",
+        containerId,
+        "python",
+        "-m",
+        "runtime",
+        "bootstrap",
+      ]);
+      const token = bootstrapped.stdout.trim();
+      if (!/^[A-Za-z0-9_-]{32,128}$/.test(token)) {
         throw new NotebookRuntimeManagerError({
-          reason: "docker-failed",
-          message: "Docker did not return a notebook container ID.",
+          reason: "runtime-unavailable",
+          message: "Notebook runtime bootstrap returned invalid credentials.",
         });
       }
       const client = this.#clientFactory({ containerId, token });
       await this.#waitUntilReady(client);
+      this.#assertCanStart();
       const project: ProjectRuntime = {
         projectId,
         containerId,
@@ -834,10 +862,11 @@ export class NotebookRuntimeManager {
       this.#projects.set(projectId, project);
       return project;
     } catch (error) {
-      if (containerId !== undefined) {
-        await this.#docker.run(["rm", "--force", containerId]).catch(() => undefined);
+      if (ownedContainer !== undefined) {
+        await this.#removeContainer(ownedContainer).catch(() => undefined);
+      } else {
+        await NodeFSP.rm(controlDirectory, { force: true, recursive: true });
       }
-      await NodeFSP.rm(controlDirectory, { force: true, recursive: true });
       throw error;
     }
   }
@@ -875,27 +904,49 @@ export class NotebookRuntimeManager {
     });
   }
 
+  #assertCanStart(): void {
+    if (!this.#closing) return;
+    throw new NotebookRuntimeManagerError({
+      reason: "runtime-unavailable",
+      message: "Notebook runtime manager is closing.",
+    });
+  }
+
   async #removeProject(project: ProjectRuntime): Promise<void> {
     if (this.#projects.get(project.projectId) !== project) return;
-    const activeRemoval = this.#projectRemovals.get(project.projectId);
+    const ownedContainer = this.#containers.get(project.projectId);
+    if (ownedContainer === undefined || ownedContainer.containerId !== project.containerId) return;
+    return this.#removeContainer(ownedContainer);
+  }
+
+  async #removeContainer(container: OwnedProjectContainer): Promise<void> {
+    const ownedContainer = this.#containers.get(container.projectId);
+    if (ownedContainer === undefined || ownedContainer.containerId !== container.containerId)
+      return;
+    const activeRemoval = this.#projectRemovals.get(container.projectId);
     if (activeRemoval !== undefined) return activeRemoval;
-    const removal = this.#removeProjectOnce(project);
-    this.#projectRemovals.set(project.projectId, removal);
+    const removal = this.#removeContainerOnce(container);
+    this.#projectRemovals.set(container.projectId, removal);
     try {
       await removal;
     } finally {
-      if (this.#projectRemovals.get(project.projectId) === removal) {
-        this.#projectRemovals.delete(project.projectId);
+      if (this.#projectRemovals.get(container.projectId) === removal) {
+        this.#projectRemovals.delete(container.projectId);
       }
     }
   }
 
-  async #removeProjectOnce(project: ProjectRuntime): Promise<void> {
-    await this.#docker.run(["rm", "--force", project.containerId]);
-    if (this.#projects.get(project.projectId) === project) {
-      this.#projects.delete(project.projectId);
+  async #removeContainerOnce(container: OwnedProjectContainer): Promise<void> {
+    await this.#docker.run(["rm", "--force", container.containerId]);
+    const project = this.#projects.get(container.projectId);
+    if (project?.containerId === container.containerId) {
+      this.#projects.delete(container.projectId);
     }
-    await NodeFSP.rm(project.controlDirectory, { force: true, recursive: true }).catch(
+    const ownedContainer = this.#containers.get(container.projectId);
+    if (ownedContainer?.containerId === container.containerId) {
+      this.#containers.delete(container.projectId);
+    }
+    await NodeFSP.rm(container.controlDirectory, { force: true, recursive: true }).catch(
       () => undefined,
     );
   }

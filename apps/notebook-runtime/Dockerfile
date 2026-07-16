@@ -6,14 +6,14 @@ ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONHASHSEED=random \
-    JUPYTER_RUNTIME_DIR=/tmp/jupyter-runtime \
-    IPYTHONDIR=/tmp/ipython \
-    MPLCONFIGDIR=/tmp/matplotlib \
     NOTEBOOK_WORKSPACE_ROOT=/workspace
 
 RUN groupadd --gid 10001 runtime \
     && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin runtime \
-    && install -d -o runtime -g runtime -m 0700 /app /workspace /runtime
+    && groupadd --gid 10002 runtime-control \
+    && useradd --uid 10002 --gid 10002 --no-create-home --shell /usr/sbin/nologin runtime-control \
+    && install -d -o runtime -g runtime -m 0755 /app \
+    && install -d -o runtime -g runtime -m 0700 /workspace
 
 WORKDIR /app
 COPY --chown=runtime:runtime pyproject.toml uv.lock ./

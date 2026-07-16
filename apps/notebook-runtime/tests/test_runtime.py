@@ -116,8 +116,9 @@ class FakeKernelClient:
 
 
 class FakeKernelManager:
-    def __init__(self, kernel_name: str) -> None:
+    def __init__(self, kernel_name: str, connection_file: str | None = None) -> None:
         self.kernel_name = kernel_name
+        self.connection_file = connection_file
         self.client_instance = FakeKernelClient()
         self.started = False
         self.interrupt_count = 0
@@ -131,6 +132,10 @@ class FakeKernelManager:
         self.started = True
         self.cwd = cwd
         self.env = env
+        if self.connection_file is not None:
+            path = __import__("pathlib").Path(self.connection_file)
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path.write_text("connection-secret")
 
     def client(self) -> FakeKernelClient:
         return self.client_instance
@@ -151,6 +156,8 @@ class FakeKernelManager:
         self.restart_count += 1
         self.client_instance.messages.clear()
         self.client_instance.active = False
+        if self.connection_file is not None:
+            __import__("pathlib").Path(self.connection_file).write_text("connection-secret")
 
     async def shutdown_kernel(self, *, now: bool) -> None:
         assert now is True
@@ -162,7 +169,8 @@ class FakeKernelManager:
 def service(tmp_path: Any) -> RuntimeService:
     return RuntimeService(
         kernel_factory=FakeKernelManager,
-        workspace_root=tmp_path,
+        workspace_root=tmp_path / "workspace",
+        runtime_root=tmp_path / "runtime",
         output_limit_bytes=1024,
         execution_timeout_seconds=0.03,
         timeout_idle_grace_seconds=0.03,
@@ -181,7 +189,11 @@ async def test_runtime_token_is_private_and_kernel_environment_is_sanitized(
 ) -> None:
     monkeypatch.setenv("NOTEBOOK_RUNTIME_TOKEN", "kernel-must-not-see-this")
     monkeypatch.setenv("UNSAFE_HOST_SECRET", "kernel-must-not-see-this-either")
-    service = RuntimeService(kernel_factory=FakeKernelManager, workspace_root=tmp_path)
+    service = RuntimeService(
+        kernel_factory=FakeKernelManager,
+        workspace_root=tmp_path / "workspace",
+        runtime_root=tmp_path / "runtime",
+    )
 
     manager, _ = await open_session(service)
 
@@ -198,13 +210,17 @@ async def test_open_failure_shuts_down_started_kernel_and_removes_session(
 ) -> None:
     created: list[FakeKernelManager] = []
 
-    def factory(kernel_name: str) -> FakeKernelManager:
-        manager = FakeKernelManager(kernel_name)
+    def factory(kernel_name: str, connection_file: str | None = None) -> FakeKernelManager:
+        manager = FakeKernelManager(kernel_name, connection_file)
         manager.client_instance.readiness_error = RuntimeError("readiness failed")
         created.append(manager)
         return manager
 
-    service = RuntimeService(kernel_factory=factory, workspace_root=tmp_path)
+    service = RuntimeService(
+        kernel_factory=factory,
+        workspace_root=tmp_path / "workspace",
+        runtime_root=tmp_path / "runtime",
+    )
 
     with pytest.raises(RuntimeError, match="readiness failed"):
         await service.open_session("failed-session", "failed-open")
@@ -213,6 +229,34 @@ async def test_open_failure_shuts_down_started_kernel_and_removes_session(
     assert created[0].started is True
     assert created[0].client_instance.channels_stopped is True
     assert created[0].shutdown_count == 1
+
+
+async def test_sessions_use_unique_removed_connection_files_including_restart(
+    service: RuntimeService,
+) -> None:
+    first, _ = await open_session(service)
+    await service.open_session("session-2", "open-2", "python3")
+    second = service.sessions["session-2"].manager
+    assert isinstance(second, FakeKernelManager)
+
+    assert first.connection_file is not None
+    assert second.connection_file is not None
+    assert first.connection_file != second.connection_file
+    assert __import__("os").path.dirname(first.connection_file) != __import__("os").path.dirname(
+        second.connection_file
+    )
+    assert not __import__("os").path.exists(first.connection_file)
+    assert not __import__("os").path.exists(second.connection_file)
+
+    await service.restart("session-1", "restart-connection-file")
+    assert not __import__("os").path.exists(first.connection_file)
+
+    first_runtime = __import__("pathlib").Path(first.connection_file).parent
+    second_runtime = __import__("pathlib").Path(second.connection_file).parent
+    await service.dispose("session-1", "dispose-connection-file")
+    assert not first_runtime.exists()
+    await service.close()
+    assert not second_runtime.exists()
 
 
 async def test_orders_matching_iopub_messages_through_idle(service: RuntimeService) -> None:
@@ -327,6 +371,34 @@ async def test_duplicate_command_replays_without_executing_twice(service: Runtim
     assert len(rejected) == 1
     assert rejected[0]["type"] == "rejected"
     assert rejected[0]["reason"] == "command-id-conflict"
+
+
+async def test_execution_survives_subscriber_cancellation_and_replays_terminal_events(
+    service: RuntimeService,
+) -> None:
+    manager, _ = await open_session(service)
+    stream = service.execute("session-1", "disconnect", "disconnect-execution", "wait")
+    accepted = await anext(stream)
+    assert accepted["type"] == "accepted"
+    pending = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0.01)
+    pending.cancel()
+    with __import__("contextlib").suppress(asyncio.CancelledError):
+        await pending
+    await stream.aclose()
+
+    await asyncio.sleep(0.1)
+    replay = [
+        event
+        async for event in service.execute(
+            "session-1", "disconnect", "disconnect-execution", "wait"
+        )
+    ]
+
+    assert manager.client_instance.execute_count == 1
+    assert any(
+        event["type"] == "kernel" and event["state"] in {"idle", "terminated"} for event in replay
+    )
 
 
 async def test_interrupt_restart_and_dispose_are_ordered(service: RuntimeService) -> None:
@@ -454,6 +526,21 @@ async def test_api_requires_bearer_authentication(service: RuntimeService) -> No
     assert missing.status_code == wrong.status_code == 401
     assert accepted.status_code == 200
     assert accepted.json()["events"][-1]["state"] == "idle"
+
+
+async def test_bootstrap_token_is_claimed_once_before_sessions_exist(
+    service: RuntimeService,
+) -> None:
+    app = create_app(service=service, token="bootstrap-secret", bootstrap_enabled=True)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runtime") as client:
+        claimed = await client.post("/v1/bootstrap")
+        replay = await client.post("/v1/bootstrap")
+
+    assert claimed.status_code == 200
+    assert claimed.json() == {"token": "bootstrap-secret"}
+    assert replay.status_code == 409
+    assert replay.json() == {"detail": "Bootstrap unavailable."}
 
 
 async def test_execute_api_streams_ndjson(service: RuntimeService) -> None:

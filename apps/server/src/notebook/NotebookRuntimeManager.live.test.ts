@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off globalDate:off - Opt-in Docker test measures real process timing.
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -10,6 +11,7 @@ import * as NodeUtil from "node:util";
 import type { NotebookExecutionEvent } from "@t3tools/contracts";
 import { expect, it } from "vite-plus/test";
 
+import { DockerExecNotebookRuntimeClient } from "./NotebookRuntimeClient.ts";
 import {
   DockerCliCommandRunner,
   type DockerCommandRunner,
@@ -20,17 +22,57 @@ const execFilePromise = NodeUtil.promisify(NodeChildProcess.execFile);
 const liveIt = NodeProcess.env.NOTEBOOK_RUNTIME_LIVE === "1" ? it : it.skip;
 const image = NodeProcess.env.NOTEBOOK_RUNTIME_IMAGE ?? "lightfast/notebook-runtime:task5";
 
+const executeUntilSocketTimeout = async (options: {
+  readonly containerId: string;
+  readonly token: string;
+  readonly body: Readonly<Record<string, string>>;
+}): Promise<string> => {
+  const script = [
+    "import ctypes,http.client,json,socket,sys",
+    "ctypes.CDLL(None).prctl(4,0,0,0,0)",
+    "envelope=json.loads(sys.stdin.buffer.readline())",
+    "body=json.dumps(envelope['body'],separators=(',',':')).encode()",
+    "connection=http.client.HTTPConnection('127.0.0.1',8080,timeout=0.1)",
+    "connection.request('POST','/v1/sessions/live-session/execute',body=body,headers={'Authorization':f\"Bearer {envelope['token']}\",'Content-Type':'application/json'})",
+    "response=connection.getresponse()",
+    "try:",
+    " while line:=response.readline(): sys.stdout.buffer.write(line); sys.stdout.buffer.flush()",
+    "except (TimeoutError,socket.timeout): pass",
+    "finally: response.close(); connection.close()",
+  ].join("\n");
+  const child = NodeChildProcess.spawn(
+    "docker",
+    ["exec", "--interactive", "--user", "10002:10002", options.containerId, "python", "-c", script],
+    { stdio: ["pipe", "pipe", "pipe"] },
+  );
+  child.stdin.end(`${JSON.stringify({ token: options.token, body: options.body })}\n`);
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout.on("data", (chunk: Uint8Array) => stdout.push(Buffer.from(chunk)));
+  child.stderr.on("data", (chunk: Uint8Array) => stderr.push(Buffer.from(chunk)));
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", resolve);
+  });
+  if (exitCode !== 0) throw new Error(Buffer.concat(stderr).toString());
+  return Buffer.concat(stdout).toString();
+};
+
 class FailFirstRemoveDocker implements DockerCommandRunner {
   readonly #delegate = new DockerCliCommandRunner();
   #failRemove = true;
+  removeAttempts = 0;
 
   run(
     args: readonly string[],
     options?: { readonly env?: Readonly<Record<string, string>> },
   ): Promise<{ readonly stdout: string }> {
-    if (args[0] === "rm" && this.#failRemove) {
-      this.#failRemove = false;
-      return Promise.reject(new Error("injected live remove failure"));
+    if (args[0] === "rm") {
+      this.removeAttempts += 1;
+      if (this.#failRemove) {
+        this.#failRemove = false;
+        return Promise.reject(new Error("injected live remove failure"));
+      }
     }
     return this.#delegate.run(args, options);
   }
@@ -41,11 +83,12 @@ const execute = (
   sequence: number,
   code: string,
   commandId = `command-${sequence}`,
+  sessionId = "live-session",
 ) =>
   Array.fromAsync(
     manager.execute({
       projectId: "live-project",
-      sessionId: "live-session",
+      sessionId,
       commandId,
       executionId: `execution-${sequence}`,
       code,
@@ -65,10 +108,20 @@ liveIt(
     const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "notebook-runtime-live-"));
     const bookPath = NodePath.join(root, "book.txt");
     await NodeFSP.writeFile(bookPath, "readonly-book", { mode: 0o444 });
+    let directClient: DockerExecNotebookRuntimeClient | undefined;
+    let directClientOptions: { readonly containerId: string; readonly token: string } | undefined;
     const manager = new NotebookRuntimeManager({
       docker: new FailFirstRemoveDocker(),
       image,
       runtimeRoot: NodePath.join(root, "control"),
+      clientFactory: (options) => {
+        directClientOptions = options;
+        directClient = new DockerExecNotebookRuntimeClient({
+          ...options,
+          requestTimeoutMs: 130_000,
+        });
+        return directClient;
+      },
       readinessTimeoutMs: 30_000,
       executionTimeoutSeconds: 1,
       timeoutIdleGraceSeconds: 2,
@@ -81,18 +134,69 @@ liveIt(
         kernelName: "python3",
         bookPaths: [bookPath],
       });
+      if (directClient === undefined || directClientOptions === undefined) {
+        throw new Error("missing direct runtime client");
+      }
 
       const tokenIsolation = await execute(
         manager,
         0,
-        "import os\nimport urllib.error\nimport urllib.request\ntoken = os.environ.get('NOTEBOOK_RUNTIME_TOKEN')\nprint(f'token-present={token is not None}')\nrequest = urllib.request.Request('http://127.0.0.1:8080/v1/health', headers={'Authorization': f'Bearer {token or \"\"}'})\ntry:\n response = urllib.request.urlopen(request, timeout=1)\n print(f'loopback-status={response.status}')\nexcept urllib.error.HTTPError as error:\n print(f'loopback-status={error.code}')",
+        "import glob\nimport os\nimport urllib.error\nimport urllib.request\ntoken = os.environ.get('NOTEBOOK_RUNTIME_TOKEN')\nprint(f'token-present={token is not None}')\nproc_tokens = 0\nfor path in glob.glob('/proc/[0-9]*/environ'):\n try:\n  proc_tokens += int(b'NOTEBOOK_RUNTIME_TOKEN=' in open(path, 'rb').read())\n except OSError:\n  pass\nprint(f'proc-token-count={proc_tokens}')\nrequest = urllib.request.Request('http://127.0.0.1:8080/v1/health', headers={'Authorization': f'Bearer {token or \"\"}'})\ntry:\n response = urllib.request.urlopen(request, timeout=1)\n print(f'loopback-status={response.status}')\nexcept urllib.error.HTTPError as error:\n print(f'loopback-status={error.code}')",
         "token-isolation-live",
       );
       const tokenOutput = tokenIsolation
         .filter((event) => event.type === "stream")
         .map((event) => (event.type === "stream" ? event.text : ""))
         .join("");
-      expect(tokenOutput).toContain("token-present=False\nloopback-status=401\n");
+      expect(tokenOutput).toContain(
+        "token-present=False\nproc-token-count=0\nloopback-status=401\n",
+      );
+
+      await manager.open({
+        projectId: "live-project",
+        sessionId: "sibling-session",
+        commandId: "open-sibling",
+        kernelName: "python3",
+      });
+      await execute(manager, 45, "sibling_secret = 'private'", "sibling-state", "sibling-session");
+      expect(textResult(await execute(manager, 46, "'sibling_secret' in globals()"))).toBe("False");
+      const connectionIsolation = await execute(
+        manager,
+        47,
+        "import glob, os\npaths=[]\nfor path in glob.glob('/proc/[0-9]*/cmdline'):\n try:\n  parts=open(path,'rb').read().split(b'\\0')\n  if b'-f' in parts:\n   index=parts.index(b'-f')\n   if index + 1 < len(parts): paths.append(parts[index + 1].decode())\n except OSError:\n  pass\npaths=sorted(set(paths))\nprint(f'connection-count={len(paths)}')\nprint(f'runtime-dir-count={len(set(map(os.path.dirname, paths)))}')\nprint(f'readable-connections={sum(os.path.isfile(path) and os.access(path, os.R_OK) for path in paths)}')",
+        "connection-isolation",
+      );
+      const connectionOutput = connectionIsolation
+        .filter((event) => event.type === "stream")
+        .map((event) => (event.type === "stream" ? event.text : ""))
+        .join("");
+      expect(connectionOutput).toContain(
+        "connection-count=2\nruntime-dir-count=2\nreadable-connections=0\n",
+      );
+
+      const beforeDisconnect = await directClient.eventsAfter("live-session", 0);
+      const afterSequence = beforeDisconnect.at(-1)?.sequence ?? 0;
+      const disconnectRequest = {
+        sessionId: "live-session",
+        commandId: "disconnect-live",
+        executionId: "disconnect-execution",
+        code: "import time\ntime.sleep(0.6)\ndisconnect_counter = globals().get('disconnect_counter', 0) + 1\ndisconnect_counter",
+      } as const;
+      const disconnectedOutput = await executeUntilSocketTimeout({
+        ...directClientOptions,
+        body: disconnectRequest,
+      });
+      expect(disconnectedOutput).toContain('"commandId":"disconnect-live"');
+      await NodeTimersPromises.setTimeout(900);
+      const recoveredEvents = await directClient.eventsAfter("live-session", afterSequence);
+      expect(recoveredEvents).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ commandId: "disconnect-live", type: "result" }),
+          expect.objectContaining({ commandId: "disconnect-live", type: "kernel", state: "idle" }),
+        ]),
+      );
+      const replayedDisconnect = await Array.fromAsync(directClient.execute(disconnectRequest));
+      expect(textResult(replayedDisconnect)).toBe("1");
 
       await execute(manager, 1, "value = 40");
       expect(textResult(await execute(manager, 2, "value + 2"))).toBe("42");
@@ -242,6 +346,29 @@ liveIt(
       expect(mounts[0]?.Source).toBe(bookPath);
       expect(mounts.some((mount) => /docker\.sock|workspace/i.test(mount.Source))).toBe(false);
 
+      const { stdout: configuredEnvironment } = await execFilePromise("docker", [
+        "inspect",
+        "--format",
+        "{{json .Config.Env}}",
+        containerId.trim(),
+      ]);
+      expect(JSON.parse(configuredEnvironment) as string[]).not.toEqual(
+        expect.arrayContaining([expect.stringMatching(/^NOTEBOOK_RUNTIME_TOKEN=/)]),
+      );
+      const bootstrapReplay = await execFilePromise("docker", [
+        "exec",
+        "--user",
+        "10002:10002",
+        containerId.trim(),
+        "python",
+        "-m",
+        "runtime",
+        "bootstrap",
+      ]).catch((error: unknown) => error);
+      expect(bootstrapReplay).toBeInstanceOf(Error);
+      expect(String(bootstrapReplay)).toContain("bootstrap unavailable");
+      expect(String(bootstrapReplay)).not.toContain("NOTEBOOK_RUNTIME_TOKEN");
+
       await expect(manager.close()).rejects.toThrow("injected live remove failure");
       await expect(
         execFilePromise("docker", ["inspect", containerId.trim()]),
@@ -268,6 +395,95 @@ liveIt(
         "-aq",
         "--filter",
         "label=lightfast.notebook.project=5b5cd5d2405ffcf3",
+      ]);
+      if (leakedContainers.trim()) {
+        await execFilePromise("docker", ["rm", "--force", ...leakedContainers.trim().split(/\s+/)]);
+      }
+      await NodeFSP.rm(root, { force: true, recursive: true });
+    }
+  },
+  60_000,
+);
+
+liveIt(
+  "retains and removes a live container when close races startup cleanup",
+  async () => {
+    const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "notebook-start-race-"));
+    const projectLabel = NodeCrypto.createHash("sha256")
+      .update("live-startup-race")
+      .digest("hex")
+      .slice(0, 16);
+    const docker = new FailFirstRemoveDocker();
+    let markHealthStarted!: () => void;
+    let releaseHealth!: () => void;
+    const healthStarted = new Promise<void>((resolve) => {
+      markHealthStarted = resolve;
+    });
+    const healthReleased = new Promise<void>((resolve) => {
+      releaseHealth = resolve;
+    });
+    const manager = new NotebookRuntimeManager({
+      docker,
+      image,
+      runtimeRoot: NodePath.join(root, "control"),
+      readinessTimeoutMs: 30_000,
+      clientFactory: (options) => {
+        const client = new DockerExecNotebookRuntimeClient({
+          ...options,
+          requestTimeoutMs: 130_000,
+        });
+        return {
+          health: async () => {
+            markHealthStarted();
+            await healthReleased;
+            await client.health();
+          },
+          open: (input) => client.open(input),
+          execute: (input) => client.execute(input),
+          interrupt: (input) => client.interrupt(input),
+          restart: (input) => client.restart(input),
+          dispose: (input) => client.dispose(input),
+          eventsAfter: (sessionId, afterSequence) => client.eventsAfter(sessionId, afterSequence),
+        };
+      },
+    });
+    try {
+      const opening = manager
+        .open({
+          projectId: "live-startup-race",
+          sessionId: "live-session",
+          commandId: "open-live",
+          kernelName: "python3",
+        })
+        .catch((error: unknown) => error);
+      await healthStarted;
+      let closeSettled = false;
+      const closing = manager.close().then(() => {
+        closeSettled = true;
+      });
+      await NodeTimersPromises.setTimeout(25);
+      const settledBeforeRelease = closeSettled;
+      releaseHealth();
+
+      expect(await opening).toMatchObject({ reason: "runtime-unavailable" });
+      await closing;
+      expect(settledBeforeRelease).toBe(false);
+      expect(docker.removeAttempts).toBe(2);
+      const { stdout: remainingContainers } = await execFilePromise("docker", [
+        "ps",
+        "-aq",
+        "--filter",
+        `label=lightfast.notebook.project=${projectLabel}`,
+      ]);
+      expect(remainingContainers.trim()).toBe("");
+    } finally {
+      releaseHealth();
+      await manager.close().catch(() => undefined);
+      const { stdout: leakedContainers } = await execFilePromise("docker", [
+        "ps",
+        "-aq",
+        "--filter",
+        `label=lightfast.notebook.project=${projectLabel}`,
       ]);
       if (leakedContainers.trim()) {
         await execFilePromise("docker", ["rm", "--force", ...leakedContainers.trim().split(/\s+/)]);

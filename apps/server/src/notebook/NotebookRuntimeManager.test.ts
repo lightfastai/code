@@ -42,7 +42,14 @@ class FakeDocker implements DockerCommandRunner {
       this.removeFailures -= 1;
       throw new Error("injected remove failure");
     }
-    return { stdout: args[0] === "run" ? "container-id\n" : "" };
+    return {
+      stdout:
+        args[0] === "run"
+          ? "container-id\n"
+          : args[0] === "exec"
+            ? "fake-bootstrap-token-with-sufficient-entropy\n"
+            : "",
+    };
   }
 }
 
@@ -134,6 +141,40 @@ class FakeRuntimeClient implements NotebookRuntimeClientLike {
   }
 }
 
+class FailingHealthRuntimeClient extends FakeRuntimeClient {
+  override async health(): Promise<void> {
+    this.healthCount += 1;
+    throw new Error("injected readiness failure");
+  }
+}
+
+class DeferredHealthRuntimeClient extends FakeRuntimeClient {
+  readonly healthStarted: Promise<void>;
+  readonly #markHealthStarted: () => void;
+  readonly #healthReleased: Promise<void>;
+  readonly releaseHealth: () => void;
+
+  constructor() {
+    super();
+    let markHealthStarted!: () => void;
+    let releaseHealth!: () => void;
+    this.healthStarted = new Promise((resolve) => {
+      markHealthStarted = resolve;
+    });
+    this.#healthReleased = new Promise((resolve) => {
+      releaseHealth = resolve;
+    });
+    this.#markHealthStarted = markHealthStarted;
+    this.releaseHealth = releaseHealth;
+  }
+
+  override async health(): Promise<void> {
+    this.healthCount += 1;
+    this.#markHealthStarted();
+    await this.#healthReleased;
+  }
+}
+
 class PartialFailureRuntimeClient extends FakeRuntimeClient {
   readonly recoveryMode: "events" | "replay";
   eventsAfterCount = 0;
@@ -205,6 +246,8 @@ const makeHarness = async (options?: {
   readonly eventHistoryLimitBytes?: number;
   readonly commandCacheLimitBytes?: number;
   readonly createClient?: () => FakeRuntimeClient;
+  readonly now?: () => number;
+  readonly readinessTimeoutMs?: number;
 }) => {
   const runtimeRoot = await NodeFSP.mkdtemp(
     NodePath.join(NodeOS.tmpdir(), "notebook-manager-test-"),
@@ -222,9 +265,9 @@ const makeHarness = async (options?: {
       clients.push(client);
       return client;
     },
-    now: () => now,
+    now: options?.now ?? (() => now),
     idleTimeoutMs: options?.idleTimeoutMs ?? 60_000,
-    readinessTimeoutMs: 50,
+    readinessTimeoutMs: options?.readinessTimeoutMs ?? 50,
     ...(options?.eventHistoryLimitBytes === undefined
       ? {}
       : { eventHistoryLimitBytes: options.eventHistoryLimitBytes }),
@@ -279,8 +322,24 @@ it("uses one hardened project container for separate notebook sessions", async (
       (arg) => arg.includes("src=/safe/books/physics.pdf") && arg.includes("readonly"),
     ),
   ).toBe(true);
-  expect(run?.env?.NOTEBOOK_RUNTIME_TOKEN).toBeTruthy();
-  expect(run?.args.join(" ")).not.toContain(String(run?.env?.NOTEBOOK_RUNTIME_TOKEN));
+  expect(run?.env?.NOTEBOOK_RUNTIME_TOKEN).toBeUndefined();
+  expect(run?.args).not.toContain("NOTEBOOK_RUNTIME_TOKEN");
+  expect(docker.calls).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        args: [
+          "exec",
+          "--user",
+          "10002:10002",
+          "container-id",
+          "python",
+          "-m",
+          "runtime",
+          "bootstrap",
+        ],
+      }),
+    ]),
+  );
   await manager.close();
 });
 
@@ -404,6 +463,61 @@ it("keeps failed container cleanup tracked so close can retry", async () => {
   expect(
     docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id"),
   ).toHaveLength(2);
+});
+
+it("retains startup container ownership when readiness and initial removal both fail", async () => {
+  let clock = 0;
+  const client = new FailingHealthRuntimeClient();
+  const { docker, manager } = await makeHarness({
+    createClient: () => client,
+    now: () => (clock += 100),
+  });
+  docker.removeFailures = 1;
+
+  await expect(
+    manager.open({
+      projectId: "project-startup-failure",
+      sessionId: "session-1",
+      commandId: "open-1",
+      kernelName: "python3",
+    }),
+  ).rejects.toMatchObject({ reason: "runtime-unavailable" });
+  await manager.close();
+
+  expect(
+    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id"),
+  ).toHaveLength(2);
+});
+
+it("close waits for a racing project start and prevents it from being published", async () => {
+  const client = new DeferredHealthRuntimeClient();
+  const { docker, manager } = await makeHarness({ createClient: () => client });
+  const opening = manager
+    .open({
+      projectId: "project-close-race",
+      sessionId: "session-1",
+      commandId: "open-1",
+      kernelName: "python3",
+    })
+    .catch((error: unknown) => error);
+  await client.healthStarted;
+
+  let closeSettled = false;
+  const closing = manager.close().then(() => {
+    closeSettled = true;
+  });
+  await Promise.resolve();
+  const settledBeforeRelease = closeSettled;
+  client.releaseHealth();
+  const openResult = await opening;
+  await closing;
+  await manager.close().catch(() => undefined);
+
+  expect(settledBeforeRelease).toBe(false);
+  expect(openResult).toMatchObject({ reason: "runtime-unavailable" });
+  expect(
+    docker.calls.filter((call) => call.args.join(" ") === "rm --force container-id"),
+  ).toHaveLength(1);
 });
 
 it("reconciles a partial stream once for concurrent duplicates without repeating effects", async () => {
