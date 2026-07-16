@@ -1,0 +1,27 @@
+{
+  "name": "@t3tools/lightfast-artifact-notebook",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./contracts": {
+      "types": "./src/contracts.ts",
+      "import": "./src/contracts.ts"
+    },
+    "./nbformat": {
+      "types": "./src/nbformat.ts",
+      "import": "./src/nbformat.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsgo --noEmit",
+    "test": "vp test run"
+  },
+  "dependencies": {
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/platform-node": "catalog:",
+    "@effect/vitest": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}

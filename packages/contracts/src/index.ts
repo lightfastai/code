@@ -23,6 +23,7 @@ export * from "./project.ts";
 export * from "./filesystem.ts";
 export * from "./assets.ts";
 export * from "./artifacts.ts";
+export * from "./notebook.ts";
 export * from "./study.ts";
 export * from "./studyLoop.ts";
 export * from "./review.ts";

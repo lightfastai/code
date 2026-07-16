@@ -144,6 +144,17 @@ import {
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
 import {
+  NotebookRevisionCreateInput,
+  NotebookRevisionExportResult,
+  NotebookRevisionImportInput,
+  NotebookRevisionRef,
+  NotebookRevisionSaveInput,
+} from "./notebook.ts";
+import {
+  NotebookRevision,
+  NotebookRevisionError,
+} from "@t3tools/lightfast-artifact-notebook/contracts";
+import {
   StudyLibraryListInput,
   StudyLibraryListResult,
   StudyLibraryRequestError,
@@ -175,6 +186,13 @@ export const WS_METHODS = {
   studyLibraryList: "study.library.list",
   studyLibrarySearch: "study.library.search",
   studyVoiceSessionCreate: "study.voice.session.create",
+
+  // Immutable notebook revision methods
+  notebookRevisionCreate: "notebook.revision.create",
+  notebookRevisionRead: "notebook.revision.read",
+  notebookRevisionSave: "notebook.revision.save",
+  notebookRevisionImport: "notebook.revision.import",
+  notebookRevisionExport: "notebook.revision.export",
 
   // VCS methods
   vcsPull: "vcs.pull",
@@ -426,6 +444,36 @@ export const WsStudyVoiceSessionCreateRpc = Rpc.make(WS_METHODS.studyVoiceSessio
   payload: StudyVoiceSessionInput,
   success: StudyVoiceSessionResult,
   error: Schema.Union([StudyVoiceSessionError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookRevisionCreateRpc = Rpc.make(WS_METHODS.notebookRevisionCreate, {
+  payload: NotebookRevisionCreateInput,
+  success: NotebookRevision,
+  error: Schema.Union([NotebookRevisionError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookRevisionReadRpc = Rpc.make(WS_METHODS.notebookRevisionRead, {
+  payload: NotebookRevisionRef,
+  success: NotebookRevision,
+  error: Schema.Union([NotebookRevisionError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookRevisionSaveRpc = Rpc.make(WS_METHODS.notebookRevisionSave, {
+  payload: NotebookRevisionSaveInput,
+  success: NotebookRevision,
+  error: Schema.Union([NotebookRevisionError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookRevisionImportRpc = Rpc.make(WS_METHODS.notebookRevisionImport, {
+  payload: NotebookRevisionImportInput,
+  success: NotebookRevision,
+  error: Schema.Union([NotebookRevisionError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookRevisionExportRpc = Rpc.make(WS_METHODS.notebookRevisionExport, {
+  payload: NotebookRevisionRef,
+  success: NotebookRevisionExportResult,
+  error: Schema.Union([NotebookRevisionError, EnvironmentAuthorizationError]),
 });
 
 export const WsSubscribeVcsStatusRpc = Rpc.make(WS_METHODS.subscribeVcsStatus, {
@@ -742,6 +790,11 @@ export const WsRpcGroup = RpcGroup.make(
   WsStudyLibraryListRpc,
   WsStudyLibrarySearchRpc,
   WsStudyVoiceSessionCreateRpc,
+  WsNotebookRevisionCreateRpc,
+  WsNotebookRevisionReadRpc,
+  WsNotebookRevisionSaveRpc,
+  WsNotebookRevisionImportRpc,
+  WsNotebookRevisionExportRpc,
   WsSubscribeVcsStatusRpc,
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,
