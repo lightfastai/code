@@ -32,7 +32,6 @@ import {
   type OrchestrationShellStreamEvent,
   type OrchestrationShellStreamItem,
   type OrchestrationThreadStreamItem,
-  type ProjectId,
   OrchestrationGetFullThreadDiffError,
   OrchestrationGetSnapshotError,
   OrchestrationGetTurnDiffError,
@@ -62,7 +61,6 @@ import {
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
-import { NotebookRevisionError } from "@t3tools/lightfast-artifact-notebook/contracts";
 import { clamp } from "effect/Number";
 import { HttpRouter, HttpServerRequest, HttpServerRespondable } from "effect/unstable/http";
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
@@ -122,6 +120,7 @@ import { readStudyLibraryIndex, resolveStudyLibraryPaths } from "./study/StudyLi
 import { searchStudyLibrary } from "./study/StudySearch.ts";
 import { createStudyVoiceSession } from "./study/StudyVoiceSession.ts";
 import * as NotebookRevisionStore from "./notebook/NotebookRevisionStore.ts";
+import { makeNotebookRevisionRpcHandlers } from "./notebook/NotebookRevisionRpc.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 const isStudyVoiceSessionError = Schema.is(StudyVoiceSessionError);
 
@@ -320,11 +319,6 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.studyLibraryList, AuthOrchestrationReadScope],
   [WS_METHODS.studyLibrarySearch, AuthOrchestrationReadScope],
   [WS_METHODS.studyVoiceSessionCreate, AuthOrchestrationOperateScope],
-  [WS_METHODS.notebookRevisionCreate, AuthOrchestrationOperateScope],
-  [WS_METHODS.notebookRevisionRead, AuthOrchestrationReadScope],
-  [WS_METHODS.notebookRevisionSave, AuthOrchestrationOperateScope],
-  [WS_METHODS.notebookRevisionImport, AuthOrchestrationOperateScope],
-  [WS_METHODS.notebookRevisionExport, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeVcsStatus, AuthOrchestrationReadScope],
   [WS_METHODS.vcsRefreshStatus, AuthOrchestrationReadScope],
   [WS_METHODS.vcsPull, AuthOrchestrationOperateScope],
@@ -529,33 +523,6 @@ const makeWsRpcLayer = (
       const serverEventId = randomUUID.pipe(Effect.map(EventId.make));
       const serverCommandId = (tag: string) =>
         randomUUID.pipe(Effect.map((uuid) => CommandId.make(`server:${tag}:${uuid}`)));
-
-      const validateNotebookScope = Effect.fn("NotebookRevisionRpc.validateScope")(
-        function* (scope: { readonly environmentId: string; readonly projectId: ProjectId }) {
-          const environmentId = yield* serverEnvironment.getEnvironmentId;
-          if (scope.environmentId !== environmentId) {
-            return yield* new NotebookRevisionError({
-              reason: "scope-mismatch",
-              message: "The notebook request is scoped to a different environment.",
-            });
-          }
-          const project = yield* projectionSnapshotQuery.getProjectShellById(scope.projectId).pipe(
-            Effect.mapError(
-              () =>
-                new NotebookRevisionError({
-                  reason: "storage-failed",
-                  message: "Could not validate the notebook project scope.",
-                }),
-            ),
-          );
-          if (Option.isNone(project)) {
-            return yield* new NotebookRevisionError({
-              reason: "project-not-found",
-              message: "The notebook project does not exist in this environment.",
-            });
-          }
-        },
-      );
 
       const loadAuthAccessSnapshot = () =>
         Effect.all({
@@ -987,6 +954,17 @@ const makeWsRpcLayer = (
         vcsStatusBroadcaster
           .refreshStatus(cwd)
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
+
+      const notebookRevisionRpcHandlers = makeNotebookRevisionRpcHandlers({
+        scopes: currentSession.scopes,
+        environmentId: serverEnvironment.getEnvironmentId,
+        projectExists: (projectId) =>
+          projectionSnapshotQuery.getProjectShellById(projectId).pipe(Effect.map(Option.isSome)),
+        randomUUID: crypto.randomUUIDv4,
+        store: notebookRevisionStore,
+        observe: (method, effect) =>
+          instrumentRpcEffect(method, effect, { "rpc.aggregate": "notebook" }),
+      });
 
       return WsRpcGroup.of({
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
@@ -1620,84 +1598,7 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "study" },
           ),
-        [WS_METHODS.notebookRevisionCreate]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.notebookRevisionCreate,
-            Effect.gen(function* () {
-              yield* validateNotebookScope(input.scope);
-              const documentUuid = yield* crypto.randomUUIDv4.pipe(
-                Effect.mapError(
-                  () =>
-                    new NotebookRevisionError({
-                      reason: "storage-failed",
-                      message: "Could not generate a notebook document ID.",
-                    }),
-                ),
-              );
-              return yield* notebookRevisionStore.save({
-                scope: input.scope,
-                documentId: `notebook-${documentUuid}`,
-                notebook: {
-                  nbformat: 4,
-                  nbformat_minor: 5,
-                  metadata: {
-                    kernelspec: {
-                      name: input.kernel.name,
-                      display_name: input.kernel.displayName,
-                      language: input.kernel.language,
-                    },
-                    ...(input.title === undefined ? {} : { lightfast: { title: input.title } }),
-                  },
-                  cells: [],
-                },
-              });
-            }),
-            { "rpc.aggregate": "notebook" },
-          ),
-        [WS_METHODS.notebookRevisionRead]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.notebookRevisionRead,
-            Effect.gen(function* () {
-              yield* validateNotebookScope(input.scope);
-              return yield* notebookRevisionStore.read(input);
-            }),
-            { "rpc.aggregate": "notebook" },
-          ),
-        [WS_METHODS.notebookRevisionSave]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.notebookRevisionSave,
-            Effect.gen(function* () {
-              yield* validateNotebookScope(input.scope);
-              return yield* notebookRevisionStore.save({
-                scope: input.scope,
-                documentId: input.documentId,
-                notebook: input.document,
-              });
-            }),
-            { "rpc.aggregate": "notebook" },
-          ),
-        [WS_METHODS.notebookRevisionImport]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.notebookRevisionImport,
-            Effect.gen(function* () {
-              yield* validateNotebookScope(input.scope);
-              return yield* notebookRevisionStore.importIpynb(input);
-            }),
-            { "rpc.aggregate": "notebook" },
-          ),
-        [WS_METHODS.notebookRevisionExport]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.notebookRevisionExport,
-            Effect.gen(function* () {
-              yield* validateNotebookScope(input.scope);
-              return {
-                fileName: `notebook-${input.documentId.slice(0, 128)}.ipynb`,
-                contentType: "application/x-ipynb+json" as const,
-                ipynbJson: yield* notebookRevisionStore.exportIpynb(input),
-              };
-            }),
-            { "rpc.aggregate": "notebook" },
-          ),
+        ...notebookRevisionRpcHandlers,
         [WS_METHODS.subscribeVcsStatus]: (input) =>
           observeRpcStream(
             WS_METHODS.subscribeVcsStatus,

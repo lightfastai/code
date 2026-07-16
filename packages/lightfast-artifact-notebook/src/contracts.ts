@@ -7,6 +7,17 @@ export const NOTEBOOK_CELL_SOURCE_MAX_BYTES = 1024 * 1024;
 export const NOTEBOOK_OUTPUT_MAX_BYTES = 8 * 1024 * 1024;
 export const NOTEBOOK_MAX_OUTPUTS_PER_CELL = 1_000;
 export const NOTEBOOK_DOCUMENT_MAX_BYTES = 64 * 1024 * 1024;
+export const NOTEBOOK_MAX_MIME_BUNDLE_ENTRIES = 64;
+export const NOTEBOOK_MIME_KEY_MAX_LENGTH = 255;
+export const NOTEBOOK_MIME_VALUE_MAX_BYTES = NOTEBOOK_OUTPUT_MAX_BYTES;
+
+const utf8Encoder = new TextEncoder();
+const serializedJsonSize = (maxBytes: number, label: string) =>
+  Schema.makeFilter<Schema.Json>(
+    (value) =>
+      utf8Encoder.encode(JSON.stringify(value)).byteLength <= maxBytes ||
+      `${label} must not exceed ${maxBytes} bytes.`,
+  );
 
 const NonEmptyString = Schema.String.check(Schema.isNonEmpty());
 const ShortNonEmptyString = NonEmptyString.check(Schema.isMaxLength(255));
@@ -61,18 +72,21 @@ export const NotebookCellMetadata = Schema.Struct({
 });
 export type NotebookCellMetadata = typeof NotebookCellMetadata.Type;
 
-export const NotebookMimeBundle = Schema.Struct({
-  "text/plain": Schema.optional(Schema.String),
-  "text/markdown": Schema.optional(Schema.String),
-  "text/html": Schema.optional(Schema.String),
-  "image/png": Schema.optional(Schema.String),
-  "image/svg+xml": Schema.optional(Schema.String),
-  "application/json": Schema.optional(Schema.Json),
-  "application/vnd.dataresource+json": Schema.optional(Schema.Json),
-  "application/vnd.plotly.v1+json": Schema.optional(Schema.Json),
-  "application/vnd.vega.v5+json": Schema.optional(Schema.Json),
-  "application/vnd.vegalite.v5+json": Schema.optional(Schema.Json),
-});
+export const NotebookMimeType = Schema.String.check(
+  Schema.isMaxLength(NOTEBOOK_MIME_KEY_MAX_LENGTH),
+  Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/),
+);
+export type NotebookMimeType = typeof NotebookMimeType.Type;
+
+export const NotebookMimeValue = Schema.Json.check(
+  serializedJsonSize(NOTEBOOK_MIME_VALUE_MAX_BYTES, "Notebook MIME value"),
+);
+export type NotebookMimeValue = typeof NotebookMimeValue.Type;
+
+export const NotebookMimeBundle = Schema.Record(NotebookMimeType, NotebookMimeValue).check(
+  Schema.isMaxProperties(NOTEBOOK_MAX_MIME_BUNDLE_ENTRIES),
+  serializedJsonSize(NOTEBOOK_OUTPUT_MAX_BYTES, "Notebook MIME bundle"),
+);
 export type NotebookMimeBundle = typeof NotebookMimeBundle.Type;
 
 export const NotebookStreamOutput = Schema.Struct({
@@ -106,7 +120,7 @@ export const NotebookOutput = Schema.Union([
   NotebookDisplayOutput,
   NotebookExecutionResultOutput,
   NotebookErrorOutput,
-]);
+]).check(serializedJsonSize(NOTEBOOK_OUTPUT_MAX_BYTES, "Notebook output"));
 export type NotebookOutput = typeof NotebookOutput.Type;
 
 export const NotebookMarkdownCell = Schema.Struct({

@@ -15,9 +15,15 @@ import * as Schema from "effect/Schema";
 
 import * as ServerConfig from "../config.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
-import { NotebookRevisionStore, layer } from "./NotebookRevisionStore.ts";
+import {
+  NotebookRevisionStore,
+  layer,
+  resolveNotebookImportDocumentId,
+} from "./NotebookRevisionStore.ts";
 
 const decodeNotebookJson = Schema.decodeUnknownEffect(Schema.fromJsonString(NotebookDocument));
+const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
 const scope = {
   environmentId: EnvironmentId.make("environment-notebook-test"),
@@ -56,6 +62,27 @@ const testLayer = layer.pipe(
 );
 
 it.layer(testLayer)("NotebookRevisionStore", (it) => {
+  it.effect("does not evaluate UUID generation when an import already has a document ID", () =>
+    Effect.gen(function* () {
+      const unexpectedUuid = Effect.die("UUID generation must stay lazy");
+
+      assert.strictEqual(
+        yield* resolveNotebookImportDocumentId(
+          { documentId: "explicit-document", sourceDocumentId: "source-document" },
+          unexpectedUuid,
+        ),
+        "explicit-document",
+      );
+      assert.strictEqual(
+        yield* resolveNotebookImportDocumentId(
+          { documentId: undefined, sourceDocumentId: "source-document" },
+          unexpectedUuid,
+        ),
+        "source-document",
+      );
+    }),
+  );
+
   it.effect("round-trips revisions and treats duplicate saves as immutable idempotent writes", () =>
     Effect.gen(function* () {
       const store = yield* NotebookRevisionStore;
@@ -124,6 +151,95 @@ it.layer(testLayer)("NotebookRevisionStore", (it) => {
       });
 
       assert.deepStrictEqual(yield* decodeNotebookJson(exported), imported.document);
+    }),
+  );
+
+  it.effect("preserves supported and unsupported MIME entries through import and export", () =>
+    Effect.gen(function* () {
+      const store = yield* NotebookRevisionStore;
+      const imported = yield* store.importIpynb({
+        scope,
+        documentId: "document-mime-round-trip",
+        ipynbJson: encodeUnknownJson({
+          ...notebook(),
+          cells: [
+            {
+              cell_type: "code",
+              id: "mime-cell",
+              metadata: {},
+              source: "display(value)",
+              execution_count: 1,
+              outputs: [
+                {
+                  output_type: "execute_result",
+                  execution_count: 1,
+                  metadata: {},
+                  data: {
+                    "text/plain": ["supported", "\n"],
+                    "application/json": { supported: true },
+                    "application/vnd.example.widget+json": {
+                      unsupported: ["but", "preserved"],
+                    },
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+      });
+      const exported = yield* store.exportIpynb({
+        scope,
+        documentId: imported.documentId,
+        revisionId: imported.revisionId,
+      });
+      const parsed = (yield* decodeUnknownJson(exported)) as {
+        readonly cells: ReadonlyArray<{
+          readonly outputs?: ReadonlyArray<{
+            readonly data?: Readonly<Record<string, unknown>>;
+          }>;
+        }>;
+      };
+      const data = parsed.cells[0]?.outputs?.[0]?.data;
+
+      assert.strictEqual(data?.["text/plain"], "supported\n");
+      assert.deepStrictEqual(data?.["application/json"], { supported: true });
+      assert.deepStrictEqual(data?.["application/vnd.example.widget+json"], {
+        unsupported: ["but", "preserved"],
+      });
+    }),
+  );
+
+  it.effect("saves and reads a canonical notebook at the maximum cell cardinality", () =>
+    Effect.gen(function* () {
+      const store = yield* NotebookRevisionStore;
+      const duplicateId = "z".repeat(64);
+      const saved = yield* store.save({
+        scope,
+        documentId: "document-max-cells",
+        notebook: {
+          ...notebook(),
+          cells: Array.from({ length: 1_000 }, (_, index) => ({
+            cell_type: "markdown",
+            id: duplicateId,
+            metadata: {},
+            source: `cell ${index}`,
+          })),
+        },
+      });
+      const loaded = yield* store.read({
+        scope,
+        documentId: saved.documentId,
+        revisionId: saved.revisionId,
+      });
+      const ids = loaded.document.cells.map((cell) => cell.id);
+
+      assert.strictEqual(ids.length, 1_000);
+      assert.strictEqual(new Set(ids).size, ids.length);
+      assert.strictEqual(
+        canonicalNotebookJson(loaded.document),
+        canonicalNotebookJson(saved.document),
+      );
+      assert.isTrue(ids.every((id) => id.length <= 64));
     }),
   );
 

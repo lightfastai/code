@@ -6,7 +6,10 @@ import {
   NOTEBOOK_CELL_SOURCE_MAX_BYTES,
   NOTEBOOK_DOCUMENT_MAX_BYTES,
   NOTEBOOK_MAX_CELLS,
+  NOTEBOOK_MAX_MIME_BUNDLE_ENTRIES,
   NOTEBOOK_MAX_OUTPUTS_PER_CELL,
+  NOTEBOOK_MIME_KEY_MAX_LENGTH,
+  NOTEBOOK_MIME_VALUE_MAX_BYTES,
   NOTEBOOK_NBFORMAT_MAJOR,
   NOTEBOOK_NBFORMAT_MINOR,
   NOTEBOOK_OUTPUT_MAX_BYTES,
@@ -22,6 +25,7 @@ import {
 
 const decodeJsonString = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeJson = Schema.decodeUnknownEffect(Schema.Json);
+const encodeJsonString = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 const isNotebookRevisionError = (value: unknown): value is NotebookRevisionError =>
   typeof value === "object" &&
   value !== null &&
@@ -123,13 +127,6 @@ const normalizeCellMetadata = (input: unknown): NotebookCellMetadata | NotebookR
   return metadata;
 };
 
-const JSON_MIME_TYPES = [
-  "application/json",
-  "application/vnd.dataresource+json",
-  "application/vnd.plotly.v1+json",
-  "application/vnd.vega.v5+json",
-  "application/vnd.vegalite.v5+json",
-] as const;
 const TEXT_MIME_TYPES = [
   "text/plain",
   "text/markdown",
@@ -137,24 +134,45 @@ const TEXT_MIME_TYPES = [
   "image/png",
   "image/svg+xml",
 ] as const;
+const TEXT_MIME_TYPE_SET = new Set<string>(TEXT_MIME_TYPES);
+const MIME_TYPE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/;
 
 const normalizeMimeBundle = Effect.fn("Notebook.normalizeMimeBundle")(function* (input: unknown) {
   const record = asRecord(input, "Notebook output data");
   if (isNotebookRevisionError(record)) return yield* record;
-  const bundle: Record<string, Schema.Json> = {};
-  for (const mime of TEXT_MIME_TYPES) {
-    if (record[mime] === undefined) continue;
-    const value = textValue(record[mime], `Notebook MIME value ${mime}`);
-    if (isNotebookRevisionError(value)) return yield* value;
-    bundle[mime] = value;
-  }
-  for (const mime of JSON_MIME_TYPES) {
-    if (record[mime] === undefined) continue;
-    bundle[mime] = yield* decodeJson(record[mime]).pipe(
-      Effect.mapError(() => invalidNotebook(`Notebook MIME value ${mime} must be JSON.`)),
+  const entries = Object.entries(record);
+  if (entries.length > NOTEBOOK_MAX_MIME_BUNDLE_ENTRIES) {
+    return yield* limitExceeded(
+      `Notebook MIME bundle exceeds the ${NOTEBOOK_MAX_MIME_BUNDLE_ENTRIES} entry limit.`,
     );
   }
-  return bundle as NotebookMimeBundle;
+  const bundle: Record<string, Schema.Json> = {};
+  for (const [mime, inputValue] of entries) {
+    if (mime.length > NOTEBOOK_MIME_KEY_MAX_LENGTH || !MIME_TYPE_PATTERN.test(mime)) {
+      return yield* invalidNotebook(`Notebook MIME type ${mime} is invalid.`);
+    }
+    const value = TEXT_MIME_TYPE_SET.has(mime)
+      ? textValue(inputValue, `Notebook MIME value ${mime}`)
+      : yield* decodeJson(inputValue).pipe(
+          Effect.mapError(() => invalidNotebook(`Notebook MIME value ${mime} must be JSON.`)),
+        );
+    if (isNotebookRevisionError(value)) return yield* value;
+    if (utf8Encoder.encode(encodeJsonString(value)).byteLength > NOTEBOOK_MIME_VALUE_MAX_BYTES) {
+      return yield* limitExceeded(
+        `Notebook MIME value ${mime} exceeds the ${NOTEBOOK_MIME_VALUE_MAX_BYTES} byte limit.`,
+      );
+    }
+    bundle[mime] = value;
+  }
+  if (utf8Encoder.encode(encodeJsonString(bundle)).byteLength > NOTEBOOK_OUTPUT_MAX_BYTES) {
+    return yield* limitExceeded(
+      `Notebook MIME bundle exceeds the ${NOTEBOOK_OUTPUT_MAX_BYTES} byte limit.`,
+    );
+  }
+  return yield* decodeJson(bundle).pipe(
+    Effect.map((value) => value as NotebookMimeBundle),
+    Effect.mapError(() => invalidNotebook("Notebook MIME bundle must be JSON.")),
+  );
 });
 
 const normalizeExecutionCount = (
@@ -244,8 +262,12 @@ const uniqueCellId = (requested: unknown, index: number, used: Set<string>): str
     return base;
   }
   let suffix = 2;
-  while (used.has(`${base.slice(0, 60)}-${suffix}`)) suffix += 1;
-  const id = `${base.slice(0, 60)}-${suffix}`;
+  let id: string;
+  do {
+    const suffixText = `-${suffix}`;
+    id = `${base.slice(0, 64 - suffixText.length)}${suffixText}`;
+    suffix += 1;
+  } while (used.has(id));
   used.add(id);
   return id;
 };

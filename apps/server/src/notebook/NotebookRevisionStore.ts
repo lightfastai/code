@@ -17,6 +17,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import type * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -92,6 +93,23 @@ const hashMismatch = () =>
     reason: "content-hash-mismatch",
     message: "The immutable notebook revision failed content hash verification.",
   });
+
+export const resolveNotebookImportDocumentId = Effect.fn(
+  "NotebookRevisionStore.resolveImportDocumentId",
+)(function* (
+  input: {
+    readonly documentId: string | undefined;
+    readonly sourceDocumentId: string | undefined;
+  },
+  randomUUID: Effect.Effect<string, PlatformError.PlatformError>,
+) {
+  const existingDocumentId = input.documentId ?? input.sourceDocumentId;
+  if (existingDocumentId !== undefined) return existingDocumentId;
+  const generatedId = yield* randomUUID.pipe(
+    Effect.mapError(() => storageError("Could not generate a notebook document ID.")),
+  );
+  return `notebook-${generatedId}`;
+});
 
 const normalizeDocumentId = Effect.fn("NotebookRevisionStore.normalizeDocumentId")(function* (
   documentId: string,
@@ -319,13 +337,13 @@ const make = Effect.gen(function* () {
     "NotebookRevisionStore.importIpynb",
   )(function* (input) {
     const document = yield* normalizeIpynb(input.ipynbJson);
-    const generatedId = yield* crypto.randomUUIDv4.pipe(
-      Effect.mapError(() => storageError("Could not generate a notebook document ID.")),
+    const documentId = yield* resolveNotebookImportDocumentId(
+      {
+        documentId: input.documentId,
+        sourceDocumentId: document.metadata.lightfast?.sourceDocumentId,
+      },
+      crypto.randomUUIDv4,
     );
-    const documentId =
-      input.documentId ??
-      document.metadata.lightfast?.sourceDocumentId ??
-      `notebook-${generatedId}`;
     return yield* save({ scope: input.scope, documentId, notebook: document });
   });
 
