@@ -1261,6 +1261,128 @@ it("rejects every session access while idle removal owns the runtime generation"
   await manager.close();
 });
 
+it("rejects every session access while sidecar disposal owns the runtime generation", async () => {
+  const heldClient = new DeferredDisposeRuntimeClient();
+  let clientIndex = 0;
+  const { clients, docker, manager } = await makeHarness({
+    createClient: () => {
+      clientIndex += 1;
+      return clientIndex === 1 ? heldClient : new FakeRuntimeClient();
+    },
+  });
+  const executeInput = {
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "execute-1",
+    executionId: "execution-1",
+    cellId: "cell-1",
+    code: "print('first generation')",
+  } as const;
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+  await Array.fromAsync(manager.execute(executeInput));
+
+  const disposing = manager.dispose({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "dispose-1",
+  });
+  await heldClient.disposeStarted;
+
+  const capture = async (access: () => unknown): Promise<unknown> => {
+    try {
+      return await access();
+    } catch (error) {
+      return error;
+    }
+  };
+  const accessResults = [
+    await capture(() => Array.fromAsync(manager.execute(executeInput))),
+    await capture(() =>
+      Array.fromAsync(
+        manager.execute({
+          ...executeInput,
+          commandId: "execute-during-disposal",
+          executionId: "execution-during-disposal",
+        }),
+      ),
+    ),
+    await capture(() =>
+      manager.interrupt({
+        projectId: "project-1",
+        sessionId: "session-1",
+        commandId: "interrupt-during-disposal",
+      }),
+    ),
+    await capture(() =>
+      manager.restart({
+        projectId: "project-1",
+        sessionId: "session-1",
+        commandId: "restart-during-disposal",
+      }),
+    ),
+    await capture(() => manager.eventsAfter("project-1", "session-1", 0)),
+  ];
+
+  let reopenSettled = false;
+  const reopening = manager
+    .open({
+      projectId: "project-1",
+      sessionId: "session-1",
+      commandId: "open-2",
+      kernelName: "python3",
+    })
+    .then((events) => {
+      reopenSettled = true;
+      return events;
+    });
+  await Promise.resolve();
+  await Promise.resolve();
+  const settledBeforeDispose = reopenSettled;
+  heldClient.releaseDispose();
+  const [disposed, reopened] = await Promise.all([disposing, reopening]);
+
+  try {
+    expect(accessResults).toEqual(
+      Array.from({ length: 5 }, () => expect.objectContaining({ reason: "runtime-unavailable" })),
+    );
+    expect(settledBeforeDispose).toBe(false);
+    expect(disposed.at(-1)).toMatchObject({ type: "kernel", state: "terminated" });
+    expect(reopened.at(-1)).toMatchObject({ type: "kernel", state: "idle" });
+    expect(docker.runCount).toBe(2);
+    expect(clients).toHaveLength(2);
+    expect(clients[0]).toMatchObject({ executeCount: 1, interruptCount: 0, restartCount: 0 });
+
+    await Array.fromAsync(
+      manager.execute({
+        ...executeInput,
+        commandId: "execute-2",
+        executionId: "execution-2",
+        code: "print('replacement generation')",
+      }),
+    );
+    await manager.interrupt({
+      projectId: "project-1",
+      sessionId: "session-1",
+      commandId: "interrupt-2",
+    });
+    await manager.restart({
+      projectId: "project-1",
+      sessionId: "session-1",
+      commandId: "restart-2",
+    });
+    expect(manager.eventsAfter("project-1", "session-1", 0).events).not.toHaveLength(0);
+    expect(clients[1]).toMatchObject({ executeCount: 1, interruptCount: 1, restartCount: 1 });
+    expect(clients[0]).toMatchObject({ executeCount: 1, interruptCount: 0, restartCount: 0 });
+  } finally {
+    await manager.close();
+  }
+});
+
 it("waits for held sidecar disposal and removal before reopening", async () => {
   const heldClient = new DeferredDisposeRuntimeClient();
   let clientIndex = 0;

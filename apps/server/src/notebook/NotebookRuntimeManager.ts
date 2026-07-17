@@ -644,6 +644,12 @@ export class NotebookRuntimeManager {
     readonly session: SessionState;
   } {
     const sessionKey = this.#sessionKey(input.projectId, input.sessionId);
+    if (!allowDisposed && this.#sessionDisposals.has(sessionKey)) {
+      throw new NotebookRuntimeManagerError({
+        reason: "runtime-unavailable",
+        message: "Notebook session runtime is being disposed.",
+      });
+    }
     if (this.#sessionRemovals.has(sessionKey)) {
       throw new NotebookRuntimeManagerError({
         reason: "runtime-unavailable",
