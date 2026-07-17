@@ -74,7 +74,7 @@ export function appendStudyCanvasSnapshotOperation(
   readonly prunedSnapshotFileNames: ReadonlyArray<string>;
 } {
   const previous = document.operations.at(-1);
-  if (previous?.digest === input.digest) {
+  if (previous && input.revision <= previous.revision) {
     return { document, prunedSnapshotFileNames: [] };
   }
 
@@ -94,6 +94,14 @@ export function appendStudyCanvasSnapshotOperation(
     Math.max(0, allOperations.length - STUDY_CANVAS_MAX_SNAPSHOT_OPERATIONS),
   );
   const operations = allOperations.slice(-STUDY_CANVAS_MAX_SNAPSHOT_OPERATIONS);
+  const retainedSnapshotFileNames = new Set(operations.map((entry) => entry.snapshotFileName));
+  const prunedSnapshotFileNames = [
+    ...new Set(
+      pruned
+        .map((entry) => entry.snapshotFileName)
+        .filter((fileName) => !retainedSnapshotFileNames.has(fileName)),
+    ),
+  ];
 
   return {
     document: decodeStudyCanvasDocument({
@@ -104,7 +112,7 @@ export function appendStudyCanvasSnapshotOperation(
       },
       operations,
     }),
-    prunedSnapshotFileNames: pruned.map((entry) => entry.snapshotFileName),
+    prunedSnapshotFileNames,
   };
 }
 

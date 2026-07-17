@@ -150,18 +150,23 @@ export function saveStudyCanvasSnapshot(input: {
       }
 
       const document = await readManifest(input.canvasId, input.title, paths);
-      const digest = await digestDrawing(input.drawingDataBase64);
-      if (document.operations.at(-1)?.digest === digest) {
+      const previous = document.operations.at(-1);
+      if (previous && input.revision <= previous.revision) {
         return document;
       }
-
-      const sequence = (document.operations.at(-1)?.sequence ?? 0) + 1;
-      const snapshotFileName = `${String(sequence).padStart(8, "0")}-${digest.slice(0, 16)}.drawing`;
+      const digest = await digestDrawing(input.drawingDataBase64);
+      const existingSnapshot = document.operations.find((operation) => operation.digest === digest);
+      const sequence = (previous?.sequence ?? 0) + 1;
+      const snapshotFileName =
+        existingSnapshot?.snapshotFileName ??
+        `${String(sequence).padStart(8, "0")}-${digest.slice(0, 16)}.drawing`;
       try {
         const { File } = await import("expo-file-system");
         const snapshot = new File(paths.snapshots, snapshotFileName);
-        if (!snapshot.exists) snapshot.create({ intermediates: true });
-        snapshot.write(input.drawingDataBase64, { encoding: "base64" });
+        if (!snapshot.exists) {
+          snapshot.create({ intermediates: true });
+          snapshot.write(input.drawingDataBase64, { encoding: "base64" });
+        }
       } catch (cause) {
         throw new StudyCanvasPersistenceError({
           operation: "write",

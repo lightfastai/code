@@ -20,7 +20,7 @@ describe("study canvas model", () => {
     expect(first).toMatch(/^thread-[0-9a-f]{16}$/);
   });
 
-  it("appends immutable snapshots, deduplicates content, and prunes old history", () => {
+  it("appends immutable revisions, deduplicates blobs, and prunes unreferenced history", () => {
     let document = createStudyCanvasDocument({
       canvasId: "canvas-1",
       title: "Eigenvectors",
@@ -45,15 +45,20 @@ describe("study canvas model", () => {
     expect(document.operations.at(-1)?.revision).toBe(STUDY_CANVAS_MAX_SNAPSHOT_OPERATIONS + 2);
     expect(pruned).toHaveLength(2);
 
-    const duplicate = appendStudyCanvasSnapshotOperation(document, {
+    const newerRevision = appendStudyCanvasSnapshotOperation(document, {
       operationId: "duplicate",
       revision: 999,
       digest: document.operations.at(-1)!.digest,
-      snapshotFileName: "duplicate.drawing",
+      snapshotFileName: document.operations.at(-1)!.snapshotFileName,
       now: "2026-07-15T01:00:00.000Z",
     });
-    expect(duplicate.document).toBe(document);
-    expect(duplicate.prunedSnapshotFileNames).toEqual([]);
+    expect(newerRevision.document.operations.at(-1)?.revision).toBe(999);
+    expect(newerRevision.document.operations.at(-1)?.snapshotFileName).toBe(
+      document.operations.at(-1)?.snapshotFileName,
+    );
+    expect(newerRevision.prunedSnapshotFileNames).not.toContain(
+      document.operations.at(-1)?.snapshotFileName,
+    );
   });
 
   it("rejects unsafe snapshot paths", () => {
