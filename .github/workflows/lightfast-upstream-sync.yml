@@ -6,25 +6,36 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  pull-requests: read
 
 concurrency:
   group: lightfast-upstream-sync
   cancel-in-progress: false
 
 jobs:
-  sync:
-    name: Merge upstream into an integration pull request
+  validate:
+    name: Merge and validate untrusted upstream code
     if: github.repository == 'lightfastai/code'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      base_sha: ${{ steps.branch.outputs.base_sha }}
+      branch: ${{ steps.branch.outputs.name }}
+      outcome: ${{ steps.merge.outputs.outcome }}
+      upstream_sha: ${{ steps.candidate.outputs.upstream_sha }}
+      verified_sha: ${{ steps.candidate.outputs.verified_sha }}
     steps:
-      - name: Checkout Lightfast main with full history
+      - name: Checkout Lightfast main with full history and no persisted credential
         uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Fetch origin and upstream main
         shell: bash
@@ -87,6 +98,7 @@ jobs:
 
           echo "name=$branch" >> "$GITHUB_OUTPUT"
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
           git log --no-merges --format='- `%h` %s' origin/main..upstream/main \
             > "$RUNNER_TEMP/upstream-commits.md"
@@ -157,6 +169,20 @@ jobs:
           echo "outcome=conflict" >> "$GITHUB_OUTPUT"
           echo "conflict_brief=$brief" >> "$GITHUB_OUTPUT"
 
+      - id: candidate
+        name: Capture the exact candidate commit before upstream execution
+        if: steps.merge.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          verified_sha="$(git rev-parse HEAD)"
+          upstream_sha="$(git rev-parse upstream/main)"
+          [[ "$verified_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$upstream_sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "verified_sha=$verified_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
       - name: Setup Vite+
         if: steps.merge.outputs.outcome == 'merged'
         uses: voidzero-dev/setup-vp@v1
@@ -170,7 +196,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/lightfast-upstream-audit.ts --base upstream/main --head HEAD \
+          node scripts/lightfast-upstream-audit.ts \
+            --base "${{ steps.candidate.outputs.upstream_sha }}" \
+            --head "${{ steps.candidate.outputs.verified_sha }}" \
             | tee "$RUNNER_TEMP/upstream-audit.json"
 
       - name: Check formatting and lint
@@ -203,7 +231,7 @@ jobs:
 
           body="$RUNNER_TEMP/upstream-pr.md"
           sync_date="$(date -u +%Y-%m-%d)"
-          upstream_sha="$(git rev-parse upstream/main)"
+          upstream_sha="${{ steps.candidate.outputs.upstream_sha }}"
           {
             echo "## Upstream integration"
             echo
@@ -238,7 +266,6 @@ jobs:
 
             echo
             echo "### Incoming upstream commits"
-            echo
             cat "$RUNNER_TEMP/upstream-commits.md"
           } > "$body"
 
@@ -249,50 +276,240 @@ jobs:
             echo "draft=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Push only the integration branch
+      - id: package
+        name: Package only the captured and validated candidate
         if: steps.pr.outcome == 'success'
         shell: bash
         env:
           BRANCH: ${{ steps.branch.outputs.name }}
+          BASE_SHA: ${{ steps.branch.outputs.base_sha }}
+          PR_NUMBER: ${{ steps.branch.outputs.pr_number }}
+          DRAFT: ${{ steps.pr.outputs.draft }}
+          OUTCOME: ${{ steps.merge.outputs.outcome }}
+          VERIFIED_SHA: ${{ steps.candidate.outputs.verified_sha }}
+          UPSTREAM_SHA: ${{ steps.candidate.outputs.upstream_sha }}
         run: |
           set -euo pipefail
-          git push origin "HEAD:refs/heads/$BRANCH"
 
-      - name: Open or update the integration pull request
-        if: steps.pr.outcome == 'success'
+          test "$(git rev-parse HEAD)" = "${{ steps.candidate.outputs.verified_sha }}"
+          [[ "$BRANCH" =~ ^sync/upstream-[0-9]{8}$ ]]
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$VERIFIED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PR_NUMBER" =~ ^[0-9]*$ ]]
+          [[ "$DRAFT" == "true" || "$DRAFT" == "false" ]]
+          [[ "$OUTCOME" == "merged" || "$OUTCOME" == "conflict" ]]
+
+          artifact="$RUNNER_TEMP/publish"
+          mkdir -p "$artifact"
+          git update-ref refs/lightfast/verified-candidate "$VERIFIED_SHA"
+          git bundle create "$artifact/candidate.bundle" refs/lightfast/verified-candidate
+          bundle_sha="$(sha256sum "$artifact/candidate.bundle" | cut -d ' ' -f 1)"
+
+          jq -n \
+            --argjson version 1 \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg runId "$GITHUB_RUN_ID" \
+            --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+            --arg branch "$BRANCH" \
+            --arg baseSha "$BASE_SHA" \
+            --arg upstreamSha "$UPSTREAM_SHA" \
+            --arg verifiedSha "$VERIFIED_SHA" \
+            --arg bundleSha256 "$bundle_sha" \
+            --arg outcome "$OUTCOME" \
+            --arg prNumber "$PR_NUMBER" \
+            --arg draft "$DRAFT" \
+            '{version: $version, repository: $repository, runId: $runId, runAttempt: $runAttempt, branch: $branch, baseSha: $baseSha, upstreamSha: $upstreamSha, verifiedSha: $verifiedSha, bundleSha256: $bundleSha256, outcome: $outcome, prNumber: $prNumber, draft: $draft}' \
+            > "$artifact/manifest.json"
+          cp -- "${{ steps.pr.outputs.body }}" "$artifact/upstream-pr.md"
+
+      - id: upload
+        name: Upload the immutable publication candidate
+        if: steps.package.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: lightfast-upstream-publication
+          path: ${{ runner.temp }}/publish
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish the exact validated commit
+    needs: validate
+    if: needs.validate.outputs.artifact_id != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Download this run's immutable publication candidate
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.validate.outputs.artifact_id }}
+          path: ${{ runner.temp }}/publish
+
+      - name: Independently verify and publish the exact commit
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ steps.branch.outputs.name }}
-          PR_NUMBER: ${{ steps.branch.outputs.pr_number }}
-          PR_BODY: ${{ steps.pr.outputs.body }}
-          DRAFT: ${{ steps.pr.outputs.draft }}
+          ARTIFACT_DIR: ${{ runner.temp }}/publish
+          EXPECTED_BASE_SHA: ${{ needs.validate.outputs.base_sha }}
+          EXPECTED_BRANCH: ${{ needs.validate.outputs.branch }}
+          EXPECTED_OUTCOME: ${{ needs.validate.outputs.outcome }}
+          EXPECTED_UPSTREAM_SHA: ${{ needs.validate.outputs.upstream_sha }}
+          EXPECTED_VERIFIED_SHA: ${{ needs.validate.outputs.verified_sha }}
         run: |
           set -euo pipefail
 
+          manifest="$ARTIFACT_DIR/manifest.json"
+          bundle="$ARTIFACT_DIR/candidate.bundle"
+          pr_body="$ARTIFACT_DIR/upstream-pr.md"
+          for file in "$manifest" "$bundle" "$pr_body"; do
+            [[ -f "$file" && ! -L "$file" ]]
+          done
+          [[ "$(/usr/bin/stat -c %s "$manifest")" -le 16384 ]]
+          [[ "$(/usr/bin/stat -c %s "$pr_body")" -le 65536 ]]
+
+          version="$(/usr/bin/jq -er '.version' "$manifest")"
+          repository="$(/usr/bin/jq -er '.repository' "$manifest")"
+          run_id="$(/usr/bin/jq -er '.runId' "$manifest")"
+          run_attempt="$(/usr/bin/jq -er '.runAttempt' "$manifest")"
+          branch="$(/usr/bin/jq -er '.branch' "$manifest")"
+          base_sha="$(/usr/bin/jq -er '.baseSha' "$manifest")"
+          upstream_sha="$(/usr/bin/jq -er '.upstreamSha' "$manifest")"
+          verified_sha="$(/usr/bin/jq -er '.verifiedSha' "$manifest")"
+          expected_bundle_sha="$(/usr/bin/jq -er '.bundleSha256' "$manifest")"
+          outcome="$(/usr/bin/jq -er '.outcome' "$manifest")"
+          pr_number="$(/usr/bin/jq -er '.prNumber' "$manifest")"
+          draft="$(/usr/bin/jq -er '.draft' "$manifest")"
+
+          [[ "$version" == "1" ]]
+          [[ "$repository" == "$GITHUB_REPOSITORY" ]]
+          [[ "$run_id" == "$GITHUB_RUN_ID" ]]
+          [[ "$run_attempt" == "$GITHUB_RUN_ATTEMPT" ]]
+          [[ "$branch" =~ ^sync/upstream-[0-9]{8}$ ]]
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$upstream_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$verified_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$expected_bundle_sha" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$outcome" == "merged" || "$outcome" == "conflict" ]]
+          [[ "$pr_number" =~ ^[0-9]*$ ]]
+          [[ "$draft" == "true" || "$draft" == "false" ]]
+          [[ "$base_sha" == "$EXPECTED_BASE_SHA" ]]
+          [[ "$branch" == "$EXPECTED_BRANCH" ]]
+          [[ "$outcome" == "$EXPECTED_OUTCOME" ]]
+          [[ "$upstream_sha" == "$EXPECTED_UPSTREAM_SHA" ]]
+          [[ "$verified_sha" == "$EXPECTED_VERIFIED_SHA" ]]
+
+          actual_bundle_sha="$(/usr/bin/sha256sum "$bundle")"
+          actual_bundle_sha="${actual_bundle_sha%% *}"
+          [[ "$actual_bundle_sha" == "$expected_bundle_sha" ]]
+
+          verified_repo="$RUNNER_TEMP/verified.git"
+          /usr/bin/git init --bare "$verified_repo"
+          cd "$verified_repo"
+          /usr/bin/git bundle verify "$bundle"
+          /usr/bin/git fetch --no-tags "$bundle" \
+            "refs/lightfast/verified-candidate:refs/verified/candidate"
+          [[ "$(/usr/bin/git rev-parse refs/verified/candidate)" == "$verified_sha" ]]
+          /usr/bin/git cat-file -e "$verified_sha^{commit}"
+          /usr/bin/git fsck --strict --no-reflogs "$verified_sha"
+
+          origin_url="https://github.com/$GITHUB_REPOSITORY.git"
+          upstream_url="https://github.com/pingdotgg/t3code.git"
+          /usr/bin/git remote add origin "$origin_url"
+          /usr/bin/git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main"
+          /usr/bin/git fetch --no-tags "$upstream_url" \
+            "+refs/heads/main:refs/remotes/upstream/main"
+          [[ "$(/usr/bin/git rev-parse refs/remotes/upstream/main)" == "$upstream_sha" ]] || {
+            echo "verified second parent does not match upstream/main" >&2
+            exit 1
+          }
+
+          remote_branch_sha="$(
+            /usr/bin/git ls-remote --refs origin "refs/heads/$branch" |
+              /usr/bin/awk 'NR == 1 { print $1 }'
+          )"
+          if [[ -n "$remote_branch_sha" ]]; then
+            expected_first_parent="$remote_branch_sha"
+            /usr/bin/git fetch --no-tags origin \
+              "+refs/heads/$branch:refs/remotes/origin/candidate-branch"
+          else
+            expected_first_parent="$(/usr/bin/git rev-parse refs/remotes/origin/main)"
+          fi
+          [[ "$base_sha" == "$expected_first_parent" ]] || {
+            echo "verified first parent does not match the expected branch tip" >&2
+            exit 1
+          }
+
+          read -r commit first_parent second_parent extra_parent <<< "$(
+            /usr/bin/git rev-list --parents -n 1 "$verified_sha"
+          )"
+          [[ "$commit" == "$verified_sha" ]]
+          if [[ "$outcome" == "merged" ]]; then
+            [[ -n "$first_parent" && -n "$second_parent" && -z "${extra_parent:-}" ]] || {
+              echo "merge commit must have exactly two parents" >&2
+              exit 1
+            }
+            [[ "$first_parent" == "$expected_first_parent" ]] || {
+              echo "verified first parent does not match the expected branch tip" >&2
+              exit 1
+            }
+            [[ "$second_parent" == "$upstream_sha" ]] || {
+              echo "verified second parent does not match upstream/main" >&2
+              exit 1
+            }
+          elif [[ "$verified_sha" != "$expected_first_parent" ]]; then
+            [[ "$first_parent" == "$expected_first_parent" && -z "${second_parent:-}" ]] || {
+              echo "conflict brief commit does not descend directly from the expected branch tip" >&2
+              exit 1
+            }
+          fi
+
+          if [[ -n "$pr_number" ]]; then
+            pr_json="$(/usr/bin/gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number")"
+            [[ "$(/usr/bin/jq -r '.state' <<< "$pr_json")" == "open" ]]
+            [[ "$(/usr/bin/jq -r '.base.ref' <<< "$pr_json")" == "main" ]]
+            [[ "$(/usr/bin/jq -r '.head.ref' <<< "$pr_json")" == "$branch" ]]
+            [[ "$(/usr/bin/jq -r '.head.repo.full_name' <<< "$pr_json")" == "$GITHUB_REPOSITORY" ]]
+          else
+            [[ -z "$remote_branch_sha" ]]
+          fi
+
+          basic_auth="$(
+            /usr/bin/printf 'x-access-token:%s' "$GH_TOKEN" | /usr/bin/base64 -w 0
+          )"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic_auth"
+          /usr/bin/git push origin "$verified_sha:refs/heads/$branch"
+          unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 basic_auth
+
           title="chore: sync pingdotgg/t3code upstream"
-          if [[ -n "$PR_NUMBER" ]]; then
-            gh pr edit "$PR_NUMBER" \
+          if [[ -n "$pr_number" ]]; then
+            /usr/bin/gh pr edit "$pr_number" \
               --repo "$GITHUB_REPOSITORY" \
               --title "$title" \
-              --body-file "$PR_BODY"
+              --body-file "$pr_body"
 
-            if [[ "$DRAFT" == "true" ]]; then
-              gh pr ready "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --undo || true
+            if [[ "$draft" == "true" ]]; then
+              /usr/bin/gh pr ready "$pr_number" --repo "$GITHUB_REPOSITORY" --undo || true
             else
-              gh pr ready "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" || true
+              /usr/bin/gh pr ready "$pr_number" --repo "$GITHUB_REPOSITORY" || true
             fi
             exit 0
           fi
 
           draft_args=()
-          if [[ "$DRAFT" == "true" ]]; then
+          if [[ "$draft" == "true" ]]; then
             draft_args+=(--draft)
           fi
-          gh pr create \
+          /usr/bin/gh pr create \
             --repo "$GITHUB_REPOSITORY" \
             --base main \
-            --head "$BRANCH" \
+            --head "$branch" \
             --title "$title" \
-            --body-file "$PR_BODY" \
+            --body-file "$pr_body" \
             "${draft_args[@]}"

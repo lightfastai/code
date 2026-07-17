@@ -30,15 +30,19 @@ upstream push URL of `DISABLED`. Do not enable upstream pushes.
 `.github/workflows/lightfast-upstream-sync.yml` runs daily at 04:17 UTC and is also manually
 dispatchable. It:
 
-1. checks out full Lightfast `main` history;
+1. checks out full Lightfast `main` history without persisting a GitHub write credential;
 2. fetches `origin/main` and `pingdotgg/t3code:main`;
 3. reuses an existing open `sync/upstream-YYYYMMDD` pull request or creates that branch from
    Lightfast `main`;
 4. creates a non-fast-forward upstream merge;
 5. runs the Lightfast boundary audit, `vp check`, `vp run typecheck`, `vp run test`, and mobile
    native lint when incoming upstream paths require it;
-6. pushes only the integration branch; and
-7. opens or updates the integration pull request with incoming commits and gate evidence.
+6. captures the exact candidate SHA before installing or executing merged upstream code, verifies the
+   worktree still names that SHA after all gates, and uploads an immutable Git bundle plus manifest;
+7. starts a separate privileged job that never checks out, installs, or executes repository code,
+   independently verifies the artifact identity, exact SHA, expected refs, and commit parents; and
+8. pushes only that verified SHA to the integration branch before opening or updating the pull request
+   with incoming commits and gate evidence.
 
 Trigger and inspect it with:
 
@@ -48,7 +52,9 @@ gh run list --repo lightfastai/code --workflow lightfast-upstream-sync.yml --lim
 gh run watch --repo lightfastai/code <run-id>
 ```
 
-The workflow's repository token needs `contents: write` and `pull-requests: write`. Branch
+The merge and validation job has only `contents: read` and `pull-requests: read`, and checkout does
+not persist its credential. Only the publication job receives `contents: write` and
+`pull-requests: write`; it runs on a fresh runner and never executes the merged tree. Branch
 protection on `main` must require a pull request and must disallow force pushes and deletion; the
 workflow never needs a main-branch bypass.
 
