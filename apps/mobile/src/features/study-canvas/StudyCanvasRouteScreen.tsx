@@ -38,6 +38,7 @@ import type {
   StudyCanvasDrawingChangeEvent,
   StudyCanvasSelectionChangeEvent,
 } from "./StudyCanvasSurface.types";
+import { finishStudyCanvas, saveStudyCanvasSurfaceSnapshot } from "./studyCanvasSave";
 import { loadStudyCanvas, saveStudyCanvasSnapshot } from "./studyCanvasStorage";
 
 const SAVE_DEBOUNCE_MS = 750;
@@ -50,20 +51,25 @@ type StudyCanvasRouteProps = StaticScreenProps<{
 
 type CanvasStatus = "loading" | "ready" | "saving" | "saved" | "error";
 
-function StudyCanvasHeaderButton() {
-  const navigation = useNavigation();
+function StudyCanvasHeaderButton(props: {
+  readonly disabled: boolean;
+  readonly onPress: () => void;
+}) {
   return (
-    <Pressable accessibilityLabel="Close canvas" onPress={() => navigation.goBack()}>
+    <Pressable
+      accessibilityLabel="Save and close canvas"
+      accessibilityRole="button"
+      accessibilityState={{ disabled: props.disabled }}
+      disabled={props.disabled}
+      onPress={props.onPress}
+    >
       <Text className="font-t3-bold text-base">Done</Text>
     </Pressable>
   );
 }
 
-function renderStudyCanvasHeaderRight() {
-  return <StudyCanvasHeaderButton />;
-}
-
 export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
+  const navigation = useNavigation();
   const routeThreadRef = useMemo(
     () => ({
       environmentId: EnvironmentId.make(props.route.params.environmentId),
@@ -81,7 +87,9 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
   });
   const loadedDrawingRef = useRef(false);
   const mountedRef = useRef(true);
+  const finishingRef = useRef(false);
   const [status, setStatus] = useState<CanvasStatus>("loading");
+  const [finishing, setFinishing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedRegion, setSelectedRegion] = useState<StudyCanvasRegion | null>(null);
@@ -107,17 +115,17 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
   }, [composer.selectedThreadFeed]);
 
   const persistLatestDrawing = useCallback(async () => {
-    if (!nativeAvailable || !canvasRef.current || !loadedDrawingRef.current) return;
+    const surface = canvasRef.current;
+    if (!nativeAvailable || !surface || !loadedDrawingRef.current) return;
+    const snapshot = { ...latestDrawingRef.current };
     try {
       if (mountedRef.current) setStatus("saving");
-      const drawingDataBase64 = await canvasRef.current.exportDrawing();
-      const latest = latestDrawingRef.current;
-      await saveStudyCanvasSnapshot({
+      await saveStudyCanvasSurfaceSnapshot({
+        surface,
         canvasId,
         title: canvasTitle,
-        revision: latest.revision,
-        drawingDataBase64,
-        ...(latest.contentBounds ? { contentBounds: latest.contentBounds } : {}),
+        snapshot,
+        save: saveStudyCanvasSnapshot,
       });
       if (mountedRef.current) {
         setStatus("saved");
@@ -143,9 +151,12 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      flushSave();
+      if (saveTimerRef.current !== null) {
+        clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
     };
-  }, [flushSave]);
+  }, []);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (nextState) => {
@@ -255,6 +266,56 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
       setSending(false);
     }
   }, [canvasId, composer, prompt, selectedRegion, sending]);
+
+  const handleDone = useCallback(async () => {
+    if (finishingRef.current) return;
+    if (!nativeAvailable) {
+      navigation.goBack();
+      return;
+    }
+    const surface = canvasRef.current;
+    if (!surface || !loadedDrawingRef.current) {
+      setStatus("error");
+      setError("The canvas is still loading. Try Done again in a moment.");
+      return;
+    }
+    if (saveTimerRef.current !== null) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+
+    const snapshot = { ...latestDrawingRef.current };
+    finishingRef.current = true;
+    setFinishing(true);
+    setStatus("saving");
+    setError(null);
+    try {
+      await finishStudyCanvas({
+        surface,
+        canvasId,
+        title: canvasTitle,
+        snapshot,
+        save: saveStudyCanvasSnapshot,
+        onSaved: () => {
+          if (mountedRef.current) setStatus("saved");
+          navigation.goBack();
+        },
+      });
+    } catch (cause) {
+      if (mountedRef.current) {
+        setStatus("error");
+        setError(cause instanceof Error ? cause.message : "Could not save the canvas.");
+      }
+    } finally {
+      finishingRef.current = false;
+      if (mountedRef.current) setFinishing(false);
+    }
+  }, [canvasId, nativeAvailable, navigation]);
+
+  const renderStudyCanvasHeaderRight = useCallback(
+    () => <StudyCanvasHeaderButton disabled={finishing} onPress={() => void handleDone()} />,
+    [finishing, handleDone],
+  );
 
   return (
     <View className="flex-1 bg-screen">
