@@ -14,6 +14,7 @@ import * as Schema from "effect/Schema";
 
 import { ScopedProjectRef } from "./environment.ts";
 import { NonNegativeInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { StudyDocumentId } from "./study.ts";
 
 const NotebookRuntimeIdentifier = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
 export const NotebookSessionId = TrimmedNonEmptyString.check(
@@ -120,9 +121,13 @@ const NotebookRuntimeSessionRef = Schema.Struct({
   scope: ScopedProjectRef,
   sessionId: NotebookSessionId,
 });
+const NotebookSelectedStudyDocuments = Schema.Struct({
+  documentIds: Schema.Array(StudyDocumentId).check(Schema.isMaxLength(32)),
+});
 
 export const NotebookSessionOpenInput = Schema.Struct({
   ...NotebookRuntimeSessionRef.fields,
+  ...NotebookSelectedStudyDocuments.fields,
   commandId: NotebookCommandId,
   kernelName: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
 });
@@ -198,6 +203,7 @@ export type NotebookAgentExecutionPermissionSetInput =
 
 export const PublishNotebookArtifactInput = Schema.Struct({
   ...NotebookRevisionRef.fields,
+  ...NotebookSelectedStudyDocuments.fields,
   title: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(255))),
   initialView: NotebookInitialView,
 });
@@ -211,11 +217,15 @@ export type PublishNotebookArtifactResult = typeof PublishNotebookArtifactResult
 
 export const NotebookAgentExecuteCellInput = Schema.Struct({
   ...NotebookRevisionRef.fields,
+  ...NotebookSelectedStudyDocuments.fields,
   cellId: NotebookCellId,
 });
 export type NotebookAgentExecuteCellInput = typeof NotebookAgentExecuteCellInput.Type;
 
-export const NotebookAgentExecuteAllInput = NotebookRevisionRef;
+export const NotebookAgentExecuteAllInput = Schema.Struct({
+  ...NotebookRevisionRef.fields,
+  ...NotebookSelectedStudyDocuments.fields,
+});
 export type NotebookAgentExecuteAllInput = typeof NotebookAgentExecuteAllInput.Type;
 
 export const NotebookAgentExecutionResult = Schema.Struct({

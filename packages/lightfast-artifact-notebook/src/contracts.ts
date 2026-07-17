@@ -35,6 +35,8 @@ export type NotebookRevisionId = typeof NotebookRevisionId.Type;
 export const NotebookContentHash = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
 export type NotebookContentHash = typeof NotebookContentHash.Type;
 
+const NotebookStudyDocumentId = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
+
 export const NotebookCellId = NonEmptyString.check(
   Schema.isMaxLength(64),
   Schema.isPattern(/^[a-zA-Z0-9_-]+$/),
@@ -180,6 +182,7 @@ export const NotebookArtifactPayload = Schema.Struct({
   contentHash: NotebookContentHash,
   kernel: NotebookKernel,
   initialView: NotebookInitialView,
+  documentIds: Schema.optional(Schema.Array(NotebookStudyDocumentId).check(Schema.isMaxLength(32))),
 });
 export type NotebookArtifactPayload = typeof NotebookArtifactPayload.Type;
 

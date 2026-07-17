@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 
 import {
   NOTEBOOK_CELL_SOURCE_MAX_BYTES,
@@ -8,6 +9,7 @@ import {
   NOTEBOOK_MIME_KEY_MAX_LENGTH,
   NOTEBOOK_MIME_VALUE_MAX_BYTES,
   NOTEBOOK_OUTPUT_MAX_BYTES,
+  NotebookArtifactPayload,
 } from "./contracts.ts";
 import { canonicalNotebookJson, hashNotebook, normalizeIpynb } from "./nbformat.ts";
 
@@ -52,6 +54,28 @@ const rawNotebook = (overrides: Readonly<Record<string, unknown>> = {}) => ({
     },
   ],
   ...overrides,
+});
+
+const decodeArtifactPayload = Schema.decodeUnknownSync(NotebookArtifactPayload);
+
+describe("NotebookArtifactPayload", () => {
+  const payload = {
+    documentId: "notebook-1",
+    revisionId: "a".repeat(64),
+    contentHash: "b".repeat(64),
+    kernel: { name: "python3", displayName: "Python 3", language: "python" },
+    initialView: { mode: "notebook" as const },
+  };
+
+  it("retains selected study IDs while legacy artifacts remain bookless", () => {
+    expect(decodeArtifactPayload(payload)).not.toHaveProperty("documentIds");
+    expect(decodeArtifactPayload({ ...payload, documentIds: ["c".repeat(64)] })).toMatchObject({
+      documentIds: ["c".repeat(64)],
+    });
+    expect(() =>
+      decodeArtifactPayload({ ...payload, documentIds: ["../../etc/passwd"] }),
+    ).toThrow();
+  });
 });
 
 const notebookWithMimeData = (data: Readonly<Record<string, unknown>>) =>

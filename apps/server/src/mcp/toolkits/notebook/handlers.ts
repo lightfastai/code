@@ -24,7 +24,10 @@ import { NOTEBOOK_RUNTIME_KERNEL_LOCK_HASH } from "../../../notebook/NotebookRun
 import { NotebookRuntimeManagerService } from "../../../notebook/NotebookRuntimeManager.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
-import { resolveStudyLibraryPaths } from "../../../study/StudyLibrary.ts";
+import {
+  resolveStudyDocumentMountPaths,
+  resolveStudyLibraryPaths,
+} from "../../../study/StudyLibrary.ts";
 import {
   resolveStudyLoopPaths,
   studyTracePath,
@@ -93,6 +96,7 @@ export const publishNotebook = Effect.fn("NotebookToolkit.publishNotebook")(func
           contentHash: revision.contentHash,
           kernel: revision.kernel,
           initialView: input.initialView,
+          documentIds: input.documentIds,
         },
       }),
     )
@@ -133,6 +137,11 @@ const withAgentTools = Effect.fn("NotebookToolkit.withAgentTools")(function* <A>
   const tools = makeNotebookAgentTools({
     revisionStore: store,
     runtimeManager: runtime,
+    resolveBookPaths: (documentIds) =>
+      resolveStudyDocumentMountPaths(libraryPaths, documentIds).pipe(
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, path),
+      ),
     runtimeIdentity: () =>
       Effect.tryPromise({
         try: () => runtime.resolveRuntimeImageDigest(),

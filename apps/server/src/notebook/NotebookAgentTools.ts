@@ -43,6 +43,9 @@ export interface NotebookAgentRuntimeManager {
 export interface NotebookAgentToolsDependencies {
   readonly revisionStore: NotebookRevisionStoreShape;
   readonly runtimeManager: NotebookAgentRuntimeManager;
+  readonly resolveBookPaths: (
+    documentIds: NotebookAgentExecuteAllInput["documentIds"],
+  ) => Effect.Effect<ReadonlyArray<string>, NotebookAgentToolError>;
   readonly runtimeIdentity: () => Effect.Effect<
     {
       readonly imageDigest: string;
@@ -126,6 +129,7 @@ function semanticOutput(events: ReadonlyArray<NotebookExecutionEvent>): Readonly
 
 function traceRecords(input: {
   readonly runId: StudyTraceRunId;
+  readonly documentIds: NotebookAgentExecuteAllInput["documentIds"];
   readonly operation: StudyNotebookExecutionEvent["operation"];
   readonly startedAt: string;
   readonly finishedAt: string;
@@ -157,7 +161,7 @@ function traceRecords(input: {
           },
         ],
       },
-      documentIds: [],
+      documentIds: input.documentIds,
     },
   });
   const middleEvents: ReadonlyArray<StudyTraceEvent> = [
@@ -203,6 +207,12 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
     input: NotebookAgentExecuteAllInput | NotebookAgentExecuteCellInput,
     invocation: McpInvocationContext.McpInvocationScope,
   ) {
+    const documentIds =
+      Array.isArray(input.documentIds) &&
+      input.documentIds.length <= 32 &&
+      input.documentIds.every((documentId) => /^[0-9a-f]{64}$/.test(documentId))
+        ? input.documentIds
+        : [];
     if (input.scope.environmentId !== invocation.environmentId) {
       return yield* toolError(
         "scope-mismatch",
@@ -236,6 +246,7 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
       return yield* toolError("cell-not-found", "The requested code cell was not found.");
     }
 
+    const bookPaths = yield* dependencies.resolveBookPaths(documentIds);
     const identity = yield* dependencies
       .runtimeIdentity()
       .pipe(
@@ -330,6 +341,7 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
                                 sessionId,
                                 commandId: openCommandId,
                                 kernelName: revision.kernel.name,
+                                bookPaths,
                                 runtimeImageDigest: identity.imageDigest,
                               }),
                             catch: runtimeError,
@@ -467,6 +479,7 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
           : undefined;
         const records = traceRecords({
           runId,
+          documentIds,
           operation,
           startedAt,
           finishedAt,

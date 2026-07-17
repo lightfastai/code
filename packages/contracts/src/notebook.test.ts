@@ -11,6 +11,7 @@ import {
   NotebookCellExecuteInput,
   NotebookExecutionEvent,
   NotebookExecutionReplay,
+  NotebookSessionOpenInput,
 } from "./notebook.ts";
 
 const decodeExecuteInput = Schema.decodeUnknownSync(NotebookCellExecuteInput);
@@ -22,8 +23,36 @@ const decodePermissionSet = Schema.decodeUnknownSync(NotebookAgentExecutionPermi
 const decodePublishNotebook = Schema.decodeUnknownSync(PublishNotebookArtifactInput);
 const decodeExecuteCell = Schema.decodeUnknownSync(NotebookAgentExecuteCellInput);
 const decodeExecuteAll = Schema.decodeUnknownSync(NotebookAgentExecuteAllInput);
+const decodeSessionOpen = Schema.decodeUnknownSync(NotebookSessionOpenInput);
 
 describe("notebook execution contracts", () => {
+  it("accepts only explicit study document IDs for runtime mounts", () => {
+    const documentIds = ["b".repeat(64), "a".repeat(64)];
+    const open = decodeSessionOpen({
+      scope: { environmentId: "environment-1", projectId: "project-1" },
+      sessionId: "session-1",
+      commandId: "open-1",
+      kernelName: "python3",
+      documentIds,
+      bookPaths: ["/etc/passwd"],
+    });
+
+    expect(open).toMatchObject({ documentIds });
+    expect(open).not.toHaveProperty("bookPaths");
+    expect(() =>
+      decodeSessionOpen({
+        scope: open.scope,
+        sessionId: "session-1",
+        commandId: "open-1",
+        kernelName: "python3",
+      }),
+    ).toThrow();
+    expect(() => decodeSessionOpen({ ...open, documentIds: ["../../etc/passwd"] })).toThrow();
+    expect(() =>
+      decodeSessionOpen({ ...open, documentIds: Array.from({ length: 33 }, () => "a".repeat(64)) }),
+    ).toThrow();
+  });
+
   it("requires a cell ID on execute requests and accepted execute events", () => {
     const executeInput = {
       scope: { environmentId: "environment-1", projectId: "project-1" },
@@ -136,6 +165,7 @@ describe("notebook agent contracts", () => {
     scope: { environmentId: "environment-1", projectId: "project-1" },
     documentId: "notebook-1",
     revisionId: "a".repeat(64),
+    documentIds: ["b".repeat(64)],
   };
 
   it("requires explicit thread-scoped permission updates", () => {
@@ -165,6 +195,17 @@ describe("notebook agent contracts", () => {
     expect(decodeExecuteAll(revisionRef)).toMatchObject({ documentId: "notebook-1" });
     expect(() =>
       decodeExecuteCell({ ...revisionRef, revisionId: "latest", cellId: "cell-1" }),
+    ).toThrow();
+    expect(() => {
+      const { documentIds: _, ...missingDocumentIds } = revisionRef;
+      decodeExecuteAll(missingDocumentIds);
+    }).toThrow();
+    expect(() =>
+      decodePublishNotebook({
+        ...revisionRef,
+        documentIds: ["/tmp/private-book.pdf"],
+        initialView: { mode: "notebook" },
+      }),
     ).toThrow();
   });
 });

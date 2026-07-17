@@ -39,12 +39,25 @@ Every notebook session receives a separate container with:
 - one CPU, 512 MiB memory, and a 64-process limit;
 - a 64 MiB temporary directory and 256 MiB ephemeral workspace;
 - a 120-second execution timeout, 10 MiB output budget, and bounded event retention;
-- explicitly selected study books mounted read-only; and
+- explicitly selected study books mounted read-only for that session only; and
 - no host workspace or Docker socket mount.
 
 Agent runs are additionally ephemeral and exclusive. Publication is allowed without execution
 authority, but `notebook_execute_cell` and `notebook_execute_all` require the server-owned
 `allowNotebookExecution` grant for the exact thread and immutable revision.
+
+Notebook publication, browser runtime opens, and agent execution send only `documentIds` from the
+selected study context. They never send host paths. After authenticating the environment and project,
+the server resolves the complete selection against that environment's study-library index, verifies
+the exact immutable object key, canonical real path, regular-file type, and containment under the
+library object root, then passes those canonical paths to the runtime manager. Missing, malformed,
+unknown, or escaping selections resolve to no book mounts; the server never broadens them to the full
+library or accepts a partial selection.
+
+Mount ownership is session/container-scoped. A session's normalized book set cannot change after its
+container starts, and a sibling session in the same project receives only its own explicitly selected
+books. Each canonical source object is exposed as read-only `/books/book-N`; no derived host path,
+workspace path, title, or client-provided path is used as a mount source.
 
 ## Inspect a running system
 
@@ -100,7 +113,9 @@ vp test run apps/server/src/notebook/NotebookRuntimeManager.live.test.ts
 
 The live matrix proves stateful execution, rich PNG output, timeout and explicit interruption,
 restart, reconnect/replay, duplicate-command idempotence, network/filesystem/token isolation,
-resource settings, admission limits, cleanup retries, and zero retained containers.
+read-only selected-book access without sibling-session inheritance, resource settings, admission
+limits, cleanup retries, and zero retained containers. Focused contract and server tests additionally
+cover authenticated ID-to-path resolution, malformed/unknown IDs, and path traversal.
 
 ## Troubleshooting
 

@@ -19,6 +19,7 @@ const scope = {
   environmentId: EnvironmentId.make("environment-notebook-agent"),
   projectId: ProjectId.make("project-notebook-agent"),
 };
+const selectedStudyDocumentId = "d".repeat(64);
 const revision = {
   documentId: "notebook-agent",
   revisionId: "a".repeat(64),
@@ -75,6 +76,7 @@ const allowExecutionStart = <A, E, R>(
   _invocation: McpInvocationContext.McpInvocationScope,
   start: Effect.Effect<A, E, R>,
 ): Effect.Effect<A, E, R> => start;
+const resolveNoBookPaths = () => Effect.succeed<ReadonlyArray<string>>([]);
 
 const disposeEvents = (
   input: { readonly sessionId: string; readonly commandId: string },
@@ -101,6 +103,7 @@ it.effect("revalidates authoritative permission before open and traces a denied 
   const traces: StudyTraceRecord[][] = [];
   const tools = makeNotebookAgentTools({
     revisionStore,
+    resolveBookPaths: resolveNoBookPaths,
     runtimeManager: {
       open: async (input) => {
         calls.push("open");
@@ -148,6 +151,7 @@ it.effect("revalidates authoritative permission before open and traces a denied 
           scope,
           documentId: revision.documentId,
           revisionId: revision.revisionId,
+          documentIds: [],
           cellId: "cell-1",
         },
         invocation(true),
@@ -187,7 +191,9 @@ it.effect(
       revisionStore,
       runtimeManager: {
         open: async (input) => {
-          calls.push(`open:${input.kernelName}:${input.runtimeImageDigest ?? "mutable"}`);
+          calls.push(
+            `open:${input.kernelName}:${input.runtimeImageDigest ?? "mutable"}:${input.bookPaths?.join(",") ?? "none"}`,
+          );
           return [
             { ...eventBase(input.commandId), type: "accepted", commandType: "open" },
             { ...eventBase(input.commandId), type: "kernel", state: "idle" },
@@ -224,6 +230,11 @@ it.effect(
       },
       runtimeIdentity: () =>
         Effect.succeed({ imageDigest: `sha256:${"b".repeat(64)}`, kernelLockHash: "c".repeat(64) }),
+      resolveBookPaths: (documentIds) =>
+        Effect.sync(() => {
+          calls.push(`resolve:${documentIds.join(",")}`);
+          return ["/canonical/study-library/objects/dd/selected.pdf"];
+        }),
       withExecutionStart: allowExecutionStart,
       writeTrace: (_runId, records) => Effect.sync(() => traces.push([...records])),
       randomUUID: () => "run-1",
@@ -239,13 +250,15 @@ it.effect(
           scope,
           documentId: revision.documentId,
           revisionId: revision.revisionId,
+          documentIds: [selectedStudyDocumentId],
           cellId: "cell-1",
         },
         invocation(true),
       );
 
       expect(calls).toEqual([
-        `open:python3:sha256:${"b".repeat(64)}`,
+        `resolve:${selectedStudyDocumentId}`,
+        `open:python3:sha256:${"b".repeat(64)}:/canonical/study-library/objects/dd/selected.pdf`,
         "execute:cell-1:print('one')",
         "dispose",
       ]);
@@ -256,6 +269,10 @@ it.effect(
         traceRunId: "notebook-run-1",
       });
       expect(result.outputHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(traces[0]?.[0]?.event).toMatchObject({
+        type: "run_started",
+        documentIds: [selectedStudyDocumentId],
+      });
 
       const execution = traces[0]?.find(({ event }) => event.type === "notebook_execution")?.event;
       const permission = traces[0]?.find(
@@ -305,6 +322,7 @@ it.effect(
     const traces: StudyTraceRecord[][] = [];
     const tools = makeNotebookAgentTools({
       revisionStore,
+      resolveBookPaths: resolveNoBookPaths,
       runtimeManager: {
         open: async (input) => {
           calls.push("open");
@@ -348,7 +366,12 @@ it.effect(
     return Effect.gen(function* () {
       const result = yield* Effect.result(
         tools.executeAll(
-          { scope, documentId: revision.documentId, revisionId: revision.revisionId },
+          {
+            scope,
+            documentId: revision.documentId,
+            revisionId: revision.revisionId,
+            documentIds: [],
+          },
           invocation(true),
         ),
       );
@@ -371,6 +394,7 @@ it.effect("treats runtime rejection as failure and still disposes the isolated s
   const calls: string[] = [];
   const tools = makeNotebookAgentTools({
     revisionStore,
+    resolveBookPaths: resolveNoBookPaths,
     runtimeManager: {
       open: async (input) => {
         calls.push("open");
@@ -426,6 +450,7 @@ it.effect("treats runtime rejection as failure and still disposes the isolated s
           scope,
           documentId: revision.documentId,
           revisionId: revision.revisionId,
+          documentIds: [],
           cellId: "cell-1",
         },
         invocation(true),
@@ -446,6 +471,7 @@ it.effect("persists an interrupted trace before propagating interruption", () =>
   });
   const tools = makeNotebookAgentTools({
     revisionStore,
+    resolveBookPaths: resolveNoBookPaths,
     runtimeManager: {
       open: async (input) => {
         calls.push("open");
@@ -494,6 +520,7 @@ it.effect("persists an interrupted trace before propagating interruption", () =>
           scope,
           documentId: revision.documentId,
           revisionId: revision.revisionId,
+          documentIds: [],
           cellId: "cell-1",
         },
         invocation(true),
@@ -535,6 +562,7 @@ it.effect("waits for an interrupted open to establish ownership before cleanup",
   });
   const tools = makeNotebookAgentTools({
     revisionStore,
+    resolveBookPaths: resolveNoBookPaths,
     runtimeManager: {
       open: async (input) => {
         calls.push("open");
@@ -578,6 +606,7 @@ it.effect("waits for an interrupted open to establish ownership before cleanup",
           scope,
           documentId: revision.documentId,
           revisionId: revision.revisionId,
+          documentIds: [],
           cellId: "cell-1",
         },
         invocation(true),
@@ -604,6 +633,7 @@ it.effect("fails cleanup truth when a resolved dispose response is rejected", ()
   const traces: StudyTraceRecord[][] = [];
   const tools = makeNotebookAgentTools({
     revisionStore,
+    resolveBookPaths: resolveNoBookPaths,
     runtimeManager: {
       open: async (input) => [
         {
@@ -669,6 +699,7 @@ it.effect("fails cleanup truth when a resolved dispose response is rejected", ()
           scope,
           documentId: revision.documentId,
           revisionId: revision.revisionId,
+          documentIds: [],
           cellId: "cell-1",
         },
         invocation(true),
@@ -690,6 +721,7 @@ it.effect("hashes semantic output independently of transport identity", () => {
   const execute = (uuid: string, text: string) => {
     const tools = makeNotebookAgentTools({
       revisionStore,
+      resolveBookPaths: resolveNoBookPaths,
       runtimeManager: {
         open: async (input) => [
           {
@@ -753,6 +785,7 @@ it.effect("hashes semantic output independently of transport identity", () => {
         scope,
         documentId: revision.documentId,
         revisionId: revision.revisionId,
+        documentIds: [],
         cellId: "cell-1",
       },
       invocation(true),

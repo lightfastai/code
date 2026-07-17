@@ -166,6 +166,20 @@ liveIt(
       if (siblingRuntime === undefined) throw new Error("missing sibling runtime client");
       expect(siblingRuntime.options.containerId).not.toBe(primaryRuntime.options.containerId);
 
+      const siblingBookScope = await execute(
+        manager,
+        44,
+        "from pathlib import Path\nprint(f'book-visible={Path(\"/books/book-0\").exists()}')",
+        "sibling-book-scope",
+        "sibling-session",
+      );
+      expect(
+        siblingBookScope
+          .filter((event) => event.type === "stream")
+          .map((event) => (event.type === "stream" ? event.text : ""))
+          .join(""),
+      ).toBe("book-visible=False\n");
+
       await execute(
         manager,
         45,
@@ -390,10 +404,16 @@ liveIt(
           readonly Source: string;
           readonly Type: string;
         }>;
-        expect(mounts).toEqual([
-          expect.objectContaining({ Destination: "/books/book-0", RW: false, Type: "bind" }),
-        ]);
-        expect(mounts[0]?.Source).toBe(bookPath);
+        const isPrimaryContainer = primaryRuntime.options.containerId.startsWith(containerId);
+        if (isPrimaryContainer) {
+          expect(mounts).toEqual([
+            expect.objectContaining({ Destination: "/books/book-0", RW: false, Type: "bind" }),
+          ]);
+          expect(mounts[0]?.Source).toBe(bookPath);
+        } else {
+          expect(siblingRuntime.options.containerId.startsWith(containerId)).toBe(true);
+          expect(mounts).toEqual([]);
+        }
         expect(mounts.some((mount) => /docker\.sock|workspace/i.test(mount.Source))).toBe(false);
 
         const { stdout: configuredEnvironment } = await execFilePromise("docker", [

@@ -100,7 +100,12 @@ export interface NotebookArtifactController {
     readonly contentType: string;
     readonly ipynbJson: string;
   }) => void;
-  readonly connect: (request: RuntimeRequest & { readonly kernelName: string }) => Promise<void>;
+  readonly connect: (
+    request: RuntimeRequest & {
+      readonly kernelName: string;
+      readonly documentIds: ReadonlyArray<string>;
+    },
+  ) => Promise<void>;
   readonly recover: (request: RuntimeRequest) => Promise<void>;
   readonly executeCell: (
     request: RuntimeRequest & { readonly cellId: string; readonly code: string },

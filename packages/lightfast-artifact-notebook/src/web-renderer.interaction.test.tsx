@@ -52,7 +52,12 @@ const revision = (revisionCharacter: string, source: string): NotebookRevision =
   },
 });
 
-const artifact = (id: string, title: string, value: NotebookRevision): ArtifactEnvelope => ({
+const artifact = (
+  id: string,
+  title: string,
+  value: NotebookRevision,
+  documentIds: ReadonlyArray<string> = [],
+): ArtifactEnvelope => ({
   type: "artifact",
   id,
   kind: "notebook",
@@ -64,6 +69,7 @@ const artifact = (id: string, title: string, value: NotebookRevision): ArtifactE
     contentHash: value.contentHash,
     kernel: value.kernel,
     initialView: { mode: "notebook" },
+    documentIds,
   },
   capabilities: ["execute", "edit", "export"],
 });
@@ -217,6 +223,7 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
       order.push(`execute:${request.sessionId}`);
       request.onState(runtime({ output: "fresh-output" }));
     });
+    const selectedDocumentIds = [hash("9")];
     const renderer = await mount(
       bindings(
         controller({
@@ -230,7 +237,12 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
         }),
       ),
       ...revisions.map((value, index) =>
-        artifact(`history-${index}`, `History ${index + 1}`, value),
+        artifact(
+          `history-${index}`,
+          `History ${index + 1}`,
+          value,
+          index === 3 ? selectedDocumentIds : [],
+        ),
       ),
     );
 
@@ -242,7 +254,10 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
     expect(connect).toHaveBeenCalledTimes(0);
 
     const selected = revisions[3]!;
-    const selectedTarget = notebookRuntimeTarget(createNotebookWorkingCopy(selected));
+    const selectedTarget = notebookRuntimeTarget(
+      createNotebookWorkingCopy(selected),
+      selectedDocumentIds,
+    );
     fireEvent.click(
       within(article(renderer, "History 4")).getByRole("button", { name: "Run all" }),
     );
@@ -254,6 +269,7 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
       `execute:${selectedTarget.sessionId}`,
     ]);
     expect(connect).toHaveBeenCalledTimes(1);
+    expect(connect.mock.calls[0]?.[0].documentIds).toEqual(selectedDocumentIds);
     renderer.unmount();
   });
 

@@ -16,22 +16,46 @@ export type NotebookRuntimeTarget = {
   readonly sessionId: string;
   readonly revisionId: string;
   readonly kernelName: string;
+  readonly documentIds: ReadonlyArray<string>;
 };
 
 const utf8Encoder = new TextEncoder();
 const hex = (bytes: Uint8Array): string =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 
-const sessionIdFor = (documentId: string, revisionId: string): string =>
-  `notebook-${hex(sha256(utf8Encoder.encode(documentId))).slice(0, 32)}-${revisionId}`;
+const normalizedStudyDocumentIds = (documentIds: ReadonlyArray<string>): ReadonlyArray<string> => {
+  if (
+    documentIds.length > 32 ||
+    documentIds.some((documentId) => !/^[0-9a-f]{64}$/.test(documentId))
+  ) {
+    return [];
+  }
+  return Array.from(new Set(documentIds)).toSorted();
+};
+
+const sessionIdFor = (
+  documentId: string,
+  revisionId: string,
+  documentIds: ReadonlyArray<string>,
+): string => {
+  const base = `notebook-${hex(sha256(utf8Encoder.encode(documentId))).slice(0, 32)}-${revisionId}`;
+  return documentIds.length === 0
+    ? base
+    : `${base}-${hex(sha256(utf8Encoder.encode(JSON.stringify(documentIds)))).slice(0, 16)}`;
+};
 
 export const notebookRuntimeTarget = (
   working: Pick<NotebookWorkingCopy, "documentId" | "baseRevision">,
-): NotebookRuntimeTarget => ({
-  sessionId: sessionIdFor(working.documentId, working.baseRevision.revisionId),
-  revisionId: working.baseRevision.revisionId,
-  kernelName: working.baseRevision.kernel.name,
-});
+  selectedDocumentIds: ReadonlyArray<string> = [],
+): NotebookRuntimeTarget => {
+  const documentIds = normalizedStudyDocumentIds(selectedDocumentIds);
+  return {
+    sessionId: sessionIdFor(working.documentId, working.baseRevision.revisionId, documentIds),
+    revisionId: working.baseRevision.revisionId,
+    kernelName: working.baseRevision.kernel.name,
+    documentIds,
+  };
+};
 
 export const notebookLifecycleErrorMessage = (cause: unknown): string =>
   cause instanceof Error
@@ -59,6 +83,7 @@ export async function runNotebookTrackedAction(request: {
 type LifecycleRequest = {
   readonly controller: NotebookArtifactController;
   readonly scope: NotebookProjectScope;
+  readonly documentIds?: ReadonlyArray<string>;
   readonly onState: (state: NotebookRuntimeView) => void;
   readonly onWorkingCopy: (working: NotebookWorkingCopy) => void;
   readonly isActive?: () => boolean;
@@ -114,7 +139,7 @@ export async function connectNotebookWorkingCopyRuntime(
   request: LifecycleRequest & { readonly working: NotebookWorkingCopy },
 ): Promise<NotebookRuntimeTarget | null> {
   const isActive = request.isActive ?? (() => true);
-  const target = notebookRuntimeTarget(request.working);
+  const target = notebookRuntimeTarget(request.working, request.documentIds);
   await request.controller.connect({
     scope: request.scope,
     ...target,
@@ -140,8 +165,8 @@ export async function replaceNotebookWorkingCopyRuntime(
   },
 ): Promise<NotebookWorkingCopy | null> {
   const isActive = request.isActive ?? (() => true);
-  const previousTarget = notebookRuntimeTarget(request.working);
-  const nextTarget = notebookRuntimeTarget(request.nextWorking);
+  const previousTarget = notebookRuntimeTarget(request.working, request.documentIds);
+  const nextTarget = notebookRuntimeTarget(request.nextWorking, request.documentIds);
   const revisionChanged =
     request.working.baseRevision.revisionId !== request.nextWorking.baseRevision.revisionId;
   const runtimeMustBeReplaced = revisionChanged || !targetsEqual(previousTarget, nextTarget);

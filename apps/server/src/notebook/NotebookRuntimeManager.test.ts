@@ -577,7 +577,7 @@ const makeHarness = async (options?: {
   return { docker, clients, manager, setNow: (value: number) => (now = value) };
 };
 
-it("uses one hardened container per session and deduplicates concurrent session starts", async () => {
+it("uses one hardened container and one selected-book scope per session", async () => {
   const { docker, clients, manager } = await makeHarness();
   const firstOpen = {
     projectId: "project-1",
@@ -593,12 +593,23 @@ it("uses one hardened container per session and deduplicates concurrent session 
     commandId: "open-2",
     kernelName: "python3",
   });
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-3",
+    commandId: "open-3",
+    kernelName: "python3",
+    bookPaths: ["/safe/books/chemistry.pdf"],
+  });
 
-  expect(clients).toHaveLength(2);
-  expect(clients.map((client) => client.healthCount)).toEqual([1, 1]);
-  expect(clients.map((client) => client.openedSessionIds)).toEqual([["session-1"], ["session-2"]]);
+  expect(clients).toHaveLength(3);
+  expect(clients.map((client) => client.healthCount)).toEqual([1, 1, 1]);
+  expect(clients.map((client) => client.openedSessionIds)).toEqual([
+    ["session-1"],
+    ["session-2"],
+    ["session-3"],
+  ]);
   const runs = docker.calls.filter((call) => call.args[0] === "run");
-  expect(runs).toHaveLength(2);
+  expect(runs).toHaveLength(3);
   for (const run of runs) {
     expect(run.args).toEqual(
       expect.arrayContaining([
@@ -619,19 +630,21 @@ it("uses one hardened container per session and deduplicates concurrent session 
     expect(run.args.some((arg) => arg.startsWith("/workspace:") && arg.includes("size=256m"))).toBe(
       true,
     );
-    expect(
-      run.args.some(
-        (arg) => arg.includes("src=/safe/books/physics.pdf") && arg.includes("readonly"),
-      ),
-    ).toBe(true);
     expect(run.env?.NOTEBOOK_RUNTIME_TOKEN).toBeUndefined();
     expect(run.args).not.toContain("NOTEBOOK_RUNTIME_TOKEN");
   }
-  expect(new Set(runs.map((run) => run.args[run.args.indexOf("--name") + 1])).size).toBe(2);
+  expect(runs[0]?.args).toEqual(
+    expect.arrayContaining([expect.stringMatching(/src=\/safe\/books\/physics\.pdf.*readonly/)]),
+  );
+  expect(runs[1]?.args.some((arg) => arg.startsWith("type=bind,"))).toBe(false);
+  expect(runs[2]?.args).toEqual(
+    expect.arrayContaining([expect.stringMatching(/src=\/safe\/books\/chemistry\.pdf.*readonly/)]),
+  );
+  expect(new Set(runs.map((run) => run.args[run.args.indexOf("--name") + 1])).size).toBe(3);
   const bootstrapContainerIds = docker.calls
     .filter((call) => call.args[0] === "exec")
     .map((call) => call.args[3]);
-  expect(bootstrapContainerIds).toEqual(["container-id-1", "container-id-2"]);
+  expect(bootstrapContainerIds).toEqual(["container-id-1", "container-id-2", "container-id-3"]);
   await manager.close();
 });
 

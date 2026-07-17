@@ -160,6 +160,7 @@ interface OwnedSessionContainer {
   readonly sessionKey: string;
   readonly projectId: string;
   readonly sessionId: string;
+  readonly books: ReadonlyArray<string>;
   readonly containerId: string;
   readonly controlDirectory: string;
   lastUsedAt: number;
@@ -173,12 +174,12 @@ interface SessionRuntime extends OwnedSessionContainer {
 
 interface ProjectState {
   readonly projectId: string;
-  readonly books: ReadonlyArray<string>;
   readonly sessionKeys: Set<string>;
 }
 
 interface SessionStart {
   readonly projectId: string;
+  readonly books: ReadonlyArray<string>;
   readonly promise: Promise<SessionRuntime>;
 }
 
@@ -356,8 +357,14 @@ export class NotebookRuntimeManager {
     if (activeSessionRemoval !== undefined) await activeSessionRemoval;
     this.#assertCanStart();
     this.#assertAdmissionAvailable(input.projectId, sessionKey);
-    const project = this.#selectProject(input.projectId, input.bookPaths ?? []);
-    const runtime = await this.#ensureSession(project, input.sessionId, input.runtimeImageDigest);
+    const books = this.#normalizeBooks(input.bookPaths ?? []);
+    const project = this.#selectProject(input.projectId);
+    const runtime = await this.#ensureSession(
+      project,
+      input.sessionId,
+      books,
+      input.runtimeImageDigest,
+    );
     this.#touch(runtime);
     try {
       const events = await this.#runCached(
@@ -983,21 +990,11 @@ export class NotebookRuntimeManager {
     this.#disposeTombstones.delete(key);
   }
 
-  #selectProject(projectId: string, bookPaths: ReadonlyArray<string>): ProjectState {
-    const requestedBooks = this.#normalizeBooks(bookPaths);
+  #selectProject(projectId: string): ProjectState {
     const existing = this.#projects.get(projectId);
-    if (existing !== undefined) {
-      if (requestedBooks.some((book) => !existing.books.includes(book))) {
-        throw new NotebookRuntimeManagerError({
-          reason: "invalid-mount",
-          message: "Books must be selected before the project runtime starts.",
-        });
-      }
-      return existing;
-    }
+    if (existing !== undefined) return existing;
     const project: ProjectState = {
       projectId,
-      books: requestedBooks,
       sessionKeys: new Set(),
     };
     this.#projects.set(projectId, project);
@@ -1040,14 +1037,21 @@ export class NotebookRuntimeManager {
   async #ensureSession(
     project: ProjectState,
     sessionId: string,
+    books: ReadonlyArray<string>,
     runtimeImageDigest?: string,
   ): Promise<SessionRuntime> {
     this.#assertCanStart();
     const sessionKey = this.#sessionKey(project.projectId, sessionId);
     const existing = this.#sessions.get(sessionKey);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) {
+      this.#assertSameBookScope(existing.books, books);
+      return existing;
+    }
     const starting = this.#sessionStarts.get(sessionKey);
-    if (starting !== undefined) return starting.promise;
+    if (starting !== undefined) {
+      this.#assertSameBookScope(starting.books, books);
+      return starting.promise;
+    }
     this.#assertAdmissionAvailable(project.projectId, sessionKey);
     const promise = Promise.resolve().then(async () => {
       const orphaned = this.#containers.get(sessionKey);
@@ -1055,11 +1059,14 @@ export class NotebookRuntimeManager {
         await this.#removeContainer(orphaned);
         this.#assertCanStart();
         const racedSession = this.#sessions.get(sessionKey);
-        if (racedSession !== undefined) return racedSession;
+        if (racedSession !== undefined) {
+          this.#assertSameBookScope(racedSession.books, books);
+          return racedSession;
+        }
       }
-      return this.#startSession(project, sessionId, sessionKey, runtimeImageDigest);
+      return this.#startSession(project, sessionId, sessionKey, books, runtimeImageDigest);
     });
-    this.#sessionStarts.set(sessionKey, { projectId: project.projectId, promise });
+    this.#sessionStarts.set(sessionKey, { projectId: project.projectId, books, promise });
     try {
       return await promise;
     } finally {
@@ -1073,6 +1080,7 @@ export class NotebookRuntimeManager {
     project: ProjectState,
     sessionId: string,
     sessionKey: string,
+    books: ReadonlyArray<string>,
     runtimeImageDigest?: string,
   ): Promise<SessionRuntime> {
     const projectId = project.projectId;
@@ -1123,7 +1131,7 @@ export class NotebookRuntimeManager {
       "--env",
       `NOTEBOOK_TIMEOUT_IDLE_GRACE_SECONDS=${this.#timeoutIdleGraceSeconds}`,
     ];
-    for (const [index, book] of project.books.entries()) {
+    for (const [index, book] of books.entries()) {
       args.push("--mount", `type=bind,src=${book},dst=/books/book-${index},readonly`);
     }
     if (runtimeImageDigest !== undefined && !/^sha256:[0-9a-f]{64}$/.test(runtimeImageDigest)) {
@@ -1142,6 +1150,7 @@ export class NotebookRuntimeManager {
         sessionKey,
         projectId,
         sessionId,
+        books,
         containerId,
         controlDirectory,
         lastUsedAt: this.#now(),
@@ -1190,6 +1199,7 @@ export class NotebookRuntimeManager {
         sessionKey,
         projectId,
         sessionId,
+        books,
         containerId,
         controlDirectory,
         lastUsedAt: ownedContainer.lastUsedAt,
@@ -1233,14 +1243,31 @@ export class NotebookRuntimeManager {
   }
 
   #normalizeBooks(bookPaths: ReadonlyArray<string>): ReadonlyArray<string> {
-    return bookPaths.map((bookPath) => {
-      if (!NodePath.isAbsolute(bookPath) || /[,\n\r]/.test(bookPath)) {
-        throw new NotebookRuntimeManagerError({
-          reason: "invalid-mount",
-          message: "Notebook book mount path is invalid.",
-        });
-      }
-      return NodePath.resolve(bookPath);
+    return Array.from(
+      new Set(
+        bookPaths.map((bookPath) => {
+          if (!NodePath.isAbsolute(bookPath) || /[,\n\r]/.test(bookPath)) {
+            throw new NotebookRuntimeManagerError({
+              reason: "invalid-mount",
+              message: "Notebook book mount path is invalid.",
+            });
+          }
+          return NodePath.resolve(bookPath);
+        }),
+      ),
+    ).toSorted();
+  }
+
+  #assertSameBookScope(current: ReadonlyArray<string>, requested: ReadonlyArray<string>): void {
+    if (
+      current.length === requested.length &&
+      current.every((book, index) => book === requested[index])
+    ) {
+      return;
+    }
+    throw new NotebookRuntimeManagerError({
+      reason: "invalid-mount",
+      message: "Notebook session book scope cannot change after runtime startup.",
     });
   }
 

@@ -96,6 +96,67 @@ export const readStudyLibraryIndex = Effect.fn("StudyLibrary.readIndex")(functio
   );
 });
 
+export const resolveStudyDocumentMountPaths = Effect.fn("StudyLibrary.resolveMountPaths")(
+  function* (paths: StudyLibraryPaths, documentIds: ReadonlyArray<StudyDocumentId>) {
+    const selectedIds = Array.from(new Set(documentIds));
+    if (
+      selectedIds.length === 0 ||
+      selectedIds.length > 32 ||
+      selectedIds.some((documentId) => !/^[0-9a-f]{64}$/.test(documentId))
+    ) {
+      return [] as ReadonlyArray<string>;
+    }
+
+    return yield* Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const index = yield* readStudyLibraryIndex(paths);
+      const documents = selectedIds.map((documentId) =>
+        index.documents.find((document) => document.id === documentId),
+      );
+      if (documents.some((document) => document === undefined)) {
+        return [] as ReadonlyArray<string>;
+      }
+
+      const canonicalObjectsRoot = yield* fileSystem.realPath(paths.objects);
+      const resolved: string[] = [];
+      for (const document of documents) {
+        if (document === undefined || document.sha256 !== document.id) {
+          return [] as ReadonlyArray<string>;
+        }
+        const expectedObjectKey = `objects/${document.id.slice(0, 2)}/${document.id}.${extensionForFormat(document.format)}`;
+        if (document.objectKey !== expectedObjectKey) return [] as ReadonlyArray<string>;
+
+        const candidate = path.resolve(paths.root, ...document.objectKey.split("/"));
+        const lexicalRelative = path.relative(paths.objects, candidate);
+        if (
+          lexicalRelative === "" ||
+          lexicalRelative === ".." ||
+          lexicalRelative.startsWith(`..${path.sep}`) ||
+          path.isAbsolute(lexicalRelative)
+        ) {
+          return [] as ReadonlyArray<string>;
+        }
+
+        const canonicalCandidate = yield* fileSystem.realPath(candidate);
+        const canonicalRelative = path.relative(canonicalObjectsRoot, canonicalCandidate);
+        if (
+          canonicalRelative === "" ||
+          canonicalRelative === ".." ||
+          canonicalRelative.startsWith(`..${path.sep}`) ||
+          path.isAbsolute(canonicalRelative)
+        ) {
+          return [] as ReadonlyArray<string>;
+        }
+        const info = yield* fileSystem.stat(canonicalCandidate);
+        if (info.type !== "File") return [] as ReadonlyArray<string>;
+        resolved.push(canonicalCandidate);
+      }
+      return resolved;
+    }).pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+  },
+);
+
 const writeStudyLibraryIndex = Effect.fn("StudyLibrary.writeIndex")(function* (
   paths: StudyLibraryPaths,
   index: StudyLibraryIndex,

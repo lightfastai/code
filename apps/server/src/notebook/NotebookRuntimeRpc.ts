@@ -10,6 +10,7 @@ import {
   type NotebookSessionEventsInput,
   type NotebookSessionOpenInput,
   type ProjectId,
+  type StudyDocumentId,
   WS_METHODS,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -44,6 +45,9 @@ export interface NotebookRuntimeRpcDependencies {
   readonly projectExists: (
     projectId: ProjectId,
   ) => Effect.Effect<boolean, ProjectionRepositoryError>;
+  readonly resolveBookPaths: (
+    documentIds: ReadonlyArray<StudyDocumentId>,
+  ) => Effect.Effect<ReadonlyArray<string>>;
   readonly manager: NotebookRuntimeManager;
 }
 
@@ -164,12 +168,14 @@ export const makeNotebookRuntimeRpcHandlers = (dependencies: NotebookRuntimeRpcD
         WS_METHODS.notebookSessionOpen,
         Effect.gen(function* () {
           yield* validateScope(input.scope);
+          const bookPaths = yield* dependencies.resolveBookPaths(input.documentIds);
           return yield* promise(() =>
             dependencies.manager.open({
               projectId: input.scope.projectId,
               sessionId: input.sessionId,
               commandId: input.commandId,
               kernelName: input.kernelName,
+              bookPaths,
             }),
           );
         }),

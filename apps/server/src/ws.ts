@@ -3,8 +3,10 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -116,7 +118,11 @@ import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
-import { readStudyLibraryIndex, resolveStudyLibraryPaths } from "./study/StudyLibrary.ts";
+import {
+  readStudyLibraryIndex,
+  resolveStudyDocumentMountPaths,
+  resolveStudyLibraryPaths,
+} from "./study/StudyLibrary.ts";
 import { searchStudyLibrary } from "./study/StudySearch.ts";
 import { createStudyVoiceSession } from "./study/StudyVoiceSession.ts";
 import * as NotebookRevisionStore from "./notebook/NotebookRevisionStore.ts";
@@ -434,6 +440,8 @@ const makeWsRpcLayer = (
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
       const config = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
       const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
@@ -982,6 +990,14 @@ const makeWsRpcLayer = (
         environmentId: serverEnvironment.getEnvironmentId,
         projectExists: (projectId) =>
           projectionSnapshotQuery.getProjectShellById(projectId).pipe(Effect.map(Option.isSome)),
+        resolveBookPaths: (documentIds) =>
+          Effect.gen(function* () {
+            const paths = yield* resolveStudyLibraryPaths(config.studyLibraryDir);
+            return yield* resolveStudyDocumentMountPaths(paths, documentIds);
+          }).pipe(
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
+          ),
         manager: notebookRuntimeManager,
       });
 

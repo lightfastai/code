@@ -483,6 +483,38 @@ describe("notebook runtime lifecycle", () => {
     expect(bindings.connect).not.toHaveBeenCalled();
   });
 
+  it("binds selected study document IDs to the web runtime session and connect request", async () => {
+    const loaded = revision("selected-books-doc", {
+      name: "python3",
+      displayName: "Python 3",
+      language: "python",
+    });
+    const working = createNotebookWorkingCopy(loaded);
+    const documentIds = ["b".repeat(64), "a".repeat(64), "b".repeat(64)];
+    const connect = vi.fn<NotebookArtifactController["connect"]>(async () => undefined);
+    const bindings = controller({ connect });
+
+    const unscoped = notebookRuntimeTarget(working);
+    const scoped = notebookRuntimeTarget(working, documentIds);
+    await connectNotebookWorkingCopyRuntime({
+      controller: bindings,
+      scope,
+      working,
+      documentIds,
+      onState,
+      onWorkingCopy: vi.fn(),
+    });
+
+    expect(scoped.sessionId).not.toBe(unscoped.sessionId);
+    expect(scoped.documentIds).toEqual(["a".repeat(64), "b".repeat(64)]);
+    expect(connect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: scoped.sessionId,
+        documentIds: scoped.documentIds,
+      }),
+    );
+  });
+
   it("drops stale runtime callbacks after a lazy connection generation is invalidated", async () => {
     const loaded = revision("original-doc", {
       name: "python3",

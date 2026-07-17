@@ -23,6 +23,7 @@ export const makeNotebookArtifact = (input: {
       contentHash: input.payload.contentHash,
       kernel: input.payload.kernel,
       initialView,
+      documentIds: input.payload.documentIds ?? [],
     },
     capabilities: [...notebookArtifactDefinition.capabilities],
   };

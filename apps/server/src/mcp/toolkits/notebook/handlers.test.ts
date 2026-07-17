@@ -74,6 +74,7 @@ it.effect("publishes an exact immutable notebook revision without the execution 
       scope: { environmentId, projectId },
       documentId: revision.documentId,
       revisionId: revision.revisionId,
+      documentIds: ["b".repeat(64)],
       initialView: { mode: "notebook" },
     });
 
@@ -88,6 +89,7 @@ it.effect("publishes an exact immutable notebook revision without the execution 
           documentId: revision.documentId,
           revisionId: revision.revisionId,
           contentHash: revision.contentHash,
+          documentIds: ["b".repeat(64)],
         },
       },
     });

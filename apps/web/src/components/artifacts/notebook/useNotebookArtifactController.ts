@@ -219,6 +219,7 @@ export function useNotebookArtifactController(): NotebookArtifactController {
                     sessionId: request.sessionId,
                     commandId: commandId("open"),
                     kernelName: request.kernelName,
+                    documentIds: request.documentIds,
                   },
                 }),
               ),

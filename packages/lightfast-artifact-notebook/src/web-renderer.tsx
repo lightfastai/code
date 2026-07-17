@@ -45,6 +45,7 @@ const INITIAL_RUNTIME_STATE: NotebookRuntimeView = {
   runningCellIds: new Set(),
   error: null,
 };
+const EMPTY_DOCUMENT_IDS: ReadonlyArray<string> = [];
 
 let fallbackId = 0;
 const randomToken = (): string => {
@@ -81,6 +82,9 @@ export function NotebookArtifactEnvelopeRenderer({
 }) {
   const bindings = useNotebookWebBindings();
   const payload = isNotebookPayload(artifact.payload) ? artifact.payload : null;
+  const documentIds = Array.isArray(payload?.documentIds)
+    ? payload.documentIds
+    : EMPTY_DOCUMENT_IDS;
   const [working, setWorking] = useState<NotebookWorkingCopy | null>(null);
   const [runtime, setRuntime] = useState<NotebookRuntimeView>(INITIAL_RUNTIME_STATE);
   const [runtimeReady, setRuntimeReady] = useState(false);
@@ -100,7 +104,7 @@ export function NotebookArtifactEnvelopeRenderer({
     readonly promise: Promise<ReturnType<typeof notebookRuntimeTarget> | null>;
   } | null>(null);
   const importInput = useRef<HTMLInputElement | null>(null);
-  const runtimeTarget = working === null ? null : notebookRuntimeTarget(working);
+  const runtimeTarget = working === null ? null : notebookRuntimeTarget(working, documentIds);
   const sessionId = runtimeTarget?.sessionId ?? "notebook-invalid";
   const runtimeRevisionId = runtimeTarget?.revisionId ?? payload?.revisionId ?? "invalid";
 
@@ -198,7 +202,7 @@ export function NotebookArtifactEnvelopeRenderer({
 
   const ensureRuntime = useCallback(async () => {
     if (bindings === null || working === null) return null;
-    const target = notebookRuntimeTarget(working);
+    const target = notebookRuntimeTarget(working, documentIds);
     const targetKey = `${target.sessionId}\0${target.kernelName}`;
     if (connectedRuntimeRef.current === targetKey) return target;
     const activeAttempt = connectionAttemptRef.current;
@@ -210,6 +214,7 @@ export function NotebookArtifactEnvelopeRenderer({
       controller: bindings.controller,
       scope: bindings.scope,
       working,
+      documentIds,
       onState: onRuntimeState,
       isActive,
       onWorkingCopy: () => undefined,
@@ -233,7 +238,7 @@ export function NotebookArtifactEnvelopeRenderer({
         connectionAttemptRef.current = null;
       }
     }
-  }, [bindings, onRuntimeState, working]);
+  }, [bindings, documentIds, onRuntimeState, working]);
 
   const transitionWorkingCopy = useCallback(
     (
@@ -257,8 +262,8 @@ export function NotebookArtifactEnvelopeRenderer({
             ? await resolveNextWorking()
             : resolveNextWorking;
         if (!isActive()) return;
-        const previousTarget = notebookRuntimeTarget(working);
-        const nextTarget = notebookRuntimeTarget(nextWorking);
+        const previousTarget = notebookRuntimeTarget(working, documentIds);
+        const nextTarget = notebookRuntimeTarget(nextWorking, documentIds);
         const runtimeRetained =
           runtimeReady &&
           previousTarget.sessionId === nextTarget.sessionId &&
@@ -274,6 +279,7 @@ export function NotebookArtifactEnvelopeRenderer({
             scope: bindings.scope,
             working,
             nextWorking,
+            documentIds,
             disposePreviousRuntime: runtimeReady,
             onState: onRuntimeState,
             isActive,
@@ -293,6 +299,7 @@ export function NotebookArtifactEnvelopeRenderer({
     },
     [
       bindings,
+      documentIds,
       interruptPending,
       onRuntimeState,
       pendingAction,
@@ -550,6 +557,7 @@ export function NotebookArtifactEnvelopeRenderer({
                       sessionId,
                       revisionId: runtimeRevisionId,
                       kernelName,
+                      documentIds,
                       onState: onRuntimeState,
                     });
                     await bindings.controller.recover({
@@ -800,6 +808,7 @@ export function NotebookArtifactEnvelopeRenderer({
                       scope: bindings.scope,
                       working,
                       ipynbJson: await file.text(),
+                      documentIds,
                       disposePreviousRuntime: runtimeReady,
                       onState: onRuntimeState,
                       isActive,

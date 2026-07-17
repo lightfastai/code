@@ -1,17 +1,22 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { StudyLibraryIndex } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 
 import {
   importStudyDocument,
   readStudyLibraryIndex,
+  resolveStudyDocumentMountPaths,
   resolveStudyLibraryPaths,
   tagStudyDocument,
 } from "./StudyLibrary.ts";
+
+const encodeIndex = Schema.encodeEffect(Schema.fromJsonString(StudyLibraryIndex));
 
 it.layer(NodeServices.layer)("StudyLibrary", (it) => {
   it.effect("imports immutable documents and merges duplicate tags", () =>
@@ -68,6 +73,50 @@ it.layer(NodeServices.layer)("StudyLibrary", (it) => {
 
         assert.strictEqual(tagged.id, imported.id);
         assert.deepStrictEqual(tagged.tags, ["linear algebra", "revision"]);
+      }),
+    ),
+  );
+
+  it.effect("resolves selected IDs to canonical library objects and fails closed", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temp = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "study-library-mounts-",
+        });
+        const source = path.join(temp, "selected.md");
+        yield* fileSystem.writeFileString(source, "# Selected\n");
+        const paths = yield* resolveStudyLibraryPaths(path.join(temp, "library"));
+        const imported = yield* importStudyDocument({ paths, sourcePath: source });
+        const objectPath = path.join(paths.root, ...imported.objectKey.split("/"));
+
+        assert.deepStrictEqual(yield* resolveStudyDocumentMountPaths(paths, [imported.id]), [
+          yield* fileSystem.realPath(objectPath),
+        ]);
+        assert.deepStrictEqual(yield* resolveStudyDocumentMountPaths(paths, []), []);
+        assert.deepStrictEqual(
+          yield* resolveStudyDocumentMountPaths(paths, ["f".repeat(64) as typeof imported.id]),
+          [],
+        );
+        assert.deepStrictEqual(
+          yield* resolveStudyDocumentMountPaths(paths, ["../../etc/passwd" as typeof imported.id]),
+          [],
+        );
+
+        const outside = path.join(temp, "outside.md");
+        yield* fileSystem.writeFileString(outside, "outside");
+        const index = yield* readStudyLibraryIndex(paths);
+        const corruptedIndex = yield* encodeIndex({
+          ...index,
+          documents: index.documents.map((document) => ({
+            ...document,
+            objectKey: "../outside.md",
+          })),
+        });
+        yield* fileSystem.writeFileString(paths.index, `${corruptedIndex}\n`);
+
+        assert.deepStrictEqual(yield* resolveStudyDocumentMountPaths(paths, [imported.id]), []);
       }),
     ),
   );
