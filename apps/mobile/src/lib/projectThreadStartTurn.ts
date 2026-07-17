@@ -6,6 +6,7 @@ import {
   type ProjectId,
   type ProviderInteractionMode,
   type RuntimeMode,
+  type SelectedStudyDocumentIds,
 } from "@t3tools/contracts";
 
 import type { DraftComposerImageAttachment } from "./composerImages";
@@ -29,6 +30,7 @@ export interface ProjectThreadStartTurnSpec {
   readonly createdAt: string;
   readonly text: string;
   readonly attachments: ReadonlyArray<DraftComposerImageAttachment>;
+  readonly documentIds: SelectedStudyDocumentIds;
   readonly modelSelection: ModelSelection;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: ProviderInteractionMode;
@@ -58,6 +60,7 @@ export function buildProjectThreadStartTurnInput(spec: ProjectThreadStartTurnSpe
       attachments: spec.attachments,
     },
     modelSelection: spec.modelSelection,
+    documentIds: spec.documentIds,
     titleSeed: title,
     runtimeMode: spec.runtimeMode,
     interactionMode: spec.interactionMode,

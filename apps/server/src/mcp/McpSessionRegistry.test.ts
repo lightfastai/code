@@ -127,6 +127,41 @@ it.effect("defaults notebook execution to denied and updates every credential fo
   }),
 );
 
+it.effect("defaults notebook document authority closed and updates every thread credential", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const threadId = ThreadId.make("thread-notebook-documents");
+    const otherThreadId = ThreadId.make("thread-notebook-documents-other");
+    const issued = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const other = yield* registry.issue({
+      threadId: otherThreadId,
+      providerInstanceId: ProviderInstanceId.make("claude"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    const otherToken = other.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([]);
+    const normalized = yield* registry.setNotebookDocumentAuthority({
+      threadId,
+      documentIds: ["b".repeat(64), "a".repeat(64), "b".repeat(64)],
+    });
+
+    expect(normalized).toEqual(["a".repeat(64), "b".repeat(64)]);
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual(normalized);
+    expect((yield* registry.resolve(otherToken))?.notebookDocumentIds).toEqual([]);
+
+    const replacement = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const replacementToken = replacement.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    expect((yield* registry.resolve(replacementToken))?.notebookDocumentIds).toEqual(normalized);
+  }),
+);
+
 it.effect("revalidates the authenticated thread grant atomically at runtime start", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry(() => 1_000);
@@ -150,6 +185,7 @@ it.effect("revalidates the authenticated thread grant atomically at runtime star
         yield* Deferred.await(resume);
         return yield* registry.withNotebookExecutionStart(
           invocation,
+          [],
           Effect.sync(() => runtimeStarts.push(invocation.threadId)),
         );
       }),
@@ -164,13 +200,28 @@ it.effect("revalidates the authenticated thread grant atomically at runtime star
     expect(runtimeStarts).toEqual([]);
 
     yield* registry.setNotebookExecutionPermission({ threadId, allowNotebookExecution: true });
+    yield* registry.setNotebookDocumentAuthority({
+      threadId,
+      documentIds: ["a".repeat(64)],
+    });
     const swapped = yield* registry
       .withNotebookExecutionStart(
         { ...invocation, threadId: ThreadId.make("thread-notebook-swapped") },
+        [],
         Effect.sync(() => runtimeStarts.push("swapped")),
       )
       .pipe(Effect.flip);
     expect(swapped).toMatchObject({ reason: "permission-denied" });
+    expect(runtimeStarts).toEqual([]);
+
+    const widened = yield* registry
+      .withNotebookExecutionStart(
+        { ...invocation, notebookDocumentIds: ["a".repeat(64)] },
+        ["b".repeat(64)],
+        Effect.sync(() => runtimeStarts.push("widened")),
+      )
+      .pipe(Effect.flip);
+    expect(widened).toMatchObject({ reason: "scope-mismatch" });
     expect(runtimeStarts).toEqual([]);
   }),
 );
@@ -192,6 +243,7 @@ it.effect("serializes permission revocation with the complete runtime start boun
     const execution = yield* Effect.forkChild(
       registry.withNotebookExecutionStart(
         invocation,
+        [],
         Deferred.succeed(startEntered, undefined).pipe(
           Effect.andThen(Deferred.await(releaseStart)),
         ),

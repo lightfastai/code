@@ -15,6 +15,7 @@ import { NotebookCodeCell } from "@t3tools/lightfast-artifact-notebook/contracts
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import { narrowStudyDocumentIds } from "@t3tools/shared/studyContext";
 
 import type * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import { buildStudyTraceRecord, hashStudyValue } from "../study/StudyTraceStore.ts";
@@ -55,6 +56,7 @@ export interface NotebookAgentToolsDependencies {
   >;
   readonly withExecutionStart: <A, E, R>(
     invocation: McpInvocationContext.McpInvocationScope,
+    documentIds: NotebookAgentExecuteAllInput["documentIds"],
     start: Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E | NotebookAgentToolError, R>;
   readonly writeTrace: (
@@ -207,12 +209,22 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
     input: NotebookAgentExecuteAllInput | NotebookAgentExecuteCellInput,
     invocation: McpInvocationContext.McpInvocationScope,
   ) {
-    const documentIds =
+    const requestedDocumentIds =
       Array.isArray(input.documentIds) &&
       input.documentIds.length <= 32 &&
       input.documentIds.every((documentId) => /^[0-9a-f]{64}$/.test(documentId))
         ? input.documentIds
         : [];
+    const documentIds = narrowStudyDocumentIds(
+      invocation.notebookDocumentIds ?? [],
+      requestedDocumentIds,
+    );
+    if (documentIds === null) {
+      return yield* toolError(
+        "scope-mismatch",
+        "The requested study documents exceed this turn's notebook authority.",
+      );
+    }
     if (input.scope.environmentId !== invocation.environmentId) {
       return yield* toolError(
         "scope-mismatch",
@@ -246,14 +258,6 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
       return yield* toolError("cell-not-found", "The requested code cell was not found.");
     }
 
-    const bookPaths = yield* dependencies.resolveBookPaths(documentIds);
-    const identity = yield* dependencies
-      .runtimeIdentity()
-      .pipe(
-        Effect.mapError(() =>
-          toolError("runtime-unavailable", "The exact notebook runtime identity is unavailable."),
-        ),
-      );
     const uuid = dependencies.randomUUID().replace(/[^A-Za-z0-9_-]/g, "-");
     const runId = `notebook-${uuid}` as StudyTraceRunId;
     const operationId = `notebook-operation-${uuid}`.slice(0, 256);
@@ -274,6 +278,9 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
         });
 
         let permissionGranted = false;
+        let runtimeIdentity:
+          | { readonly imageDigest: string; readonly kernelLockHash: string }
+          | undefined;
         let executionFailure: NotebookAgentToolError | undefined;
         let opened = false;
         let cleanupAttempted = false;
@@ -330,24 +337,34 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
                   const result = yield* Effect.result(
                     dependencies.withExecutionStart(
                       invocation,
-                      Effect.sync(() => {
+                      documentIds,
+                      Effect.gen(function* () {
+                        const bookPaths = yield* dependencies.resolveBookPaths(documentIds);
+                        const identity = yield* dependencies
+                          .runtimeIdentity()
+                          .pipe(
+                            Effect.mapError(() =>
+                              toolError(
+                                "runtime-unavailable",
+                                "The exact notebook runtime identity is unavailable.",
+                              ),
+                            ),
+                          );
+                        runtimeIdentity = identity;
                         permissionGranted = true;
-                      }).pipe(
-                        Effect.andThen(
-                          Effect.tryPromise({
-                            try: () =>
-                              dependencies.runtimeManager.open({
-                                projectId: input.scope.projectId,
-                                sessionId,
-                                commandId: openCommandId,
-                                kernelName: revision.kernel.name,
-                                bookPaths,
-                                runtimeImageDigest: identity.imageDigest,
-                              }),
-                            catch: runtimeError,
-                          }),
-                        ),
-                      ),
+                        return yield* Effect.tryPromise({
+                          try: () =>
+                            dependencies.runtimeManager.open({
+                              projectId: input.scope.projectId,
+                              sessionId,
+                              commandId: openCommandId,
+                              kernelName: revision.kernel.name,
+                              bookPaths,
+                              runtimeImageDigest: identity.imageDigest,
+                            }),
+                          catch: runtimeError,
+                        });
+                      }),
                     ),
                   );
                   if (result._tag === "Success") {
@@ -428,6 +445,10 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
         const interrupted = Exit.hasInterrupts(bodyExit);
         yield* cleanup();
 
+        if (executionFailure?.reason === "scope-mismatch") {
+          return yield* executionFailure;
+        }
+
         const finishedAtMs = dependencies.now();
         const finishedAt = timestamp(finishedAtMs);
         const outputHash = hashStudyValue(semanticOutput(runtimeEvents));
@@ -439,44 +460,45 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
           providerSessionId: invocation.providerSessionId,
           permissionGranted,
         };
-        const event: StudyNotebookExecutionEvent | undefined = permissionGranted
-          ? {
-              type: "notebook_execution",
-              operation,
-              operationId,
-              outcome: interrupted
-                ? "interrupted"
-                : executionFailure === undefined && bodyExit._tag === "Success"
-                  ? "completed"
-                  : "failed",
-              permissionGranted: true,
-              binding: {
-                documentId: revision.documentId,
-                revisionId: revision.revisionId,
-                contentHash: revision.contentHash,
-                runtimeImageDigest: identity.imageDigest,
-                kernelLockHash: identity.kernelLockHash,
-                kernelName: revision.kernel.name,
-              },
-              sessionId,
-              isolation: {
-                session: "ephemeral-exclusive",
-                network: "disabled",
-                hostWorkspace: "not-mounted",
-              },
-              commands,
-              runtimeEvents,
-              outputHash,
-              startedAt,
-              finishedAt,
-              durationMs: Math.max(0, finishedAtMs - startedAtMs),
-              cleanup: {
-                attempted: cleanupAttempted,
-                succeeded: cleanupSucceeded,
-                ...(disposeCommandId === undefined ? {} : { commandId: disposeCommandId }),
-              },
-            }
-          : undefined;
+        const event: StudyNotebookExecutionEvent | undefined =
+          permissionGranted && runtimeIdentity !== undefined
+            ? {
+                type: "notebook_execution",
+                operation,
+                operationId,
+                outcome: interrupted
+                  ? "interrupted"
+                  : executionFailure === undefined && bodyExit._tag === "Success"
+                    ? "completed"
+                    : "failed",
+                permissionGranted: true,
+                binding: {
+                  documentId: revision.documentId,
+                  revisionId: revision.revisionId,
+                  contentHash: revision.contentHash,
+                  runtimeImageDigest: runtimeIdentity.imageDigest,
+                  kernelLockHash: runtimeIdentity.kernelLockHash,
+                  kernelName: revision.kernel.name,
+                },
+                sessionId,
+                isolation: {
+                  session: "ephemeral-exclusive",
+                  network: "disabled",
+                  hostWorkspace: "not-mounted",
+                },
+                commands,
+                runtimeEvents,
+                outputHash,
+                startedAt,
+                finishedAt,
+                durationMs: Math.max(0, finishedAtMs - startedAtMs),
+                cleanup: {
+                  attempted: cleanupAttempted,
+                  succeeded: cleanupSucceeded,
+                  ...(disposeCommandId === undefined ? {} : { commandId: disposeCommandId }),
+                },
+              }
+            : undefined;
         const records = traceRecords({
           runId,
           documentIds,

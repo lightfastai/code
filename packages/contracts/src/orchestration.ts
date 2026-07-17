@@ -22,6 +22,7 @@ import {
 } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import { ChatArtifactAttachment } from "./artifacts.ts";
+import { SelectedStudyDocumentIds } from "./study.ts";
 
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
@@ -610,6 +611,9 @@ export const ThreadTurnStartCommand = Schema.Struct({
     attachments: Schema.Array(ChatImageAttachment),
   }),
   modelSelection: Schema.optional(ModelSelection),
+  documentIds: Schema.optional(SelectedStudyDocumentIds).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   titleSeed: Schema.optional(TrimmedNonEmptyString),
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
   interactionMode: ProviderInteractionMode.pipe(
@@ -631,6 +635,9 @@ const ClientThreadTurnStartCommand = Schema.Struct({
     attachments: Schema.Array(UploadChatAttachment),
   }),
   modelSelection: Schema.optional(ModelSelection),
+  documentIds: Schema.optional(SelectedStudyDocumentIds).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   titleSeed: Schema.optional(TrimmedNonEmptyString),
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
@@ -939,6 +946,9 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,
   modelSelection: Schema.optional(ModelSelection),
+  documentIds: Schema.optional(SelectedStudyDocumentIds).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   titleSeed: Schema.optional(TrimmedNonEmptyString),
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
   interactionMode: ProviderInteractionMode.pipe(

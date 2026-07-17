@@ -44,6 +44,7 @@ const invocation: McpInvocationContext.McpInvocationScope = {
   providerInstanceId: ProviderInstanceId.make("codex"),
   capabilities: new Set(["artifacts"]),
   allowNotebookExecution: false,
+  notebookDocumentIds: ["a".repeat(64), "b".repeat(64)],
   issuedAt: 1,
   expiresAt: Number.MAX_SAFE_INTEGER,
 };
@@ -93,6 +94,52 @@ it.effect("publishes an exact immutable notebook revision without the execution 
         },
       },
     });
+  }).pipe(
+    Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+    Effect.provideService(ProjectionSnapshotQuery, projection),
+    Effect.provideService(NotebookRevisionStore, store),
+    Effect.provideService(OrchestrationEngineService, orchestration),
+  );
+});
+
+it.effect("rejects publication that widens the server-owned notebook document authority", () => {
+  const dispatched: OrchestrationCommand[] = [];
+  let revisionReads = 0;
+  const projection = ProjectionSnapshotQuery.of({
+    getThreadShellById: () => Effect.succeed(Option.some({ projectId } as never)),
+  } as unknown as ProjectionSnapshotQuery["Service"]);
+  const store = NotebookRevisionStore.of({
+    read: () =>
+      Effect.sync(() => {
+        revisionReads += 1;
+        return revision;
+      }),
+    save: () => Effect.die("unused"),
+    importIpynb: () => Effect.die("unused"),
+    exportIpynb: () => Effect.die("unused"),
+  });
+  const orchestration = OrchestrationEngineService.of({
+    dispatch: (command) =>
+      Effect.sync(() => {
+        dispatched.push(command);
+        return { sequence: 1 };
+      }),
+    readEvents: () => Stream.empty,
+    streamDomainEvents: Stream.empty,
+  });
+
+  return Effect.gen(function* () {
+    const error = yield* publishNotebook({
+      scope: { environmentId, projectId },
+      documentId: revision.documentId,
+      revisionId: revision.revisionId,
+      documentIds: ["c".repeat(64)],
+      initialView: { mode: "notebook" },
+    }).pipe(Effect.flip);
+
+    expect(error).toMatchObject({ _tag: "ArtifactPublishError" });
+    expect(revisionReads).toBe(0);
+    expect(dispatched).toEqual([]);
   }).pipe(
     Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
     Effect.provideService(ProjectionSnapshotQuery, projection),

@@ -27,7 +27,7 @@ const sharedDependencies = [
 
 export const PublishNotebookArtifactTool = Tool.make("artifact_publish_notebook", {
   description:
-    "Publish an exact immutable notebook revision into this conversation. Pass documentIds from the user's selected study context (or an empty array) so later user-run cells retain the same book scope. This does not execute code and remains available when agent notebook execution is disabled.",
+    "Publish an exact immutable notebook revision into this conversation. documentIds may only equal or narrow the server-owned study selection for this turn; never invent or widen IDs. The accepted subset is retained for later user-run cells. This does not execute code and remains available when agent notebook execution is disabled.",
   parameters: PublishNotebookArtifactInput,
   success: PublishNotebookArtifactResult,
   failure: ArtifactPublishError,
@@ -50,7 +50,7 @@ const executionDependencies = [
 
 export const ExecuteNotebookCellTool = Tool.make("notebook_execute_cell", {
   description:
-    "Execute one code cell from an exact immutable notebook revision in an isolated local runtime. Pass documentIds from the user's selected study context (or an empty array); IDs are resolved server-side and arbitrary paths are never accepted. Requires the explicit notebook execution grant for this thread.",
+    "Execute one code cell from an exact immutable notebook revision in an isolated local runtime. documentIds may only equal or narrow the server-owned study selection for this turn; arbitrary paths and widened IDs are rejected. Requires the explicit notebook execution grant for this thread.",
   parameters: NotebookAgentExecuteCellInput,
   success: NotebookAgentExecutionResult,
   failure: NotebookAgentToolError,
@@ -64,7 +64,7 @@ export const ExecuteNotebookCellTool = Tool.make("notebook_execute_cell", {
 
 export const ExecuteNotebookAllTool = Tool.make("notebook_execute_all", {
   description:
-    "Execute every code cell, in document order, from an exact immutable notebook revision in an isolated local runtime. Pass documentIds from the user's selected study context (or an empty array); IDs are resolved server-side and arbitrary paths are never accepted. Requires the explicit notebook execution grant for this thread.",
+    "Execute every code cell, in document order, from an exact immutable notebook revision in an isolated local runtime. documentIds may only equal or narrow the server-owned study selection for this turn; arbitrary paths and widened IDs are rejected. Requires the explicit notebook execution grant for this thread.",
   parameters: NotebookAgentExecuteAllInput,
   success: NotebookAgentExecutionResult,
   failure: NotebookAgentToolError,

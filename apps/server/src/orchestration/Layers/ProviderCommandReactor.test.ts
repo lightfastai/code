@@ -60,6 +60,7 @@ import * as Clock from "effect/Clock";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as GitWorkflowService from "../../git/GitWorkflowService.ts";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asApprovalRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
@@ -98,6 +99,7 @@ describe("ProviderCommandReactor", () => {
   const createdBaseDirs = new Set<string>();
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     if (scope) {
       await Effect.runPromise(Scope.close(scope, Exit.void));
     }
@@ -153,6 +155,7 @@ describe("ProviderCommandReactor", () => {
     const { stateDir } = deriveServerPathsSync(baseDir, undefined);
     createdStateDirs.add(stateDir);
     const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+    const lifecycleCalls: string[] = [];
     let nextSessionIndex = 1;
     const runtimeSessions: Array<ProviderSession> = [];
     const modelSelection = input?.threadModelSelection ?? {
@@ -160,6 +163,7 @@ describe("ProviderCommandReactor", () => {
       model: "gpt-5-codex",
     };
     const startSession = vi.fn((_: unknown, input: unknown) => {
+      lifecycleCalls.push("start-session");
       const sessionIndex = nextSessionIndex++;
       const resumeCursor =
         typeof input === "object" && input !== null && "resumeCursor" in input
@@ -292,6 +296,16 @@ describe("ProviderCommandReactor", () => {
           : {}),
       },
     ];
+    const setNotebookDocumentAuthority = vi.fn(
+      (authority: { readonly documentIds: ReadonlyArray<string> }) =>
+        Effect.sync(() => {
+          lifecycleCalls.push(`authority:${authority.documentIds.join(",")}`);
+          return Array.from(new Set(authority.documentIds)).sort();
+        }),
+    );
+    vi.spyOn(McpSessionRegistry, "setActiveNotebookDocumentAuthority").mockImplementation(
+      setNotebookDocumentAuthority,
+    );
 
     const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
     const service: ProviderServiceShape = {
@@ -422,6 +436,8 @@ describe("ProviderCommandReactor", () => {
       generateBranchName,
       generateThreadTitle,
       runtimeSessions,
+      lifecycleCalls,
+      setNotebookDocumentAuthority,
       stateDir,
       drain,
     };
@@ -442,6 +458,7 @@ describe("ProviderCommandReactor", () => {
           text: "hello reactor",
           attachments: [],
         },
+        documentIds: ["b".repeat(64), "a".repeat(64)],
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
         runtimeMode: "approval-required",
         createdAt: now,
@@ -459,6 +476,10 @@ describe("ProviderCommandReactor", () => {
       },
       runtimeMode: "approval-required",
     });
+    expect(harness.lifecycleCalls.slice(0, 2)).toEqual([
+      `authority:${"a".repeat(64)},${"b".repeat(64)}`,
+      "start-session",
+    ]);
 
     const readModel = await harness.readModel();
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));

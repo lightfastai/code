@@ -38,6 +38,7 @@ function queuedMessage(input: {
     commandId: CommandId.make(`command-${input.messageId}`),
     text: input.messageId,
     attachments: [],
+    documentIds: [],
     createdAt: input.createdAt,
   };
 }
@@ -85,6 +86,7 @@ describe("thread outbox", () => {
     });
     const selectedMessage = {
       ...legacyMessage,
+      documentIds: ["b".repeat(64), "a".repeat(64), "b".repeat(64)],
       modelSelection: {
         instanceId: ProviderInstanceId.make("codex"),
         model: "gpt-5.4",
@@ -94,9 +96,17 @@ describe("thread outbox", () => {
       interactionMode: "plan",
     } satisfies QueuedThreadMessage;
 
-    expect(decodeQueuedThreadMessage(encodeQueuedThreadMessage(selectedMessage))).toEqual(
-      selectedMessage,
-    );
+    expect(decodeQueuedThreadMessage(encodeQueuedThreadMessage(selectedMessage))).toEqual({
+      ...selectedMessage,
+      documentIds: ["a".repeat(64), "b".repeat(64)],
+    });
+    const { documentIds: _, ...legacyWithoutDocumentIds } = legacyMessage;
+    expect(
+      decodeQueuedThreadMessage({
+        schemaVersion: 1,
+        ...legacyWithoutDocumentIds,
+      }),
+    ).toEqual(legacyMessage);
     expect(
       resolveQueuedThreadSettings(legacyMessage, {
         modelSelection: selectedMessage.modelSelection,

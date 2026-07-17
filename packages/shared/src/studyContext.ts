@@ -1,4 +1,33 @@
-import type { StudyContextCapsule, StudyDocument } from "@t3tools/contracts";
+import type {
+  SelectedStudyDocumentIds,
+  StudyContextCapsule,
+  StudyDocument,
+  StudyDocumentId,
+} from "@t3tools/contracts";
+
+export function normalizeStudyDocumentIds(
+  documentIds: ReadonlyArray<StudyDocumentId>,
+): SelectedStudyDocumentIds {
+  return Array.from(new Set(documentIds)).sort();
+}
+
+export function selectedStudyDocumentIds(
+  documents: ReadonlyArray<StudyDocument>,
+): SelectedStudyDocumentIds {
+  return normalizeStudyDocumentIds(documents.map((document) => document.id));
+}
+
+export function narrowStudyDocumentIds(
+  authority: ReadonlyArray<StudyDocumentId>,
+  requested: ReadonlyArray<StudyDocumentId>,
+): SelectedStudyDocumentIds | null {
+  const normalizedAuthority = normalizeStudyDocumentIds(authority);
+  const normalizedRequested = normalizeStudyDocumentIds(requested);
+  const allowed = new Set(normalizedAuthority);
+  return normalizedRequested.every((documentId) => allowed.has(documentId))
+    ? normalizedRequested
+    : null;
+}
 
 export function appendStudyDocumentsToPrompt(
   prompt: string,

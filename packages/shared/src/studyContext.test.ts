@@ -4,6 +4,9 @@ import type { StudyContextCapsule, StudyDocument } from "@t3tools/contracts";
 import {
   appendStudyContextCapsulesToPrompt,
   appendStudyDocumentsToPrompt,
+  narrowStudyDocumentIds,
+  normalizeStudyDocumentIds,
+  selectedStudyDocumentIds,
 } from "./studyContext.js";
 
 const document: StudyDocument = {
@@ -31,6 +34,20 @@ describe("appendStudyDocumentsToPrompt", () => {
     expect(result).toContain(document.title);
     expect(result).toContain("study_library_search");
     expect(result).not.toContain(document.objectKey);
+  });
+});
+
+describe("study document ID scope", () => {
+  it("normalizes client selections and only permits equal or narrower requests", () => {
+    const other = { ...document, id: "b".repeat(64), sha256: "b".repeat(64) };
+
+    expect(selectedStudyDocumentIds([other, document, other])).toEqual([document.id, other.id]);
+    expect(normalizeStudyDocumentIds([other.id, document.id, other.id])).toEqual([
+      document.id,
+      other.id,
+    ]);
+    expect(narrowStudyDocumentIds([document.id, other.id], [other.id])).toEqual([other.id]);
+    expect(narrowStudyDocumentIds([document.id], [other.id])).toBeNull();
   });
 });
 

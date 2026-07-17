@@ -37,7 +37,7 @@ describe("notebook execution contracts", () => {
       bookPaths: ["/etc/passwd"],
     });
 
-    expect(open).toMatchObject({ documentIds });
+    expect(open).toMatchObject({ documentIds: ["a".repeat(64), "b".repeat(64)] });
     expect(open).not.toHaveProperty("bookPaths");
     expect(() =>
       decodeSessionOpen({

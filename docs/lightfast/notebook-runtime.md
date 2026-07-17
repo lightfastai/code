@@ -46,13 +46,20 @@ Agent runs are additionally ephemeral and exclusive. Publication is allowed with
 authority, but `notebook_execute_cell` and `notebook_execute_all` require the server-owned
 `allowNotebookExecution` grant for the exact thread and immutable revision.
 
-Notebook publication, browser runtime opens, and agent execution send only `documentIds` from the
-selected study context. They never send host paths. After authenticating the environment and project,
-the server resolves the complete selection against that environment's study-library index, verifies
-the exact immutable object key, canonical real path, regular-file type, and containment under the
-library object root, then passes those canonical paths to the runtime manager. Missing, malformed,
-unknown, or escaping selections resolve to no book mounts; the server never broadens them to the full
-library or accepts a partial selection.
+Notebook publication, browser runtime opens, and agent execution send only `documentIds`; they never
+send host paths. For agent tools, the authoritative selection comes from the authenticated
+`thread.turn.start` command, is normalized and bound to the thread before its MCP credential is
+issued or reused, and defaults to an empty selection for legacy or malformed input. A tool call may
+equal or narrow that server-owned selection, but can never widen it to another library book.
+Publication persists only the accepted subset, so a later user Run cannot acquire authority that the
+publishing turn did not have.
+
+After authenticating the environment and project and checking that authority, the server resolves
+the complete accepted selection against that environment's study-library index, verifies the exact
+immutable object key, canonical real path, regular-file type, and containment under the library
+object root, then passes those canonical paths to the runtime manager. Missing, malformed, unknown,
+or escaping selections resolve to no book mounts; the server never broadens them to the full library
+or accepts a partial selection.
 
 Mount ownership is session/container-scoped. A session's normalized book set cannot change after its
 container starts, and a sibling session in the same project receives only its own explicitly selected

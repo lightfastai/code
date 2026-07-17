@@ -311,6 +311,26 @@ it.effect("decodes thread.turn.start defaults for provider and runtime mode", ()
     assert.strictEqual(parsed.modelSelection, undefined);
     assert.strictEqual(parsed.runtimeMode, DEFAULT_RUNTIME_MODE);
     assert.strictEqual(parsed.interactionMode, DEFAULT_PROVIDER_INTERACTION_MODE);
+    assert.deepStrictEqual(parsed.documentIds, []);
+  }),
+);
+
+it.effect("normalizes selected study document IDs in thread.turn.start", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeThreadTurnStartCommand({
+      type: "thread.turn.start",
+      commandId: "cmd-turn-study",
+      threadId: "thread-1",
+      message: {
+        messageId: "msg-study",
+        role: "user",
+        text: "compare these books",
+        attachments: [],
+      },
+      documentIds: ["b".repeat(64), "a".repeat(64), "b".repeat(64)],
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.deepStrictEqual(parsed.documentIds, ["a".repeat(64), "b".repeat(64)]);
   }),
 );
 
@@ -643,7 +663,20 @@ it.effect(
       assert.strictEqual(parsed.runtimeMode, DEFAULT_RUNTIME_MODE);
       assert.strictEqual(parsed.interactionMode, DEFAULT_PROVIDER_INTERACTION_MODE);
       assert.strictEqual(parsed.sourceProposedPlan, undefined);
+      assert.deepStrictEqual(parsed.documentIds, []);
     }),
+);
+
+it.effect("normalizes selected study document IDs in thread.turn-start-requested", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeThreadTurnStartRequestedPayload({
+      threadId: "thread-1",
+      messageId: "msg-study",
+      documentIds: ["b".repeat(64), "a".repeat(64), "b".repeat(64)],
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.deepStrictEqual(parsed.documentIds, ["a".repeat(64), "b".repeat(64)]);
+  }),
 );
 
 it.effect("decodes thread.turn-start-requested source proposed plan metadata when present", () =>

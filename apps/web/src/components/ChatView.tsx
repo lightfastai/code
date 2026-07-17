@@ -178,7 +178,10 @@ import {
 } from "../lib/elementContext";
 import { appendPreviewAnnotationPrompt } from "../lib/previewAnnotation";
 import { appendReviewCommentsToPrompt, type ReviewCommentContext } from "../reviewCommentContext";
-import { appendStudyDocumentsToPrompt } from "@t3tools/shared/studyContext";
+import {
+  appendStudyDocumentsToPrompt,
+  selectedStudyDocumentIds,
+} from "@t3tools/shared/studyContext";
 import { environmentCatalog } from "../connection/catalog";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
 import { useKnownTerminalSessions, useThreadRunningTerminalIds } from "../state/terminalSessions";
@@ -3991,6 +3994,7 @@ function ChatViewContent(props: ChatViewProps) {
     const composerElementContextsSnapshot = [...composerElementContexts];
     const composerPreviewAnnotationsSnapshot = [...composerPreviewAnnotations];
     const composerReviewCommentsSnapshot: ReviewCommentContext[] = [...composerReviewComments];
+    const composerStudyDocumentIdsSnapshot = selectedStudyDocumentIds(composerStudyDocuments);
     const messageTextWithContexts = appendElementContextsToPrompt(
       appendTerminalContextsToPrompt(promptForSend, composerTerminalContextsSnapshot),
       composerElementContextsSnapshot,
@@ -4181,6 +4185,7 @@ function ChatViewContent(props: ChatViewProps) {
             attachments: turnAttachmentsResult.value,
           },
           modelSelection: ctxSelectedModelSelection,
+          documentIds: composerStudyDocumentIdsSnapshot,
           titleSeed: title,
           runtimeMode,
           interactionMode,
@@ -4450,6 +4455,7 @@ function ChatViewContent(props: ChatViewProps) {
         return;
       }
       const {
+        studyDocuments: composerStudyDocuments,
         selectedProvider: ctxSelectedProvider,
         selectedModel: ctxSelectedModel,
         selectedProviderModels: ctxSelectedProviderModels,
@@ -4465,7 +4471,7 @@ function ChatViewContent(props: ChatViewProps) {
         model: ctxSelectedModel,
         models: ctxSelectedProviderModels,
         effort: ctxSelectedPromptEffort,
-        text: trimmed,
+        text: appendStudyDocumentsToPrompt(trimmed, composerStudyDocuments),
       });
 
       sendInFlightRef.current = true;
@@ -4527,6 +4533,7 @@ function ChatViewContent(props: ChatViewProps) {
               attachments: [],
             },
             modelSelection: ctxSelectedModelSelection,
+            documentIds: selectedStudyDocumentIds(composerStudyDocuments),
             titleSeed: activeThread.title,
             runtimeMode,
             interactionMode: nextInteractionMode,
@@ -4609,6 +4616,7 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
     const {
+      studyDocuments: composerStudyDocuments,
       selectedProvider: ctxSelectedProvider,
       selectedModel: ctxSelectedModel,
       selectedProviderModels: ctxSelectedProviderModels,
@@ -4619,7 +4627,10 @@ function ChatViewContent(props: ChatViewProps) {
     const createdAt = new Date().toISOString();
     const nextThreadId = newThreadId();
     const planMarkdown = activeProposedPlan.planMarkdown;
-    const implementationPrompt = buildPlanImplementationPrompt(planMarkdown);
+    const implementationPrompt = appendStudyDocumentsToPrompt(
+      buildPlanImplementationPrompt(planMarkdown),
+      composerStudyDocuments,
+    );
     const outgoingImplementationPrompt = formatOutgoingPrompt({
       provider: ctxSelectedProvider,
       model: ctxSelectedModel,
@@ -4666,6 +4677,7 @@ function ChatViewContent(props: ChatViewProps) {
             attachments: [],
           },
           modelSelection: ctxSelectedModelSelection,
+          documentIds: selectedStudyDocumentIds(composerStudyDocuments),
           titleSeed: nextThreadTitle,
           runtimeMode,
           interactionMode: "default",

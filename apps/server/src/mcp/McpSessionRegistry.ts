@@ -1,5 +1,7 @@
 import {
   NotebookAgentToolError,
+  type SelectedStudyDocumentIds,
+  type StudyDocumentId,
   type NotebookAgentExecutionPermission,
   type NotebookAgentExecutionPermissionSetInput,
   ProviderInstanceId,
@@ -13,6 +15,7 @@ import * as Layer from "effect/Layer";
 import * as Semaphore from "effect/Semaphore";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import { HttpServer } from "effect/unstable/http";
+import { narrowStudyDocumentIds, normalizeStudyDocumentIds } from "@t3tools/shared/studyContext";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
@@ -28,6 +31,11 @@ export interface McpIssuedCredential {
   readonly expiresAt: number;
 }
 
+export interface NotebookDocumentAuthorityInput {
+  readonly threadId: ThreadId;
+  readonly documentIds: ReadonlyArray<StudyDocumentId>;
+}
+
 export interface McpSessionRegistryShape {
   readonly issue: (request: McpCredentialRequest) => Effect.Effect<McpIssuedCredential>;
   readonly resolve: (
@@ -41,8 +49,12 @@ export interface McpSessionRegistryShape {
   readonly setNotebookExecutionPermission: (
     input: NotebookAgentExecutionPermissionSetInput,
   ) => Effect.Effect<NotebookAgentExecutionPermission>;
+  readonly setNotebookDocumentAuthority: (
+    input: NotebookDocumentAuthorityInput,
+  ) => Effect.Effect<SelectedStudyDocumentIds>;
   readonly withNotebookExecutionStart: <A, E, R>(
     invocation: McpInvocationContext.McpInvocationScope,
+    documentIds: ReadonlyArray<StudyDocumentId>,
     start: Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E | NotebookAgentToolError, R>;
   readonly revokeAll: Effect.Effect<void>;
@@ -62,6 +74,7 @@ interface CredentialRecord {
 interface RegistryState {
   readonly records: ReadonlyMap<string, CredentialRecord>;
   readonly notebookExecutionPermissions: ReadonlyMap<ThreadId, boolean>;
+  readonly notebookDocumentAuthorities: ReadonlyMap<ThreadId, SelectedStudyDocumentIds>;
 }
 
 export interface McpSessionRegistryOptions {
@@ -99,6 +112,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const state = yield* SynchronizedRef.make<RegistryState>({
     records: new Map(),
     notebookExecutionPermissions: new Map(),
+    notebookDocumentAuthorities: new Map(),
   });
   const threadPermissionLocks = yield* SynchronizedRef.make<
     ReadonlyMap<ThreadId, Semaphore.Semaphore>
@@ -156,7 +170,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       const providerInstanceId = ProviderInstanceId.make(request.providerInstanceId);
       const scope = yield* SynchronizedRef.modify(
         state,
-        ({ records, notebookExecutionPermissions }) => {
+        ({ records, notebookExecutionPermissions, notebookDocumentAuthorities }) => {
           const scope: McpInvocationContext.McpInvocationScope = {
             environmentId,
             threadId,
@@ -164,12 +178,16 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
             providerInstanceId,
             capabilities: new Set(["preview", "artifacts", "study"]),
             allowNotebookExecution: notebookExecutionPermissions.get(threadId) ?? false,
+            notebookDocumentIds: notebookDocumentAuthorities.get(threadId) ?? [],
             issuedAt,
             expiresAt,
           };
           const next = new Map(pruneExpired(records, issuedAt));
           next.set(tokenHash, { tokenHash, scope, lastUsedAt: issuedAt });
-          return [scope, { records: next, notebookExecutionPermissions }] as const;
+          return [
+            scope,
+            { records: next, notebookExecutionPermissions, notebookDocumentAuthorities },
+          ] as const;
         },
       );
       return {
@@ -191,24 +209,37 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       if (rawToken.length === 0) return undefined;
       const tokenHash = yield* hashToken(rawToken);
       const timestamp = yield* currentTimeMillis;
-      return yield* SynchronizedRef.modify(state, ({ records, notebookExecutionPermissions }) => {
-        const current = pruneExpired(records, timestamp);
-        const record = current.get(tokenHash);
-        if (!record) {
-          return [undefined, { records: current, notebookExecutionPermissions }] as const;
-        }
-        const next = new Map(current);
-        next.set(tokenHash, { ...record, lastUsedAt: timestamp });
-        return [record.scope, { records: next, notebookExecutionPermissions }] as const;
-      });
+      return yield* SynchronizedRef.modify(
+        state,
+        ({ records, notebookExecutionPermissions, notebookDocumentAuthorities }) => {
+          const current = pruneExpired(records, timestamp);
+          const record = current.get(tokenHash);
+          if (!record) {
+            return [
+              undefined,
+              { records: current, notebookExecutionPermissions, notebookDocumentAuthorities },
+            ] as const;
+          }
+          const next = new Map(current);
+          next.set(tokenHash, { ...record, lastUsedAt: timestamp });
+          return [
+            record.scope,
+            { records: next, notebookExecutionPermissions, notebookDocumentAuthorities },
+          ] as const;
+        },
+      );
     },
   );
 
   const revokeWhere = (predicate: (record: CredentialRecord) => boolean) =>
-    SynchronizedRef.update(state, ({ records, notebookExecutionPermissions }) => ({
-      records: new Map(Array.from(records).filter(([, record]) => !predicate(record))),
-      notebookExecutionPermissions,
-    }));
+    SynchronizedRef.update(
+      state,
+      ({ records, notebookExecutionPermissions, notebookDocumentAuthorities }) => ({
+        records: new Map(Array.from(records).filter(([, record]) => !predicate(record))),
+        notebookExecutionPermissions,
+        notebookDocumentAuthorities,
+      }),
+    );
 
   return McpSessionRegistry.of({
     issue,
@@ -237,36 +268,74 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       (input) =>
         withThreadPermissionLock(
           input.threadId,
-          SynchronizedRef.update(state, ({ records, notebookExecutionPermissions }) => {
-            const nextPermissions = new Map(notebookExecutionPermissions);
-            nextPermissions.set(input.threadId, input.allowNotebookExecution);
-            const nextRecords = new Map(
-              Array.from(records, ([tokenHash, record]) => [
-                tokenHash,
-                record.scope.threadId === input.threadId
-                  ? {
-                      ...record,
-                      scope: {
-                        ...record.scope,
-                        allowNotebookExecution: input.allowNotebookExecution,
-                      },
-                    }
-                  : record,
-              ]),
-            );
-            return { records: nextRecords, notebookExecutionPermissions: nextPermissions };
-          }).pipe(Effect.as(input)),
+          SynchronizedRef.update(
+            state,
+            ({ records, notebookExecutionPermissions, notebookDocumentAuthorities }) => {
+              const nextPermissions = new Map(notebookExecutionPermissions);
+              nextPermissions.set(input.threadId, input.allowNotebookExecution);
+              const nextRecords = new Map(
+                Array.from(records, ([tokenHash, record]) => [
+                  tokenHash,
+                  record.scope.threadId === input.threadId
+                    ? {
+                        ...record,
+                        scope: {
+                          ...record.scope,
+                          allowNotebookExecution: input.allowNotebookExecution,
+                        },
+                      }
+                    : record,
+                ]),
+              );
+              return {
+                records: nextRecords,
+                notebookExecutionPermissions: nextPermissions,
+                notebookDocumentAuthorities,
+              };
+            },
+          ).pipe(Effect.as(input)),
         ),
     ),
+    setNotebookDocumentAuthority: Effect.fn("McpSessionRegistry.setNotebookDocumentAuthority")(
+      (input) => {
+        const documentIds = normalizeStudyDocumentIds(input.documentIds);
+        return withThreadPermissionLock(
+          input.threadId,
+          SynchronizedRef.update(
+            state,
+            ({ records, notebookExecutionPermissions, notebookDocumentAuthorities }) => {
+              const nextAuthorities = new Map(notebookDocumentAuthorities);
+              nextAuthorities.set(input.threadId, documentIds);
+              const nextRecords = new Map(
+                Array.from(records, ([tokenHash, record]) => [
+                  tokenHash,
+                  record.scope.threadId === input.threadId
+                    ? {
+                        ...record,
+                        scope: { ...record.scope, notebookDocumentIds: documentIds },
+                      }
+                    : record,
+                ]),
+              );
+              return {
+                records: nextRecords,
+                notebookExecutionPermissions,
+                notebookDocumentAuthorities: nextAuthorities,
+              };
+            },
+          ).pipe(Effect.as(documentIds)),
+        );
+      },
+    ),
     withNotebookExecutionStart: Effect.fn("McpSessionRegistry.withNotebookExecutionStart")(
-      (invocation, start) =>
+      (invocation, documentIds, start) =>
         withThreadPermissionLock(
           invocation.threadId,
           Effect.gen(function* () {
             const timestamp = yield* currentTimeMillis;
             const authorized = yield* SynchronizedRef.modify(
               state,
-              ({ records, notebookExecutionPermissions }) => {
+              ({ records, notebookExecutionPermissions, notebookDocumentAuthorities }) => {
                 const current = pruneExpired(records, timestamp);
                 const credentialIsCurrent = Array.from(current.values()).some(
                   ({ scope }) =>
@@ -275,27 +344,43 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
                     scope.providerSessionId === invocation.providerSessionId &&
                     scope.providerInstanceId === invocation.providerInstanceId,
                 );
+                const permissionGranted =
+                  notebookExecutionPermissions.get(invocation.threadId) ?? false;
+                const documentScopeGranted =
+                  narrowStudyDocumentIds(
+                    notebookDocumentAuthorities.get(invocation.threadId) ?? [],
+                    documentIds,
+                  ) !== null;
                 return [
-                  credentialIsCurrent &&
-                    (notebookExecutionPermissions.get(invocation.threadId) ?? false),
-                  { records: current, notebookExecutionPermissions },
+                  { credentialIsCurrent, permissionGranted, documentScopeGranted },
+                  { records: current, notebookExecutionPermissions, notebookDocumentAuthorities },
                 ] as const;
               },
             );
-            if (!authorized) {
+            if (!authorized.credentialIsCurrent || !authorized.permissionGranted) {
               return yield* new NotebookAgentToolError({
                 reason: "permission-denied",
                 message: "This thread does not grant notebook execution to the agent.",
+              });
+            }
+            if (!authorized.documentScopeGranted) {
+              return yield* new NotebookAgentToolError({
+                reason: "scope-mismatch",
+                message: "The requested study documents exceed this turn's notebook authority.",
               });
             }
             return yield* start;
           }),
         ),
     ),
-    revokeAll: SynchronizedRef.update(state, ({ notebookExecutionPermissions }) => ({
-      records: new Map(),
-      notebookExecutionPermissions,
-    })),
+    revokeAll: SynchronizedRef.update(
+      state,
+      ({ notebookExecutionPermissions, notebookDocumentAuthorities }) => ({
+        records: new Map(),
+        notebookExecutionPermissions,
+        notebookDocumentAuthorities,
+      }),
+    ),
   });
 });
 
@@ -347,6 +432,13 @@ export const setActiveNotebookExecutionPermission = (
   activeMcpSessionRegistry
     ? activeMcpSessionRegistry.setNotebookExecutionPermission(input)
     : Effect.succeed({ ...input, allowNotebookExecution: false });
+
+export const setActiveNotebookDocumentAuthority = (
+  input: NotebookDocumentAuthorityInput,
+): Effect.Effect<SelectedStudyDocumentIds> =>
+  activeMcpSessionRegistry
+    ? activeMcpSessionRegistry.setNotebookDocumentAuthority(input)
+    : Effect.succeed([]);
 
 /** Exposed for tests. */
 export const __testing = {

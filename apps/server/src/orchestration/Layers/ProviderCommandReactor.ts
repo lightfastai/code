@@ -41,6 +41,7 @@ import {
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
 
@@ -837,6 +838,11 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
+
+    yield* McpSessionRegistry.setActiveNotebookDocumentAuthority({
+      threadId: event.payload.threadId,
+      documentIds: event.payload.documentIds ?? [],
+    });
 
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
       threadId: event.payload.threadId,

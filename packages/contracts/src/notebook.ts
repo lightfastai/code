@@ -14,7 +14,7 @@ import * as Schema from "effect/Schema";
 
 import { ScopedProjectRef } from "./environment.ts";
 import { NonNegativeInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
-import { StudyDocumentId } from "./study.ts";
+import { SelectedStudyDocumentIds } from "./study.ts";
 
 const NotebookRuntimeIdentifier = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
 export const NotebookSessionId = TrimmedNonEmptyString.check(
@@ -122,7 +122,7 @@ const NotebookRuntimeSessionRef = Schema.Struct({
   sessionId: NotebookSessionId,
 });
 const NotebookSelectedStudyDocuments = Schema.Struct({
-  documentIds: Schema.Array(StudyDocumentId).check(Schema.isMaxLength(32)),
+  documentIds: SelectedStudyDocumentIds,
 });
 
 export const NotebookSessionOpenInput = Schema.Struct({

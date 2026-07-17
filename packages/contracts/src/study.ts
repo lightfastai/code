@@ -1,9 +1,27 @@
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import { IsoDateTime, NonNegativeInt, PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 export const StudyDocumentId = TrimmedNonEmptyString.check(Schema.isPattern(/^[0-9a-f]{64}$/));
 export type StudyDocumentId = typeof StudyDocumentId.Type;
+
+const StudyDocumentIds = Schema.Array(StudyDocumentId).check(Schema.isMaxLength(32));
+type StudyDocumentIds = typeof StudyDocumentIds.Type;
+
+const normalizeStudyDocumentIds = (documentIds: StudyDocumentIds): StudyDocumentIds =>
+  Array.from(new Set(documentIds)).sort();
+
+export const SelectedStudyDocumentIds = StudyDocumentIds.pipe(
+  Schema.decodeTo(
+    StudyDocumentIds,
+    SchemaTransformation.transform<StudyDocumentIds, StudyDocumentIds>({
+      decode: normalizeStudyDocumentIds,
+      encode: normalizeStudyDocumentIds,
+    }),
+  ),
+);
+export type SelectedStudyDocumentIds = typeof SelectedStudyDocumentIds.Type;
 
 export const StudyDocumentFormat = Schema.Literals(["pdf", "epub", "markdown"]);
 export type StudyDocumentFormat = typeof StudyDocumentFormat.Type;

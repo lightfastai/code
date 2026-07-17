@@ -14,7 +14,10 @@ import {
 } from "@t3tools/contracts";
 import { safeErrorLogAttributes } from "@t3tools/client-runtime/errors";
 import { deriveActiveWorkStartedAt } from "@t3tools/shared/orchestrationTiming";
-import { appendStudyDocumentsToPrompt } from "@t3tools/shared/studyContext";
+import {
+  appendStudyDocumentsToPrompt,
+  selectedStudyDocumentIds,
+} from "@t3tools/shared/studyContext";
 import * as Option from "effect/Option";
 
 import { makeQueuedMessageMetadata } from "../lib/commandMetadata";
@@ -170,6 +173,7 @@ export function useThreadComposerState(target: ScopedThreadRef) {
           commandId: CommandId.make(metadata.commandId),
           text,
           attachments,
+          documentIds: selectedStudyDocumentIds(draft.studyDocuments ?? []),
           modelSelection: draft.modelSelection ?? thread.modelSelection,
           runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
           interactionMode: draft.interactionMode ?? thread.interactionMode,

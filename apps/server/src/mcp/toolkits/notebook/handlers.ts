@@ -15,6 +15,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import { narrowStudyDocumentIds } from "@t3tools/shared/studyContext";
 
 import * as ServerConfig from "../../../config.ts";
 import { lightfastServerCapabilities } from "../../../lightfast/register.ts";
@@ -78,6 +79,13 @@ export const publishNotebook = Effect.fn("NotebookToolkit.publishNotebook")(func
 ) {
   const invocation = yield* McpInvocationContext.requireArtifactCapability();
   yield* requireThreadProject(input.scope).pipe(Effect.mapError(() => publicationError()));
+  const documentIds = narrowStudyDocumentIds(
+    invocation.notebookDocumentIds ?? [],
+    input.documentIds,
+  );
+  if (documentIds === null) {
+    return yield* publicationError();
+  }
   const store = yield* NotebookRevisionStore;
   const revision = yield* store.read(input).pipe(Effect.mapError(() => publicationError()));
   const orchestration = yield* OrchestrationEngineService;
@@ -96,7 +104,7 @@ export const publishNotebook = Effect.fn("NotebookToolkit.publishNotebook")(func
           contentHash: revision.contentHash,
           kernel: revision.kernel,
           initialView: input.initialView,
-          documentIds: input.documentIds,
+          documentIds,
         },
       }),
     )
@@ -152,7 +160,8 @@ const withAgentTools = Effect.fn("NotebookToolkit.withAgentTools")(function* <A>
           kernelLockHash: NOTEBOOK_RUNTIME_KERNEL_LOCK_HASH,
         })),
       ),
-    withExecutionStart: (scope, start) => sessions.withNotebookExecutionStart(scope, start),
+    withExecutionStart: (scope, documentIds, start) =>
+      sessions.withNotebookExecutionStart(scope, documentIds, start),
     writeTrace: (runId, records) =>
       Effect.gen(function* () {
         const tracePath = yield* studyTracePath(loopPaths, runId);

@@ -162,6 +162,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
             { id: "reasoningEffort", value: "high" },
             { id: "fastMode", value: true },
           ]),
+          documentIds: ["b".repeat(64), "a".repeat(64), "b".repeat(64)],
           interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
           runtimeMode: "approval-required",
           createdAt: now,
@@ -187,6 +188,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           { id: "fastMode", value: true },
         ]),
         runtimeMode: "approval-required",
+        documentIds: ["a".repeat(64), "b".repeat(64)],
       });
     }),
   );

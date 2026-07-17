@@ -4,6 +4,7 @@ import {
   PreviewAutomationUnavailableError,
   NotebookAgentToolError,
   StudyToolError,
+  type SelectedStudyDocumentIds,
   type ProviderInstanceId,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -19,6 +20,7 @@ export interface McpInvocationScope {
   readonly providerInstanceId: ProviderInstanceId;
   readonly capabilities: ReadonlySet<McpCapability>;
   readonly allowNotebookExecution: boolean;
+  readonly notebookDocumentIds?: SelectedStudyDocumentIds;
   readonly issuedAt: number;
   readonly expiresAt: number;
 }

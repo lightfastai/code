@@ -54,13 +54,17 @@ const revision = {
   createdAt: "2026-07-17T00:00:00.000Z",
 } as NotebookRevision;
 
-const invocation = (allowNotebookExecution: boolean): McpInvocationContext.McpInvocationScope => ({
+const invocation = (
+  allowNotebookExecution: boolean,
+  notebookDocumentIds: ReadonlyArray<string> = [selectedStudyDocumentId],
+): McpInvocationContext.McpInvocationScope => ({
   environmentId: scope.environmentId,
   threadId: ThreadId.make("thread-notebook-agent"),
   providerSessionId: "provider-session-notebook-agent",
   providerInstanceId: ProviderInstanceId.make("codex"),
   capabilities: new Set(["artifacts"]),
   allowNotebookExecution,
+  notebookDocumentIds,
   issuedAt: 1,
   expiresAt: Number.MAX_SAFE_INTEGER,
 });
@@ -74,6 +78,7 @@ const revisionStore: NotebookRevisionStoreShape = {
 
 const allowExecutionStart = <A, E, R>(
   _invocation: McpInvocationContext.McpInvocationScope,
+  _documentIds: ReadonlyArray<string>,
   start: Effect.Effect<A, E, R>,
 ): Effect.Effect<A, E, R> => start;
 const resolveNoBookPaths = () => Effect.succeed<ReadonlyArray<string>>([]);
@@ -97,6 +102,55 @@ const disposeEvents = (
     state: "terminated" as const,
   },
 ];
+
+it.effect(
+  "rejects document-scope widening before revision, mount, runtime, or trace access",
+  () => {
+    const calls: string[] = [];
+    const tools = makeNotebookAgentTools({
+      revisionStore: {
+        ...revisionStore,
+        read: () => Effect.sync(() => (calls.push("revision"), revision)),
+      },
+      resolveBookPaths: () => Effect.sync(() => (calls.push("resolve"), [])),
+      runtimeManager: {
+        open: async () => {
+          calls.push("open");
+          return [];
+        },
+        execute: () => ({ async *[Symbol.asyncIterator]() {} }),
+        dispose: async () => [],
+      },
+      runtimeIdentity: () =>
+        Effect.sync(() => {
+          calls.push("identity");
+          return { imageDigest: `sha256:${"b".repeat(64)}`, kernelLockHash: "c".repeat(64) };
+        }),
+      withExecutionStart: allowExecutionStart,
+      writeTrace: () => Effect.sync(() => calls.push("trace")),
+      randomUUID: () => "scope-mismatch",
+      now: () => Date.parse("2026-07-17T00:00:00.000Z"),
+    });
+
+    return Effect.gen(function* () {
+      const error = yield* tools
+        .executeCell(
+          {
+            scope,
+            documentId: revision.documentId,
+            revisionId: revision.revisionId,
+            documentIds: ["a".repeat(64)],
+            cellId: "cell-1",
+          },
+          invocation(true, [selectedStudyDocumentId]),
+        )
+        .pipe(Effect.flip);
+
+      expect(error).toMatchObject({ reason: "scope-mismatch" });
+      expect(calls).toEqual([]);
+    });
+  },
+);
 
 it.effect("revalidates authoritative permission before open and traces a denied attempt", () => {
   const calls: string[] = [];
