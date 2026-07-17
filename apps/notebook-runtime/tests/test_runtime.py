@@ -451,15 +451,11 @@ async def test_duplicate_command_replays_without_executing_twice(service: Runtim
     manager, _ = await open_session(service)
     first = [
         event
-        async for event in service.execute(
-            "session-1", "same", "execution-1", "cell-1", "ordered"
-        )
+        async for event in service.execute("session-1", "same", "execution-1", "cell-1", "ordered")
     ]
     replay = [
         event
-        async for event in service.execute(
-            "session-1", "same", "execution-1", "cell-1", "ordered"
-        )
+        async for event in service.execute("session-1", "same", "execution-1", "cell-1", "ordered")
     ]
     assert replay == first
     assert manager.client_instance.execute_count == 1
@@ -467,9 +463,7 @@ async def test_duplicate_command_replays_without_executing_twice(service: Runtim
 
     rejected = [
         event
-        async for event in service.execute(
-            "session-1", "same", "execution-2", "cell-2", "error"
-        )
+        async for event in service.execute("session-1", "same", "execution-2", "cell-2", "error")
     ]
     assert len(rejected) == 1
     assert rejected[0]["type"] == "rejected"
@@ -513,14 +507,10 @@ async def test_queued_execution_is_not_accepted_until_the_session_lock_is_acquir
     manager, _ = await open_session(service)
     observed_lock = ObservedExecutionLock()
     service.sessions["session-1"].lock = observed_lock  # type: ignore[assignment]
-    first = service.execute(
-        "session-1", "command-a", "execution-a", "cell-a", "wait"
-    )
+    first = service.execute("session-1", "command-a", "execution-a", "cell-a", "wait")
     assert (await anext(first))["type"] == "accepted"
 
-    second = service.execute(
-        "session-1", "command-b", "execution-b", "cell-b", "assignment"
-    )
+    second = service.execute("session-1", "command-b", "execution-b", "cell-b", "assignment")
     second_event = asyncio.create_task(anext(second))
     await asyncio.wait_for(observed_lock.second_attempt.wait(), timeout=0.1)
     queued_record = service.sessions["session-1"].commands["command-b"]
@@ -551,15 +541,11 @@ async def test_dispose_rejects_execution_cancelled_while_waiting_for_acceptance(
     observed_lock = ObservedExecutionLock()
     service.sessions["session-1"].lock = observed_lock  # type: ignore[assignment]
 
-    first = service.execute(
-        "session-1", "command-a", "execution-a", "cell-a", "wait"
-    )
+    first = service.execute("session-1", "command-a", "execution-a", "cell-a", "wait")
     first_events = [await anext(first)]
     assert first_events[0]["type"] == "accepted"
 
-    second = service.execute(
-        "session-1", "command-b", "execution-b", "cell-b", "assignment"
-    )
+    second = service.execute("session-1", "command-b", "execution-b", "cell-b", "assignment")
     second_event = asyncio.create_task(anext(second))
     await asyncio.wait_for(observed_lock.second_attempt.wait(), timeout=0.1)
     queued_record = service.sessions["session-1"].commands["command-b"]

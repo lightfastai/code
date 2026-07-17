@@ -21,11 +21,12 @@ import {
 import {
   importNotebookRevisionAndReplaceRuntime,
   isNotebookExecutionDisabled,
+  isNotebookInterruptDisabled,
   isNotebookRevisionSwitchDisabled,
   loadNotebookRevisionAndConnect,
-  notebookLifecycleErrorMessage,
   notebookRuntimeTarget,
   replaceNotebookWorkingCopyRuntime,
+  runNotebookTrackedAction,
 } from "./runtime-lifecycle.ts";
 import { NotebookCell } from "./NotebookCell.tsx";
 import { removeNotebookCellFromRenderer } from "./notebook-cell-removal.ts";
@@ -85,6 +86,7 @@ export function NotebookArtifactEnvelopeRenderer({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [interruptPending, setInterruptPending] = useState(false);
   const [expanded, setExpanded] = useState(true);
   const mounted = useRef(true);
   const lifecycleGeneration = useRef(0);
@@ -143,23 +145,40 @@ export function NotebookArtifactEnvelopeRenderer({
     };
   }, [loadRevisionAndConnect]);
 
-  const runAction = useCallback(async (label: string, action: () => Promise<void>) => {
-    setPendingAction(label);
-    setActionError(null);
-    try {
-      await action();
-    } catch (cause) {
-      if (mounted.current) setActionError(notebookLifecycleErrorMessage(cause));
-    } finally {
-      if (mounted.current) setPendingAction(null);
-    }
-  }, []);
+  const runAction = useCallback(
+    (label: string, action: () => Promise<void>) =>
+      runNotebookTrackedAction({
+        action,
+        onError: (error) => {
+          if (mounted.current) setActionError(error);
+        },
+        onPendingChange: (pending) => {
+          if (mounted.current) setPendingAction(pending ? label : null);
+        },
+      }),
+    [],
+  );
+
+  const runInterruptAction = useCallback(
+    (action: () => Promise<void>) =>
+      runNotebookTrackedAction({
+        action,
+        onError: (error) => {
+          if (mounted.current) setActionError(error);
+        },
+        onPendingChange: (pending) => {
+          if (mounted.current) setInterruptPending(pending);
+        },
+      }),
+    [],
+  );
 
   const transitionWorkingCopy = useCallback(
     (label: string, nextWorking: NotebookWorkingCopy) => {
       if (
         bindings === null ||
         working === null ||
+        interruptPending ||
         isNotebookRevisionSwitchDisabled(pendingAction, runtime.runningCellIds)
       )
         return;
@@ -189,7 +208,15 @@ export function NotebookArtifactEnvelopeRenderer({
         }
       });
     },
-    [bindings, onRuntimeState, pendingAction, runAction, runtime.runningCellIds, working],
+    [
+      bindings,
+      interruptPending,
+      onRuntimeState,
+      pendingAction,
+      runAction,
+      runtime.runningCellIds,
+      working,
+    ],
   );
 
   const runCell = useCallback(
@@ -278,16 +305,12 @@ export function NotebookArtifactEnvelopeRenderer({
   }
 
   const dirty = isNotebookWorkingCopyDirty(working);
-  const disabled = pendingAction !== null;
-  const executionDisabled = isNotebookExecutionDisabled(
-    pendingAction,
-    runtimeReady,
-    runtime.runningCellIds,
-  );
-  const revisionSwitchDisabled = isNotebookRevisionSwitchDisabled(
-    pendingAction,
-    runtime.runningCellIds,
-  );
+  const disabled = pendingAction !== null || interruptPending;
+  const executionDisabled =
+    isNotebookExecutionDisabled(pendingAction, runtimeReady, runtime.runningCellIds) ||
+    interruptPending;
+  const revisionSwitchDisabled =
+    isNotebookRevisionSwitchDisabled(pendingAction, runtime.runningCellIds) || interruptPending;
   const permission = bindings.agentExecutionPermission;
   const currentRevision = working.baseRevision;
   const kernelName = runtimeTarget?.kernelName ?? currentRevision.kernel.name;
@@ -389,9 +412,13 @@ export function NotebookArtifactEnvelopeRenderer({
             <button
               type="button"
               className="rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
-              disabled={executionDisabled || runtime.runningCellIds.size === 0}
+              disabled={isNotebookInterruptDisabled(
+                interruptPending,
+                runtimeReady,
+                runtime.runningCellIds,
+              )}
               onClick={() =>
-                void runAction("interrupt", () =>
+                void runInterruptAction(() =>
                   bindings.controller.interrupt({
                     scope: bindings.scope,
                     sessionId,
@@ -635,7 +662,11 @@ export function NotebookArtifactEnvelopeRenderer({
                 const file = event.currentTarget.files?.[0];
                 event.currentTarget.value = "";
                 if (!file) return;
-                if (isNotebookRevisionSwitchDisabled(pendingAction, runtime.runningCellIds)) return;
+                if (
+                  interruptPending ||
+                  isNotebookRevisionSwitchDisabled(pendingAction, runtime.runningCellIds)
+                )
+                  return;
                 const generation = ++lifecycleGeneration.current;
                 const isActive = () =>
                   mounted.current && lifecycleGeneration.current === generation;

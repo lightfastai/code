@@ -32,6 +32,22 @@ export const notebookLifecycleErrorMessage = (cause: unknown): string =>
       ? cause
       : "Notebook action failed.";
 
+export async function runNotebookTrackedAction(request: {
+  readonly action: () => Promise<void>;
+  readonly onError: (error: string | null) => void;
+  readonly onPendingChange: (pending: boolean) => void;
+}): Promise<void> {
+  request.onPendingChange(true);
+  request.onError(null);
+  try {
+    await request.action();
+  } catch (cause) {
+    request.onError(notebookLifecycleErrorMessage(cause));
+  } finally {
+    request.onPendingChange(false);
+  }
+}
+
 type LifecycleRequest = {
   readonly controller: NotebookArtifactController;
   readonly scope: NotebookProjectScope;
@@ -54,6 +70,12 @@ export const isNotebookExecutionDisabled = (
   runtimeReady: boolean,
   runningCellIds: ReadonlySet<string>,
 ): boolean => pendingAction !== null || !runtimeReady || runningCellIds.size > 0;
+
+export const isNotebookInterruptDisabled = (
+  interruptPending: boolean,
+  runtimeReady: boolean,
+  runningCellIds: ReadonlySet<string>,
+): boolean => !runtimeReady || runningCellIds.size === 0 || interruptPending;
 
 export async function loadNotebookRevisionAndConnect(
   request: LifecycleRequest & {
@@ -104,10 +126,12 @@ export async function replaceNotebookWorkingCopyRuntime(
   const isActive = request.isActive ?? (() => true);
   const previousTarget = notebookRuntimeTarget(request.working);
   const nextTarget = notebookRuntimeTarget(request.nextWorking);
-  const identityChanged = !targetsEqual(previousTarget, nextTarget);
+  const revisionChanged =
+    request.working.baseRevision.revisionId !== request.nextWorking.baseRevision.revisionId;
+  const runtimeMustBeReplaced = revisionChanged || !targetsEqual(previousTarget, nextTarget);
   const onState = guardedRuntimeState(request);
 
-  if (identityChanged) {
+  if (runtimeMustBeReplaced) {
     try {
       await request.controller.dispose({
         scope: request.scope,

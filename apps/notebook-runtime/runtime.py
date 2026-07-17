@@ -848,9 +848,7 @@ class RuntimeService:
         )
         return {
             "baselineSequence": baseline_sequence,
-            "events": [
-                event for event in session.events if event["sequence"] > after_sequence
-            ],
+            "events": [event for event in session.events if event["sequence"] > after_sequence],
         }
 
     async def close(self) -> None:
@@ -941,9 +939,7 @@ def create_app(*, service: RuntimeService, token: str, bootstrap_enabled: bool =
         service._get_session(session_id)
 
         async def lines() -> AsyncIterator[bytes]:
-            async for event in service.execute(
-                session_id, command_id, execution_id, cell_id, code
-            ):
+            async for event in service.execute(session_id, command_id, execution_id, cell_id, code):
                 yield json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
 
         return StreamingResponse(lines(), media_type="application/x-ndjson")
