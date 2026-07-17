@@ -11,7 +11,6 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
-import { writeFileStringAtomically } from "../atomicWrite.ts";
 import type { StudyLibraryPaths } from "./StudyLibrary.ts";
 
 const MAX_TRACE_BYTES = 128 * 1024 * 1024;
@@ -231,17 +230,43 @@ export const writeStudyTraceFile = Effect.fn("StudyTraceStore.writeTraceFile")(f
         }),
     ),
   );
-  yield* writeFileStringAtomically({ filePath: input.tracePath, contents }).pipe(
-    Effect.mapError(
-      (cause) =>
-        new StudyLoopError({
-          operation: "write-trace",
-          path: input.tracePath,
-          message: "Could not write the trace file.",
-          cause,
-        }),
+  const publishResult = yield* Effect.result(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const tempPath = yield* fileSystem.makeTempFileScoped({
+          directory: path.dirname(input.tracePath),
+          prefix: `.${path.basename(input.tracePath)}.`,
+          suffix: ".tmp",
+        });
+        yield* fileSystem.writeFileString(tempPath, contents);
+        yield* fileSystem.link(tempPath, input.tracePath);
+      }),
     ),
   );
+  if (publishResult._tag === "Success") return;
+
+  if (publishResult.failure.reason._tag === "AlreadyExists") {
+    const existingResult = yield* Effect.result(fileSystem.readFileString(input.tracePath));
+    if (existingResult._tag === "Success" && existingResult.success === contents) {
+      return;
+    }
+    return yield* new StudyLoopError({
+      operation: "write-trace",
+      path: input.tracePath,
+      message:
+        existingResult._tag === "Success"
+          ? "Study traces are immutable; this run ID already contains different bytes."
+          : "Could not verify the existing immutable trace.",
+      cause: existingResult._tag === "Failure" ? existingResult.failure : publishResult.failure,
+    });
+  }
+
+  return yield* new StudyLoopError({
+    operation: "write-trace",
+    path: input.tracePath,
+    message: "Could not write the trace file.",
+    cause: publishResult.failure,
+  });
 });
 
 export const listStudyTraces = Effect.fn("StudyTraceStore.listTraces")(function* (
@@ -257,10 +282,13 @@ export const listStudyTraces = Effect.fn("StudyTraceStore.listTraces")(function*
       Effect.mapError((cause) => invalidTrace(paths.traces, "Could not list trace files.", cause)),
     );
   const traceFiles = entries.filter((entry) => entry.endsWith(".jsonl")).sort();
-  const traces = yield* Effect.forEach(
+  const traceResults = yield* Effect.forEach(
     traceFiles,
-    (entry) => readStudyTraceFile(path.join(paths.traces, entry)),
+    (entry) => Effect.result(readStudyTraceFile(path.join(paths.traces, entry))),
     { concurrency: 1 },
+  );
+  const traces = traceResults.flatMap((result) =>
+    result._tag === "Success" ? [result.success] : [],
   );
   return traces.map((trace) => {
     const started = trace.records[0];

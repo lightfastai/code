@@ -14,6 +14,7 @@ import { resolveStudyLibraryPaths } from "./StudyLibrary.ts";
 import { compareStudyEvalReports, evaluateStudyDataset } from "./StudyEvalRunner.ts";
 import {
   buildStudyTraceRecord,
+  listStudyTraces,
   readStudyTrace,
   readStudyTraceFile,
   resolveStudyLoopPaths,
@@ -178,6 +179,64 @@ it.layer(NodeServices.layer)("StudyLoop", (it) => {
         );
         const tampered = yield* Effect.result(readStudyTraceFile(tamperedPath));
         assert.strictEqual(tampered._tag, "Failure");
+      }),
+    ),
+  );
+
+  it.effect("allows byte-identical trace replay and rejects conflicting immutable bytes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const temp = yield* fileSystem.makeTempDirectoryScoped({ prefix: "study-loop-replay-" });
+        const loopPaths = yield* resolveStudyLoopPaths(yield* resolveStudyLibraryPaths(temp));
+        const runId = "immutable-run" as StudyTraceRunId;
+        const tracePath = yield* studyTracePath(loopPaths, runId);
+        const records = makeRecords({ runId, includeSearch: false });
+        yield* writeStudyTraceFile({ tracePath, records });
+        const original = yield* fileSystem.readFileString(tracePath);
+
+        yield* writeStudyTraceFile({ tracePath, records });
+        const conflict = yield* Effect.result(
+          writeStudyTraceFile({
+            tracePath,
+            records: makeRecords({ runId, includeSearch: true }),
+          }),
+        );
+
+        assert.strictEqual(conflict._tag, "Failure");
+        assert.strictEqual(yield* fileSystem.readFileString(tracePath), original);
+      }),
+    ),
+  );
+
+  it.effect("lists valid traces deterministically while isolating malformed files", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temp = yield* fileSystem.makeTempDirectoryScoped({ prefix: "study-loop-list-" });
+        const loopPaths = yield* resolveStudyLoopPaths(yield* resolveStudyLibraryPaths(temp));
+        const firstRunId = "a-valid-run" as StudyTraceRunId;
+        const secondRunId = "z-valid-run" as StudyTraceRunId;
+        yield* writeStudyTraceFile({
+          tracePath: yield* studyTracePath(loopPaths, secondRunId),
+          records: makeRecords({ runId: secondRunId, includeSearch: true }),
+        });
+        yield* writeStudyTraceFile({
+          tracePath: yield* studyTracePath(loopPaths, firstRunId),
+          records: makeRecords({ runId: firstRunId, includeSearch: false }),
+        });
+        yield* fileSystem.writeFileString(
+          path.join(loopPaths.traces, "m-malformed.jsonl"),
+          '{"torn":',
+        );
+
+        const traces = yield* listStudyTraces(loopPaths);
+
+        assert.deepStrictEqual(
+          traces.map((trace) => trace.runId),
+          [firstRunId, secondRunId],
+        );
       }),
     ),
   );
