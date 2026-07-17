@@ -133,18 +133,85 @@ const article = (renderer: RenderResult, title: string): HTMLElement =>
 const button = (renderer: RenderResult, label: string): HTMLButtonElement =>
   renderer.getByRole("button", { name: label }) as HTMLButtonElement;
 
-const deferred = () => {
-  let resolve!: () => void;
+const deferred = <Value = void,>() => {
+  let resolve!: (value: Value) => void;
   let reject!: (cause: unknown) => void;
-  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+  const promise = new Promise<Value>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise;
     reject = rejectPromise;
   });
   return { promise, reject, resolve } as const;
 };
 
+const expectWorkingCopyMutationControlsDisabled = (
+  renderer: RenderResult,
+  disabled: boolean,
+): void => {
+  expect(button(renderer, "Add Markdown cell").disabled).toBe(disabled);
+  expect(button(renderer, "Add code cell").disabled).toBe(disabled);
+  expect(button(renderer, "Duplicate cell").disabled).toBe(disabled);
+  expect(button(renderer, "Remove cell").disabled).toBe(disabled);
+  expect(button(renderer, "Import .ipynb").disabled).toBe(disabled);
+  expect(
+    (renderer.getByRole("textbox", { name: "Code cell 1 source" }) as HTMLTextAreaElement).disabled,
+  ).toBe(disabled);
+};
+
 describe("NotebookArtifactEnvelopeRenderer interactions", () => {
   afterEach(() => cleanup());
+
+  it("blocks working-copy mutations while save persistence is pending", async () => {
+    const original = revision("f", "print('original')");
+    const saved = revision("g", "print('edited')");
+    const persistence = deferred<NotebookRevision>();
+    const saveRevision = vi.fn<NotebookArtifactController["saveRevision"]>(
+      async (_scope, _documentId, document) => {
+        expect(document.cells).toHaveLength(1);
+        expect(document.cells[0]?.source).toBe("print('edited')");
+        return persistence.promise;
+      },
+    );
+    const bindingsValue = bindings(
+      controller({
+        readRevision: vi.fn(async () => original),
+        saveRevision,
+        connect: vi.fn(async (request) => request.onState(runtime())),
+        dispose: vi.fn(async () => undefined),
+      }),
+    );
+    const renderer = await mount(
+      bindingsValue,
+      artifact("artifact-pending-save", "Pending save", original),
+    );
+    const source = renderer.getByRole("textbox", {
+      name: "Code cell 1 source",
+    }) as HTMLTextAreaElement;
+
+    fireEvent.change(source, { target: { value: "print('edited')" } });
+    fireEvent.click(button(renderer, "Save new revision"));
+    await waitFor(() => expect(button(renderer, "Save new revision").disabled).toBe(true));
+
+    fireEvent.click(button(renderer, "Add code cell"));
+    fireEvent.change(source, { target: { value: "print('late edit')" } });
+
+    expectWorkingCopyMutationControlsDisabled(renderer, true);
+    expect(source.value).toBe("print('edited')");
+    expect(renderer.queryByRole("textbox", { name: "Code cell 2 source" })).toBeNull();
+
+    await act(async () => {
+      persistence.resolve(saved);
+      await persistence.promise;
+    });
+
+    await waitFor(() => expectWorkingCopyMutationControlsDisabled(renderer, false));
+    expect(saveRevision).toHaveBeenCalledTimes(1);
+    expect(source.value).toBe("print('edited')");
+    expect(renderer.queryByRole("textbox", { name: "Code cell 2 source" })).toBeNull();
+    expect(article(renderer, "Pending save").textContent).toContain(
+      `Latest ${hash("g").slice(0, 8)}`,
+    );
+    renderer.unmount();
+  });
 
   it("moves edit and save controls onto the newly opened immutable revision runtime", async () => {
     const original = revision("a", "print('original')");
@@ -236,12 +303,13 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
     const originalTarget = notebookRuntimeTarget(createNotebookWorkingCopy(original));
     const openSessions = new Set<string>();
     const order: string[] = [];
+    const persistence = deferred<NotebookRevision>();
     const bindingsValue = bindings(
       controller({
         readRevision: vi.fn(async () => original),
-        saveRevision: vi.fn(async () => {
+        saveRevision: vi.fn(() => {
           order.push("save");
-          throw new Error("save unavailable");
+          return persistence.promise;
         }),
         connect: vi.fn(async (request) => {
           order.push(`connect:${request.sessionId}`);
@@ -270,6 +338,22 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
       target: { value: "print('unsaved')" },
     });
     fireEvent.click(button(renderer, "Save new revision"));
+    await waitFor(() => expect(button(renderer, "Save new revision").disabled).toBe(true));
+
+    const source = renderer.getByRole("textbox", {
+      name: "Code cell 1 source",
+    }) as HTMLTextAreaElement;
+    fireEvent.click(button(renderer, "Add code cell"));
+    fireEvent.change(source, { target: { value: "print('late edit')" } });
+
+    expectWorkingCopyMutationControlsDisabled(renderer, true);
+    expect(source.value).toBe("print('unsaved')");
+    expect(renderer.queryByRole("textbox", { name: "Code cell 2 source" })).toBeNull();
+
+    await act(async () => {
+      persistence.reject(new Error("save unavailable"));
+      await Promise.resolve();
+    });
 
     await waitFor(() =>
       expect(renderer.getByRole("alert").textContent).toContain("save unavailable"),
@@ -277,6 +361,9 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
     expect(order).toEqual([`connect:${originalTarget.sessionId}`, "save"]);
     expect(article(renderer, "Save failure").textContent).toContain("Unsaved changes");
     expect(button(renderer, "Run all").disabled).toBe(false);
+    expectWorkingCopyMutationControlsDisabled(renderer, false);
+    expect(source.value).toBe("print('unsaved')");
+    expect(renderer.queryByRole("textbox", { name: "Code cell 2 source" })).toBeNull();
 
     fireEvent.click(button(renderer, "Run all"));
     await waitFor(() => expect(order).toContain(`execute:${originalTarget.sessionId}`));

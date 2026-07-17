@@ -90,6 +90,8 @@ export function NotebookArtifactEnvelopeRenderer({
   const [expanded, setExpanded] = useState(true);
   const mounted = useRef(true);
   const lifecycleGeneration = useRef(0);
+  const pendingActionRef = useRef(false);
+  const interruptPendingRef = useRef(false);
   const importInput = useRef<HTMLInputElement | null>(null);
   const runtimeTarget = working === null ? null : notebookRuntimeTarget(working);
   const sessionId = runtimeTarget?.sessionId ?? "notebook-invalid";
@@ -154,6 +156,7 @@ export function NotebookArtifactEnvelopeRenderer({
           if (mounted.current) setActionError(error);
         },
         onPendingChange: (pending) => {
+          pendingActionRef.current = pending;
           if (mounted.current) setPendingAction(pending ? label : null);
         },
       }),
@@ -168,11 +171,17 @@ export function NotebookArtifactEnvelopeRenderer({
           if (mounted.current) setActionError(error);
         },
         onPendingChange: (pending) => {
+          interruptPendingRef.current = pending;
           if (mounted.current) setInterruptPending(pending);
         },
       }),
     [],
   );
+
+  const runWorkingCopyMutation = useCallback((mutation: () => void) => {
+    if (pendingActionRef.current || interruptPendingRef.current) return;
+    mutation();
+  }, []);
 
   const transitionWorkingCopy = useCallback(
     (
@@ -182,6 +191,8 @@ export function NotebookArtifactEnvelopeRenderer({
       if (
         bindings === null ||
         working === null ||
+        pendingActionRef.current ||
+        interruptPendingRef.current ||
         interruptPending ||
         isNotebookRevisionSwitchDisabled(pendingAction, runtime.runningCellIds)
       )
@@ -572,7 +583,9 @@ export function NotebookArtifactEnvelopeRenderer({
                   outputKeys={renderedOutput?.outputKeys}
                   outputRetention={renderedOutput?.retention}
                   onSourceChange={(source) =>
-                    setWorking(updateNotebookCellSource(working, cell.id, source))
+                    runWorkingCopyMutation(() =>
+                      setWorking(updateNotebookCellSource(working, cell.id, source)),
+                    )
                   }
                   onRun={
                     cell.cell_type === "code" && runtimeReady
@@ -588,20 +601,28 @@ export function NotebookArtifactEnvelopeRenderer({
                           })
                       : undefined
                   }
-                  onMove={(direction) => setWorking(moveNotebookCell(working, cell.id, direction))}
+                  onMove={(direction) =>
+                    runWorkingCopyMutation(() =>
+                      setWorking(moveNotebookCell(working, cell.id, direction)),
+                    )
+                  }
                   onDuplicate={() =>
-                    setWorking(duplicateNotebookCell(working, cell.id, () => nextId("cell")))
+                    runWorkingCopyMutation(() =>
+                      setWorking(duplicateNotebookCell(working, cell.id, () => nextId("cell"))),
+                    )
                   }
                   onRemove={() =>
-                    setWorking(
-                      removeNotebookCellFromRenderer(working, cell.id, (cellId) =>
-                        bindings.controller.removeCell({
-                          scope: bindings.scope,
-                          sessionId,
-                          revisionId: runtimeRevisionId,
-                          cellId,
-                          onState: onRuntimeState,
-                        }),
+                    runWorkingCopyMutation(() =>
+                      setWorking(
+                        removeNotebookCellFromRenderer(working, cell.id, (cellId) =>
+                          bindings.controller.removeCell({
+                            scope: bindings.scope,
+                            sessionId,
+                            revisionId: runtimeRevisionId,
+                            cellId,
+                            onState: onRuntimeState,
+                          }),
+                        ),
                       ),
                     )
                   }
@@ -617,11 +638,14 @@ export function NotebookArtifactEnvelopeRenderer({
           >
             <button
               type="button"
-              className="rounded border border-border px-2 py-1 text-xs"
+              className="rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
+              disabled={disabled}
               onClick={() =>
-                setWorking(
-                  addNotebookCell(working, "markdown", working.document.cells.length, () =>
-                    nextId("markdown"),
+                runWorkingCopyMutation(() =>
+                  setWorking(
+                    addNotebookCell(working, "markdown", working.document.cells.length, () =>
+                      nextId("markdown"),
+                    ),
                   ),
                 )
               }
@@ -630,11 +654,14 @@ export function NotebookArtifactEnvelopeRenderer({
             </button>
             <button
               type="button"
-              className="rounded border border-border px-2 py-1 text-xs"
+              className="rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
+              disabled={disabled}
               onClick={() =>
-                setWorking(
-                  addNotebookCell(working, "code", working.document.cells.length, () =>
-                    nextId("code"),
+                runWorkingCopyMutation(() =>
+                  setWorking(
+                    addNotebookCell(working, "code", working.document.cells.length, () =>
+                      nextId("code"),
+                    ),
                   ),
                 )
               }
@@ -677,6 +704,8 @@ export function NotebookArtifactEnvelopeRenderer({
                 event.currentTarget.value = "";
                 if (!file) return;
                 if (
+                  pendingActionRef.current ||
+                  interruptPendingRef.current ||
                   interruptPending ||
                   isNotebookRevisionSwitchDisabled(pendingAction, runtime.runningCellIds)
                 )
