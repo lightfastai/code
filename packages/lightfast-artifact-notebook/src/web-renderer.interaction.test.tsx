@@ -6,6 +6,7 @@ import { act, Fragment } from "react";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type { NotebookRevision } from "./contracts.ts";
+import { notebookRuntimeTarget } from "./runtime-lifecycle.ts";
 import { NotebookArtifactEnvelopeRenderer } from "./web-renderer.tsx";
 import {
   NotebookWebProvider,
@@ -13,6 +14,7 @@ import {
   type NotebookRuntimeView,
   type NotebookWebBindings,
 } from "./web.tsx";
+import { createNotebookWorkingCopy } from "./working-copy.ts";
 
 const hash = (character: string) => character.repeat(64);
 const scope = { environmentId: "environment-1", projectId: "project-1" } as const;
@@ -143,6 +145,144 @@ const deferred = () => {
 
 describe("NotebookArtifactEnvelopeRenderer interactions", () => {
   afterEach(() => cleanup());
+
+  it("moves edit and save controls onto the newly opened immutable revision runtime", async () => {
+    const original = revision("a", "print('original')");
+    const saved = revision("b", "print('edited')");
+    const originalTarget = notebookRuntimeTarget(createNotebookWorkingCopy(original));
+    const savedTarget = notebookRuntimeTarget(createNotebookWorkingCopy(saved));
+    const openSessions = new Set<string>();
+    const order: string[] = [];
+    const savedConnection = deferred();
+    const requireOpen = (sessionId: string) => {
+      if (!openSessions.has(sessionId)) throw new Error(`session-not-found: ${sessionId}`);
+    };
+    const bindingsValue = bindings(
+      controller({
+        readRevision: vi.fn(async () => original),
+        saveRevision: vi.fn(async (_scope, _documentId, document) => {
+          order.push("save");
+          expect(document.cells[0]?.source).toBe("print('edited')");
+          return saved;
+        }),
+        connect: vi.fn(async (request) => {
+          order.push(`connect:${request.sessionId}`);
+          if (request.sessionId === savedTarget.sessionId) await savedConnection.promise;
+          openSessions.add(request.sessionId);
+          request.onState(runtime());
+        }),
+        executeCell: vi.fn(async (request) => {
+          order.push(`execute:${request.sessionId}`);
+          requireOpen(request.sessionId);
+          request.onState(runtime({ output: "edited-output" }));
+        }),
+        restart: vi.fn(async (request) => {
+          order.push(`restart:${request.sessionId}`);
+          requireOpen(request.sessionId);
+          request.onState(runtime());
+        }),
+        dispose: vi.fn(async (request) => {
+          order.push(`dispose:${request.sessionId}`);
+          requireOpen(request.sessionId);
+          openSessions.delete(request.sessionId);
+        }),
+      }),
+    );
+    const renderer = await mount(bindingsValue, artifact("artifact-save", "Save", original));
+
+    await waitFor(() => expect(button(renderer, "Run all").disabled).toBe(false));
+    fireEvent.change(renderer.getByRole("textbox", { name: "Code cell 1 source" }), {
+      target: { value: "print('edited')" },
+    });
+    await waitFor(() => expect(button(renderer, "Save new revision").disabled).toBe(false));
+    fireEvent.click(button(renderer, "Save new revision"));
+
+    await waitFor(() =>
+      expect(article(renderer, "Save").textContent).toContain(`Latest ${hash("b").slice(0, 8)}`),
+    );
+    expect(openSessions.has(originalTarget.sessionId)).toBe(false);
+    expect(openSessions.has(savedTarget.sessionId)).toBe(false);
+    expect(button(renderer, "Run all").disabled).toBe(true);
+
+    await act(async () => {
+      savedConnection.resolve();
+      await savedConnection.promise;
+    });
+    await waitFor(() => expect(button(renderer, "Run all").disabled).toBe(false));
+    expect(openSessions.has(savedTarget.sessionId)).toBe(true);
+
+    fireEvent.click(button(renderer, "Run all"));
+    await waitFor(() => expect(order).toContain(`execute:${savedTarget.sessionId}`));
+    fireEvent.click(button(renderer, "Restart kernel"));
+    await waitFor(() => expect(order).toContain(`restart:${savedTarget.sessionId}`));
+    fireEvent.click(button(renderer, "Dispose runtime"));
+    await waitFor(() => expect(openSessions.size).toBe(0));
+
+    expect(order).toEqual([
+      `connect:${originalTarget.sessionId}`,
+      "save",
+      `dispose:${originalTarget.sessionId}`,
+      `connect:${savedTarget.sessionId}`,
+      `execute:${savedTarget.sessionId}`,
+      `restart:${savedTarget.sessionId}`,
+      `dispose:${savedTarget.sessionId}`,
+    ]);
+    expect(article(renderer, "Save").textContent).not.toContain("session-not-found");
+    renderer.unmount();
+  });
+
+  it("keeps the old revision runtime ready when persistence fails before transition", async () => {
+    const original = revision("c", "print('original')");
+    const originalTarget = notebookRuntimeTarget(createNotebookWorkingCopy(original));
+    const openSessions = new Set<string>();
+    const order: string[] = [];
+    const bindingsValue = bindings(
+      controller({
+        readRevision: vi.fn(async () => original),
+        saveRevision: vi.fn(async () => {
+          order.push("save");
+          throw new Error("save unavailable");
+        }),
+        connect: vi.fn(async (request) => {
+          order.push(`connect:${request.sessionId}`);
+          openSessions.add(request.sessionId);
+          request.onState(runtime());
+        }),
+        executeCell: vi.fn(async (request) => {
+          order.push(`execute:${request.sessionId}`);
+          if (!openSessions.has(request.sessionId))
+            throw new Error(`session-not-found: ${request.sessionId}`);
+          request.onState(runtime());
+        }),
+        dispose: vi.fn(async (request) => {
+          order.push(`dispose:${request.sessionId}`);
+          openSessions.delete(request.sessionId);
+        }),
+      }),
+    );
+    const renderer = await mount(
+      bindingsValue,
+      artifact("artifact-save-failure", "Save failure", original),
+    );
+
+    await waitFor(() => expect(button(renderer, "Run all").disabled).toBe(false));
+    fireEvent.change(renderer.getByRole("textbox", { name: "Code cell 1 source" }), {
+      target: { value: "print('unsaved')" },
+    });
+    fireEvent.click(button(renderer, "Save new revision"));
+
+    await waitFor(() =>
+      expect(renderer.getByRole("alert").textContent).toContain("save unavailable"),
+    );
+    expect(order).toEqual([`connect:${originalTarget.sessionId}`, "save"]);
+    expect(article(renderer, "Save failure").textContent).toContain("Unsaved changes");
+    expect(button(renderer, "Run all").disabled).toBe(false);
+
+    fireEvent.click(button(renderer, "Run all"));
+    await waitFor(() => expect(order).toContain(`execute:${originalTarget.sessionId}`));
+    expect(article(renderer, "Save failure").textContent).not.toContain("session-not-found");
+    renderer.unmount();
+  });
 
   it("does not recover an earlier revision after a fresh renderer reload", async () => {
     const first = revision("a", "print('first')");

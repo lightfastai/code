@@ -175,7 +175,10 @@ export function NotebookArtifactEnvelopeRenderer({
   );
 
   const transitionWorkingCopy = useCallback(
-    (label: string, nextWorking: NotebookWorkingCopy) => {
+    (
+      label: string,
+      resolveNextWorking: NotebookWorkingCopy | (() => Promise<NotebookWorkingCopy>),
+    ) => {
       if (
         bindings === null ||
         working === null ||
@@ -186,7 +189,12 @@ export function NotebookArtifactEnvelopeRenderer({
       const generation = ++lifecycleGeneration.current;
       const isActive = () => mounted.current && lifecycleGeneration.current === generation;
       void runAction(label, async () => {
-        if (isActive()) setRuntimeReady(false);
+        const nextWorking =
+          typeof resolveNextWorking === "function"
+            ? await resolveNextWorking()
+            : resolveNextWorking;
+        if (!isActive()) return;
+        setRuntimeReady(false);
         try {
           const next = await replaceNotebookWorkingCopyRuntime({
             controller: bindings.controller,
@@ -638,16 +646,13 @@ export function NotebookArtifactEnvelopeRenderer({
               className="ml-auto rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
               disabled={disabled || !dirty}
               onClick={() =>
-                void runAction("save", async () => {
+                transitionWorkingCopy("save", async () => {
                   const revision = await bindings.controller.saveRevision(
                     bindings.scope,
                     working.documentId,
                     working.document,
                   );
-                  if (mounted.current)
-                    setWorking((current) =>
-                      current === null ? current : applySavedNotebookRevision(current, revision),
-                    );
+                  return applySavedNotebookRevision(working, revision);
                 })
               }
             >
