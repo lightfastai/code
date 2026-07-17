@@ -1141,6 +1141,113 @@ it("waits for session removal before reopening in a new container", async () => 
   await manager.close();
 });
 
+it("rejects every session access while idle removal owns the runtime generation", async () => {
+  const { clients, docker, manager, setNow } = await makeHarness({ idleTimeoutMs: 10 });
+  const executeInput = {
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "execute-1",
+    executionId: "execution-1",
+    cellId: "cell-1",
+    code: "print('first generation')",
+  } as const;
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-1",
+    kernelName: "python3",
+  });
+  await Array.fromAsync(manager.execute(executeInput));
+
+  docker.holdRemovals = true;
+  setNow(2_000);
+  const reaping = manager.reapIdle();
+  await docker.removeStarted;
+
+  const capture = async (access: () => unknown): Promise<unknown> => {
+    try {
+      return await access();
+    } catch (error) {
+      return error;
+    }
+  };
+
+  try {
+    const accessResults = [
+      await capture(() => Array.fromAsync(manager.execute(executeInput))),
+      await capture(() =>
+        Array.fromAsync(
+          manager.execute({
+            ...executeInput,
+            commandId: "execute-during-removal",
+            executionId: "execution-during-removal",
+          }),
+        ),
+      ),
+      await capture(() =>
+        manager.interrupt({
+          projectId: "project-1",
+          sessionId: "session-1",
+          commandId: "interrupt-during-removal",
+        }),
+      ),
+      await capture(() =>
+        manager.restart({
+          projectId: "project-1",
+          sessionId: "session-1",
+          commandId: "restart-during-removal",
+        }),
+      ),
+      await capture(() => manager.eventsAfter("project-1", "session-1", 0)),
+    ];
+
+    expect(accessResults).toEqual(
+      Array.from({ length: 5 }, () => expect.objectContaining({ reason: "runtime-unavailable" })),
+    );
+    expect(clients[0]).toMatchObject({
+      executeCount: 1,
+      interruptCount: 0,
+      restartCount: 0,
+    });
+  } finally {
+    docker.releaseRemovals();
+    await reaping;
+  }
+
+  await manager.open({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "open-2",
+    kernelName: "python3",
+  });
+  await Array.fromAsync(
+    manager.execute({
+      ...executeInput,
+      commandId: "execute-2",
+      executionId: "execution-2",
+      code: "print('replacement generation')",
+    }),
+  );
+  await manager.interrupt({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "interrupt-2",
+  });
+  await manager.restart({
+    projectId: "project-1",
+    sessionId: "session-1",
+    commandId: "restart-2",
+  });
+
+  expect(manager.eventsAfter("project-1", "session-1", 0).events).not.toHaveLength(0);
+  expect(clients).toHaveLength(2);
+  expect(clients).toEqual([
+    expect.objectContaining({ executeCount: 1, interruptCount: 0, restartCount: 0 }),
+    expect.objectContaining({ executeCount: 1, interruptCount: 1, restartCount: 1 }),
+  ]);
+  await manager.close();
+});
+
 it("waits for held sidecar disposal and removal before reopening", async () => {
   const heldClient = new DeferredDisposeRuntimeClient();
   let clientIndex = 0;

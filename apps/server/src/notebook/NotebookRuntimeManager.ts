@@ -636,8 +636,15 @@ export class NotebookRuntimeManager {
     readonly runtime: SessionRuntime;
     readonly session: SessionState;
   } {
+    const sessionKey = this.#sessionKey(input.projectId, input.sessionId);
+    if (this.#sessionRemovals.has(sessionKey)) {
+      throw new NotebookRuntimeManagerError({
+        reason: "runtime-unavailable",
+        message: "Notebook session runtime is being removed.",
+      });
+    }
     const project = this.#projects.get(input.projectId);
-    const runtime = this.#sessions.get(this.#sessionKey(input.projectId, input.sessionId));
+    const runtime = this.#sessions.get(sessionKey);
     const session = runtime?.session;
     if (
       project === undefined ||
