@@ -36,7 +36,11 @@ layer("ProjectionTurnRepository accepted starts", (it) => {
       assert.isFalse(yield* repository.stageAcceptedTurnStart(overlappingB));
       assert.deepEqual(
         Option.getOrThrow(yield* repository.getAcceptedTurnStartByThreadId({ threadId })),
-        acceptedA,
+        {
+          ...acceptedA,
+          providerSendCompleted: false,
+          runtimeAdmitted: false,
+        },
       );
     }),
   );
@@ -78,6 +82,90 @@ layer("ProjectionTurnRepository accepted starts", (it) => {
       assert.isTrue(yield* repository.deletePendingTurnStart({ threadId, messageId: messageB }));
       assert.isTrue(Option.isNone(yield* repository.getAcceptedTurnStartByThreadId({ threadId })));
       assert.isTrue(Option.isNone(yield* repository.getPendingTurnStartByThreadId({ threadId })));
+    }),
+  );
+
+  it.effect("finalizes accepted A exactly once after send and runtime phases in either order", () =>
+    Effect.gen(function* () {
+      const repository = yield* ProjectionTurnRepository;
+      const threadId = ThreadId.make("thread-accepted-phase-reconciliation");
+      const messageA = MessageId.make("message-phase-a");
+      const messageB = MessageId.make("message-phase-b");
+      const acceptedA = {
+        threadId,
+        messageId: messageA,
+        sourceProposedPlanThreadId: null,
+        sourceProposedPlanId: null,
+        requestedAt: "2026-01-01T00:00:00.000Z",
+      } as const;
+
+      assert.isTrue(yield* repository.stageAcceptedTurnStart(acceptedA));
+      assert.deepEqual(
+        Option.getOrThrow(
+          yield* repository.completeAcceptedTurnStartPhase({
+            threadId,
+            messageId: messageA,
+            phase: "provider-send-completed",
+          }),
+        ),
+        {
+          ...acceptedA,
+          providerSendCompleted: true,
+          runtimeAdmitted: false,
+          finalized: false,
+        },
+      );
+      assert.isTrue(
+        Option.isNone(
+          yield* repository.completeAcceptedTurnStartPhase({
+            threadId,
+            messageId: messageB,
+            phase: "runtime-admitted",
+          }),
+        ),
+      );
+      assert.equal(
+        Option.getOrThrow(yield* repository.getAcceptedTurnStartByThreadId({ threadId })).messageId,
+        messageA,
+      );
+
+      assert.deepEqual(
+        Option.getOrThrow(
+          yield* repository.completeAcceptedTurnStartPhase({
+            threadId,
+            messageId: messageA,
+            phase: "runtime-admitted",
+          }),
+        ),
+        {
+          ...acceptedA,
+          providerSendCompleted: true,
+          runtimeAdmitted: true,
+          finalized: true,
+        },
+      );
+      assert.isTrue(Option.isNone(yield* repository.getAcceptedTurnStartByThreadId({ threadId })));
+      assert.isTrue(
+        Option.isNone(
+          yield* repository.completeAcceptedTurnStartPhase({
+            threadId,
+            messageId: messageA,
+            phase: "runtime-admitted",
+          }),
+        ),
+      );
+
+      assert.isTrue(
+        yield* repository.stageAcceptedTurnStart({
+          ...acceptedA,
+          messageId: messageB,
+          requestedAt: "2026-01-01T00:00:01.000Z",
+        }),
+      );
+      assert.isFalse(
+        Option.getOrThrow(yield* repository.getAcceptedTurnStartByThreadId({ threadId }))
+          .providerSendCompleted,
+      );
     }),
   );
 });

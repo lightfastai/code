@@ -87,6 +87,44 @@ export const ProjectionAcceptedTurnStart = Schema.Struct({
 });
 export type ProjectionAcceptedTurnStart = typeof ProjectionAcceptedTurnStart.Type;
 
+export const ProjectionAcceptedTurnStartState = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
+  sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
+  requestedAt: IsoDateTime,
+  providerSendCompleted: Schema.Boolean,
+  runtimeAdmitted: Schema.Boolean,
+});
+export type ProjectionAcceptedTurnStartState = typeof ProjectionAcceptedTurnStartState.Type;
+
+export const ProjectionAcceptedTurnStartPhase = Schema.Literals([
+  "provider-send-completed",
+  "runtime-admitted",
+]);
+export type ProjectionAcceptedTurnStartPhase = typeof ProjectionAcceptedTurnStartPhase.Type;
+
+export const CompleteProjectionAcceptedTurnStartPhaseInput = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  phase: ProjectionAcceptedTurnStartPhase,
+});
+export type CompleteProjectionAcceptedTurnStartPhaseInput =
+  typeof CompleteProjectionAcceptedTurnStartPhaseInput.Type;
+
+export const ProjectionAcceptedTurnStartPhaseResult = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
+  sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
+  requestedAt: IsoDateTime,
+  providerSendCompleted: Schema.Boolean,
+  runtimeAdmitted: Schema.Boolean,
+  finalized: Schema.Boolean,
+});
+export type ProjectionAcceptedTurnStartPhaseResult =
+  typeof ProjectionAcceptedTurnStartPhaseResult.Type;
+
 export const ListProjectionTurnsByThreadInput = Schema.Struct({
   threadId: ThreadId,
 });
@@ -154,7 +192,15 @@ export interface ProjectionTurnRepositoryShape {
   /** Returns the reactor-admitted turn start independently of the latest projected intent. */
   readonly getAcceptedTurnStartByThreadId: (
     input: GetProjectionPendingTurnStartInput,
-  ) => Effect.Effect<Option.Option<ProjectionAcceptedTurnStart>, ProjectionRepositoryError>;
+  ) => Effect.Effect<Option.Option<ProjectionAcceptedTurnStartState>, ProjectionRepositoryError>;
+
+  /** Records one exact completion phase and atomically finalizes the row when both phases exist. */
+  readonly completeAcceptedTurnStartPhase: (
+    input: CompleteProjectionAcceptedTurnStartPhaseInput,
+  ) => Effect.Effect<
+    Option.Option<ProjectionAcceptedTurnStartPhaseResult>,
+    ProjectionRepositoryError
+  >;
 
   /** Deletes an accepted turn start only when both its thread and message identity match. */
   readonly deleteAcceptedTurnStart: (

@@ -203,44 +203,122 @@ it.effect("stages notebook authority invisibly and rolls an admitted turn back a
   }),
 );
 
-it.effect("completes staged notebook authority and direct updates cancel stale transactions", () =>
+it.effect(
+  "retains send-first authority until exact runtime admission completes the transaction",
+  () =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry(() => 1_000);
+      const threadId = ThreadId.make("thread-notebook-authority-complete");
+      const firstMessageId = MessageId.make("message-notebook-authority-first");
+      const overlappingMessageId = MessageId.make("message-notebook-authority-overlapping");
+      const staleMessageId = MessageId.make("message-notebook-authority-stale");
+      const documentA = "a".repeat(64);
+      const documentB = "b".repeat(64);
+      const documentC = "c".repeat(64);
+      const issued = yield* registry.issue({
+        threadId,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+      });
+      const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+      yield* registry.stageNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId: firstMessageId,
+        documentIds: [documentB],
+      });
+      expect(
+        yield* registry.completeNotebookDocumentAuthorityTurn({
+          threadId,
+          messageId: firstMessageId,
+        }),
+      ).toBe(true);
+      expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([]);
+      expect(
+        yield* registry.stageNotebookDocumentAuthorityTurn({
+          threadId,
+          messageId: overlappingMessageId,
+          documentIds: [documentA],
+        }),
+      ).toBe(false);
+      expect(
+        yield* registry.admitNotebookDocumentAuthorityTurn({
+          threadId,
+          messageId: firstMessageId,
+        }),
+      ).toBe(true);
+      expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentB]);
+      expect(
+        yield* registry.stageNotebookDocumentAuthorityTurn({
+          threadId,
+          messageId: overlappingMessageId,
+          documentIds: [documentA],
+        }),
+      ).toBe(false);
+      expect(
+        yield* registry.finalizeNotebookDocumentAuthorityTurn({
+          threadId,
+          messageId: firstMessageId,
+        }),
+      ).toBe(true);
+
+      yield* registry.stageNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId: staleMessageId,
+        documentIds: [documentA],
+      });
+      yield* registry.setNotebookDocumentAuthority({ threadId, documentIds: [documentC] });
+      yield* registry.admitNotebookDocumentAuthorityTurn({ threadId, messageId: staleMessageId });
+      yield* registry.completeNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId: staleMessageId,
+      });
+      expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentC]);
+    }),
+);
+
+it.effect("retains runtime-first authority for post-admission rollback until send completes", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry(() => 1_000);
-    const threadId = ThreadId.make("thread-notebook-authority-complete");
-    const firstMessageId = MessageId.make("message-notebook-authority-first");
-    const staleMessageId = MessageId.make("message-notebook-authority-stale");
+    const threadId = ThreadId.make("thread-notebook-authority-runtime-first");
+    const messageId = MessageId.make("message-notebook-authority-runtime-first");
+    const nextMessageId = MessageId.make("message-notebook-authority-runtime-next");
     const documentA = "a".repeat(64);
     const documentB = "b".repeat(64);
-    const documentC = "c".repeat(64);
     const issued = yield* registry.issue({
       threadId,
       providerInstanceId: ProviderInstanceId.make("codex"),
     });
     const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
 
-    yield* registry.stageNotebookDocumentAuthorityTurn({
-      threadId,
-      messageId: firstMessageId,
-      documentIds: [documentB],
-    });
-    yield* registry.completeNotebookDocumentAuthorityTurn({
-      threadId,
-      messageId: firstMessageId,
-    });
+    yield* registry.setNotebookDocumentAuthority({ threadId, documentIds: [documentA] });
+    expect(
+      yield* registry.stageNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId,
+        documentIds: [documentB],
+      }),
+    ).toBe(true);
+    expect(yield* registry.admitNotebookDocumentAuthorityTurn({ threadId, messageId })).toBe(true);
     expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentB]);
+    expect(
+      yield* registry.stageNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId: nextMessageId,
+        documentIds: [],
+      }),
+    ).toBe(false);
 
-    yield* registry.stageNotebookDocumentAuthorityTurn({
-      threadId,
-      messageId: staleMessageId,
-      documentIds: [documentA],
-    });
-    yield* registry.setNotebookDocumentAuthority({ threadId, documentIds: [documentC] });
-    yield* registry.admitNotebookDocumentAuthorityTurn({ threadId, messageId: staleMessageId });
-    yield* registry.completeNotebookDocumentAuthorityTurn({
-      threadId,
-      messageId: staleMessageId,
-    });
-    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentC]);
+    expect(yield* registry.rollbackNotebookDocumentAuthorityTurn({ threadId, messageId })).toBe(
+      true,
+    );
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentA]);
+    expect(
+      yield* registry.stageNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId: nextMessageId,
+        documentIds: [],
+      }),
+    ).toBe(true);
   }),
 );
 

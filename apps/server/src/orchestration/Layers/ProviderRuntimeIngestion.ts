@@ -39,6 +39,7 @@ import {
 } from "../Services/ProviderRuntimeIngestion.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import { completeTurnStartAdmissionPhase } from "../TurnStartAdmission.ts";
 
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 
@@ -1361,6 +1362,13 @@ const make = Effect.gen(function* () {
             },
             createdAt: now,
           });
+          if (event.type === "turn.started" && Option.isSome(acceptedTurnStart)) {
+            yield* completeTurnStartAdmissionPhase(projectionTurnRepository, {
+              threadId: thread.id,
+              messageId: acceptedTurnStart.value.messageId,
+              phase: "runtime-admitted",
+            });
+          }
         }
       }
 

@@ -1144,14 +1144,6 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             });
           }
 
-          if (Option.isSome(acceptedTurnStart)) {
-            const acceptedTurnKey = {
-              threadId: event.payload.threadId,
-              messageId: acceptedTurnStart.value.messageId,
-            } as const;
-            yield* projectionTurnRepository.deleteAcceptedTurnStart(acceptedTurnKey);
-            yield* projectionTurnRepository.deletePendingTurnStart(acceptedTurnKey);
-          }
           return;
         }
 

@@ -10,11 +10,13 @@ import * as Struct from "effect/Struct";
 import { toPersistenceDecodeError, toPersistenceSqlError } from "../Errors.ts";
 import {
   ClearCheckpointTurnConflictInput,
+  CompleteProjectionAcceptedTurnStartPhaseInput,
   DeleteProjectionTurnsByThreadInput,
   GetProjectionPendingTurnStartInput,
   GetProjectionTurnByTurnIdInput,
   ListProjectionTurnsByThreadInput,
   ProjectionAcceptedTurnStart,
+  ProjectionAcceptedTurnStartState,
   ProjectionPendingTurnStart,
   ProjectionTurn,
   ProjectionTurnById,
@@ -34,6 +36,21 @@ const ProjectionTurnByIdDbRowSchema = ProjectionTurnById.mapFields(
     checkpointFiles: Schema.fromJsonString(Schema.Array(OrchestrationCheckpointFile)),
   }),
 );
+
+const ProjectionAcceptedTurnStartDbRowSchema = ProjectionAcceptedTurnStartState.mapFields(
+  Struct.assign({
+    providerSendCompleted: Schema.Int,
+    runtimeAdmitted: Schema.Int,
+  }),
+);
+
+const decodeAcceptedTurnStart = (
+  row: typeof ProjectionAcceptedTurnStartDbRowSchema.Type,
+): ProjectionAcceptedTurnStartState => ({
+  ...row,
+  providerSendCompleted: row.providerSendCompleted === 1,
+  runtimeAdmitted: row.runtimeAdmitted === 1,
+});
 
 function toPersistenceSqlOrDecodeError(sqlOperation: string, decodeOperation: string) {
   return (cause: unknown) =>
@@ -195,7 +212,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
 
   const getAcceptedProjectionTurnStart = SqlSchema.findOneOption({
     Request: GetProjectionPendingTurnStartInput,
-    Result: ProjectionAcceptedTurnStart,
+    Result: ProjectionAcceptedTurnStartDbRowSchema,
     execute: ({ threadId }) =>
       sql`
         SELECT
@@ -203,10 +220,40 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           message_id AS "messageId",
           source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
           source_proposed_plan_id AS "sourceProposedPlanId",
-          requested_at AS "requestedAt"
+          requested_at AS "requestedAt",
+          provider_send_completed AS "providerSendCompleted",
+          runtime_admitted AS "runtimeAdmitted"
         FROM projection_turn_start_admissions
         WHERE thread_id = ${threadId}
         LIMIT 1
+      `,
+  });
+
+  const completeAcceptedProjectionTurnStartPhase = SqlSchema.findOneOption({
+    Request: CompleteProjectionAcceptedTurnStartPhaseInput,
+    Result: ProjectionAcceptedTurnStartDbRowSchema,
+    execute: ({ threadId, messageId, phase }) =>
+      sql`
+        UPDATE projection_turn_start_admissions
+        SET
+          provider_send_completed = CASE
+            WHEN ${phase} = 'provider-send-completed' THEN 1
+            ELSE provider_send_completed
+          END,
+          runtime_admitted = CASE
+            WHEN ${phase} = 'runtime-admitted' THEN 1
+            ELSE runtime_admitted
+          END
+        WHERE thread_id = ${threadId}
+          AND message_id = ${messageId}
+        RETURNING
+          thread_id AS "threadId",
+          message_id AS "messageId",
+          source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
+          source_proposed_plan_id AS "sourceProposedPlanId",
+          requested_at AS "requestedAt",
+          provider_send_completed AS "providerSendCompleted",
+          runtime_admitted AS "runtimeAdmitted"
       `,
   });
 
@@ -394,6 +441,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
   const getAcceptedTurnStartByThreadId: ProjectionTurnRepositoryShape["getAcceptedTurnStartByThreadId"] =
     (input) =>
       getAcceptedProjectionTurnStart(input).pipe(
+        Effect.map(Option.map(decodeAcceptedTurnStart)),
         Effect.mapError(
           toPersistenceSqlOrDecodeError(
             "ProjectionTurnRepository.getAcceptedTurnStartByThreadId:query",
@@ -401,6 +449,41 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           ),
         ),
       );
+
+  const completeAcceptedTurnStartPhase: ProjectionTurnRepositoryShape["completeAcceptedTurnStartPhase"] =
+    (input) =>
+      sql
+        .withTransaction(
+          completeAcceptedProjectionTurnStartPhase(input).pipe(
+            Effect.flatMap(
+              Option.match({
+                onNone: () => Effect.succeed(Option.none()),
+                onSome: (dbRow) => {
+                  const accepted = decodeAcceptedTurnStart(dbRow);
+                  if (!accepted.providerSendCompleted || !accepted.runtimeAdmitted) {
+                    return Effect.succeed(Option.some({ ...accepted, finalized: false }));
+                  }
+                  return deleteAcceptedProjectionTurnStart(input).pipe(
+                    Effect.map(
+                      Option.match({
+                        onNone: () => Option.none(),
+                        onSome: () => Option.some({ ...accepted, finalized: true }),
+                      }),
+                    ),
+                  );
+                },
+              }),
+            ),
+          ),
+        )
+        .pipe(
+          Effect.mapError(
+            toPersistenceSqlOrDecodeError(
+              "ProjectionTurnRepository.completeAcceptedTurnStartPhase:query",
+              "ProjectionTurnRepository.completeAcceptedTurnStartPhase:decodeRow",
+            ),
+          ),
+        );
 
   const deleteAcceptedTurnStart: ProjectionTurnRepositoryShape["deleteAcceptedTurnStart"] = (
     input,
@@ -487,6 +570,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
     getPendingTurnStartByThreadId,
     stageAcceptedTurnStart,
     getAcceptedTurnStartByThreadId,
+    completeAcceptedTurnStartPhase,
     deleteAcceptedTurnStart,
     deletePendingTurnStart,
     deletePendingTurnStartByThreadId,

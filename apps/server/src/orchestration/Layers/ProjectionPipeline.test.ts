@@ -2518,7 +2518,18 @@ acceptedTurnProjectionLayer("accepted turn-start projection", (it) => {
         checkpointStatus: null,
         checkpointFiles: [],
       });
-      assert.isTrue(Option.isNone(yield* turns.getAcceptedTurnStartByThreadId({ threadId })));
+      assert.deepEqual(
+        Option.getOrThrow(yield* turns.getAcceptedTurnStartByThreadId({ threadId })),
+        {
+          threadId,
+          messageId: messageA,
+          sourceProposedPlanThreadId: sourceThreadA,
+          sourceProposedPlanId: sourcePlanA,
+          requestedAt: "2026-01-01T00:00:00.000Z",
+          providerSendCompleted: false,
+          runtimeAdmitted: false,
+        },
+      );
       assert.equal(
         Option.getOrThrow(yield* turns.getPendingTurnStartByThreadId({ threadId })).messageId,
         messageB,
@@ -2623,7 +2634,7 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
           AND turn_id IS NULL
           AND state = 'pending'
       `;
-      assert.deepEqual(pendingRows, []);
+      assert.deepEqual(pendingRows, [{ threadId: "thread-restart" }]);
 
       return yield* sql<{
         readonly turnId: string;

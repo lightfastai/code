@@ -71,6 +71,9 @@ export interface McpSessionRegistryShape {
   readonly completeNotebookDocumentAuthorityTurn: (
     input: NotebookDocumentAuthorityTurnKey,
   ) => Effect.Effect<boolean>;
+  readonly finalizeNotebookDocumentAuthorityTurn: (
+    input: NotebookDocumentAuthorityTurnKey,
+  ) => Effect.Effect<boolean>;
   readonly rollbackNotebookDocumentAuthorityTurn: (
     input: NotebookDocumentAuthorityTurnKey,
   ) => Effect.Effect<boolean>;
@@ -97,7 +100,8 @@ interface NotebookDocumentAuthorityTurn {
   readonly messageId: MessageId;
   readonly previousDocumentIds: SelectedStudyDocumentIds;
   readonly documentIds: SelectedStudyDocumentIds;
-  readonly committed: boolean;
+  readonly providerSendCompleted: boolean;
+  readonly runtimeAdmitted: boolean;
 }
 
 interface RegistryState {
@@ -419,7 +423,8 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
             messageId: input.messageId,
             previousDocumentIds: current.notebookDocumentAuthorities.get(input.threadId) ?? [],
             documentIds,
-            committed: false,
+            providerSendCompleted: false,
+            runtimeAdmitted: false,
           });
           return [true, { ...current, notebookDocumentAuthorityTurns: nextTurns }] as const;
         }),
@@ -435,7 +440,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
           if (transaction === undefined || transaction.messageId !== input.messageId) {
             return [false, current] as const;
           }
-          if (transaction.committed) {
+          if (transaction.runtimeAdmitted) {
             return [true, current] as const;
           }
           const updated = updateNotebookDocumentAuthority(
@@ -444,7 +449,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
             transaction.documentIds,
           );
           const nextTurns = new Map(updated.notebookDocumentAuthorityTurns);
-          nextTurns.set(input.threadId, { ...transaction, committed: true });
+          nextTurns.set(input.threadId, { ...transaction, runtimeAdmitted: true });
           return [true, { ...updated, notebookDocumentAuthorityTurns: nextTurns }] as const;
         }),
       ),
@@ -459,12 +464,33 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
           if (transaction === undefined || transaction.messageId !== input.messageId) {
             return [false, current] as const;
           }
-          const updated = transaction.committed
-            ? current
-            : updateNotebookDocumentAuthority(current, input.threadId, transaction.documentIds);
-          const nextTurns = new Map(updated.notebookDocumentAuthorityTurns);
+          if (transaction.providerSendCompleted) {
+            return [true, current] as const;
+          }
+          const nextTurns = new Map(current.notebookDocumentAuthorityTurns);
+          nextTurns.set(input.threadId, { ...transaction, providerSendCompleted: true });
+          return [true, { ...current, notebookDocumentAuthorityTurns: nextTurns }] as const;
+        }),
+      ),
+    ),
+    finalizeNotebookDocumentAuthorityTurn: Effect.fn(
+      "McpSessionRegistry.finalizeNotebookDocumentAuthorityTurn",
+    )((input) =>
+      withThreadPermissionLock(
+        input.threadId,
+        SynchronizedRef.modify(state, (current) => {
+          const transaction = current.notebookDocumentAuthorityTurns.get(input.threadId);
+          if (
+            transaction === undefined ||
+            transaction.messageId !== input.messageId ||
+            !transaction.providerSendCompleted ||
+            !transaction.runtimeAdmitted
+          ) {
+            return [false, current] as const;
+          }
+          const nextTurns = new Map(current.notebookDocumentAuthorityTurns);
           nextTurns.delete(input.threadId);
-          return [true, { ...updated, notebookDocumentAuthorityTurns: nextTurns }] as const;
+          return [true, { ...current, notebookDocumentAuthorityTurns: nextTurns }] as const;
         }),
       ),
     ),
@@ -478,7 +504,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
           if (transaction === undefined || transaction.messageId !== input.messageId) {
             return [false, current] as const;
           }
-          const updated = transaction.committed
+          const updated = transaction.runtimeAdmitted
             ? updateNotebookDocumentAuthority(
                 current,
                 input.threadId,
@@ -638,6 +664,13 @@ export const completeActiveNotebookDocumentAuthorityTurn = (
 ): Effect.Effect<boolean> =>
   activeMcpSessionRegistry
     ? activeMcpSessionRegistry.completeNotebookDocumentAuthorityTurn(input)
+    : Effect.succeed(false);
+
+export const finalizeActiveNotebookDocumentAuthorityTurn = (
+  input: NotebookDocumentAuthorityTurnKey,
+): Effect.Effect<boolean> =>
+  activeMcpSessionRegistry
+    ? activeMcpSessionRegistry.finalizeNotebookDocumentAuthorityTurn(input)
     : Effect.succeed(false);
 
 export const rollbackActiveNotebookDocumentAuthorityTurn = (

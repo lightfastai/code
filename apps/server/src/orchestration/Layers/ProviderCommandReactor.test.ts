@@ -27,6 +27,7 @@ import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -313,7 +314,8 @@ describe("ProviderCommandReactor", () => {
           readonly messageId: MessageId;
           readonly previousDocumentIds: ReadonlyArray<string>;
           readonly documentIds: ReadonlyArray<string>;
-          committed: boolean;
+          providerSendCompleted: boolean;
+          runtimeAdmitted: boolean;
         }
       | undefined;
     const authorityExposures: Array<ReadonlyArray<string>> = [[...notebookDocumentIds]];
@@ -335,29 +337,30 @@ describe("ProviderCommandReactor", () => {
       (authority: { readonly messageId: MessageId; readonly documentIds: ReadonlyArray<string> }) =>
         Effect.sync(() => {
           const normalized = Array.from(new Set(authority.documentIds)).sort();
+          if (stagedNotebookAuthority !== undefined) {
+            return stagedNotebookAuthority.messageId === authority.messageId;
+          }
           lifecycleCalls.push(`authority-stage:${normalized.join(",")}`);
           stagedNotebookAuthority = {
             messageId: authority.messageId,
             previousDocumentIds: [...notebookDocumentIds],
             documentIds: normalized,
-            committed: false,
+            providerSendCompleted: false,
+            runtimeAdmitted: false,
           };
           return true;
         }),
     );
     const completeNotebookDocumentAuthorityTurn = vi.fn(
-      (authority: { readonly messageId: MessageId }) =>
+      (authority: { readonly threadId: ThreadId; readonly messageId: MessageId }) =>
         Effect.sync(() => {
           if (stagedNotebookAuthority?.messageId !== authority.messageId) {
             return false;
           }
-          if (!stagedNotebookAuthority.committed) {
-            exposeNotebookAuthority(stagedNotebookAuthority.documentIds);
-          }
+          stagedNotebookAuthority.providerSendCompleted = true;
           lifecycleCalls.push(
             `authority-complete:${stagedNotebookAuthority.documentIds.join(",")}`,
           );
-          stagedNotebookAuthority = undefined;
           return true;
         }),
     );
@@ -367,21 +370,38 @@ describe("ProviderCommandReactor", () => {
           if (stagedNotebookAuthority?.messageId !== authority.messageId) {
             return false;
           }
-          if (!stagedNotebookAuthority.committed) {
+          if (!stagedNotebookAuthority.runtimeAdmitted) {
             exposeNotebookAuthority(stagedNotebookAuthority.documentIds);
-            stagedNotebookAuthority.committed = true;
+            stagedNotebookAuthority.runtimeAdmitted = true;
           }
           lifecycleCalls.push(`authority-admit:${stagedNotebookAuthority.documentIds.join(",")}`);
           return true;
         }),
     );
+    const finalizeNotebookDocumentAuthorityTurn = vi.fn(
+      (authority: { readonly threadId: ThreadId; readonly messageId: MessageId }) =>
+        Effect.sync(() => {
+          if (
+            stagedNotebookAuthority?.messageId !== authority.messageId ||
+            !stagedNotebookAuthority.providerSendCompleted ||
+            !stagedNotebookAuthority.runtimeAdmitted
+          ) {
+            return false;
+          }
+          lifecycleCalls.push(
+            `authority-finalize:${stagedNotebookAuthority.documentIds.join(",")}`,
+          );
+          stagedNotebookAuthority = undefined;
+          return true;
+        }),
+    );
     const rollbackNotebookDocumentAuthorityTurn = vi.fn(
-      (authority: { readonly messageId: MessageId }) =>
+      (authority: { readonly threadId: ThreadId; readonly messageId: MessageId }) =>
         Effect.sync(() => {
           if (stagedNotebookAuthority?.messageId !== authority.messageId) {
             return false;
           }
-          if (stagedNotebookAuthority.committed) {
+          if (stagedNotebookAuthority.runtimeAdmitted) {
             exposeNotebookAuthority(stagedNotebookAuthority.previousDocumentIds);
           }
           lifecycleCalls.push(
@@ -402,6 +422,9 @@ describe("ProviderCommandReactor", () => {
     );
     vi.spyOn(McpSessionRegistry, "admitActiveNotebookDocumentAuthorityTurn").mockImplementation(
       admitNotebookDocumentAuthorityTurn,
+    );
+    vi.spyOn(McpSessionRegistry, "finalizeActiveNotebookDocumentAuthorityTurn").mockImplementation(
+      finalizeNotebookDocumentAuthorityTurn,
     );
     vi.spyOn(McpSessionRegistry, "rollbackActiveNotebookDocumentAuthorityTurn").mockImplementation(
       rollbackNotebookDocumentAuthorityTurn,
@@ -507,6 +530,25 @@ describe("ProviderCommandReactor", () => {
       Effect.gen(function* () {
         completedAdmissionCount += 1;
         const threadId = ThreadId.make("thread-1");
+        const acceptedTurnStart = yield* turns.getAcceptedTurnStartByThreadId({ threadId });
+        const acceptedMessageId = Option.isSome(acceptedTurnStart)
+          ? acceptedTurnStart.value.messageId
+          : null;
+        if (acceptedMessageId !== null) {
+          yield* completeNotebookDocumentAuthorityTurn({
+            threadId,
+            messageId: acceptedMessageId,
+          });
+          yield* turns.completeAcceptedTurnStartPhase({
+            threadId,
+            messageId: acceptedMessageId,
+            phase: "provider-send-completed",
+          });
+          yield* admitNotebookDocumentAuthorityTurn({
+            threadId,
+            messageId: acceptedMessageId,
+          });
+        }
         const turnId = asTurnId(`turn-completed-admission-${tag}-${completedAdmissionCount}`);
         const completedAt = `2026-01-01T00:00:${String(completedAdmissionCount).padStart(2, "0")}.000Z`;
         yield* engine.dispatch({
@@ -525,6 +567,18 @@ describe("ProviderCommandReactor", () => {
           },
           createdAt: completedAt,
         });
+        if (acceptedMessageId !== null) {
+          yield* turns.completeAcceptedTurnStartPhase({
+            threadId,
+            messageId: acceptedMessageId,
+            phase: "runtime-admitted",
+          });
+          yield* turns.deletePendingTurnStart({ threadId, messageId: acceptedMessageId });
+          yield* finalizeNotebookDocumentAuthorityTurn({
+            threadId,
+            messageId: acceptedMessageId,
+          });
+        }
         yield* engine.dispatch({
           type: "thread.session.set",
           commandId: CommandId.make(`cmd-session-ready-${tag}-${completedAdmissionCount}`),
@@ -573,6 +627,7 @@ describe("ProviderCommandReactor", () => {
     return {
       engine,
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
+      snapshotQuery,
       startSession,
       sendTurn,
       interruptTurn,
@@ -593,6 +648,7 @@ describe("ProviderCommandReactor", () => {
       stageNotebookDocumentAuthorityTurn,
       completeNotebookDocumentAuthorityTurn,
       admitNotebookDocumentAuthorityTurn,
+      finalizeNotebookDocumentAuthorityTurn,
       rollbackNotebookDocumentAuthorityTurn,
       readNotebookDocumentAuthority: () => [...notebookDocumentIds],
       authorityExposures,
@@ -641,7 +697,7 @@ describe("ProviderCommandReactor", () => {
       "start-session",
     ]);
     await waitFor(() => harness.completeNotebookDocumentAuthorityTurn.mock.calls.length === 1);
-    expect(harness.readNotebookDocumentAuthority()).toEqual(["a".repeat(64), "b".repeat(64)]);
+    expect(harness.readNotebookDocumentAuthority()).toEqual([]);
 
     const readModel = await harness.readModel();
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
@@ -653,6 +709,7 @@ describe("ProviderCommandReactor", () => {
     const priorDocumentId = "0".repeat(64);
     const documentA = "a".repeat(64);
     const documentB = "b".repeat(64);
+    const messageA = asMessageId("user-message-authority-a");
     const harness = await createHarness({ initialNotebookDocumentIds: [priorDocumentId] });
     const sendEntered = Effect.runSync(Deferred.make<void>());
     const releaseSend = Effect.runSync(Deferred.make<void>());
@@ -672,7 +729,7 @@ describe("ProviderCommandReactor", () => {
         commandId: CommandId.make("cmd-turn-start-authority-a"),
         threadId: ThreadId.make("thread-1"),
         message: {
-          messageId: asMessageId("user-message-authority-a"),
+          messageId: messageA,
           role: "user",
           text: "run with document A",
           attachments: [],
@@ -736,8 +793,15 @@ describe("ProviderCommandReactor", () => {
 
     await Effect.runPromise(Deferred.succeed(releaseSend, undefined));
     await waitFor(() => harness.completeNotebookDocumentAuthorityTurn.mock.calls.length === 1);
-    expect(harness.readNotebookDocumentAuthority()).toEqual([documentA]);
+    expect(harness.readNotebookDocumentAuthority()).toEqual([priorDocumentId]);
     expect(harness.authorityExposures).not.toContainEqual([documentB]);
+
+    await Effect.runPromise(
+      harness.admitNotebookDocumentAuthorityTurn({
+        threadId: ThreadId.make("thread-1"),
+        messageId: messageA,
+      }),
+    );
 
     if (harness.runtimeSessions[0]) {
       harness.runtimeSessions[0] = {
@@ -764,6 +828,27 @@ describe("ProviderCommandReactor", () => {
         createdAt: "2026-01-01T00:00:02.000Z",
       }),
     );
+    const completedRuntimeAdmission = await Effect.runPromise(
+      harness.turns.completeAcceptedTurnStartPhase({
+        threadId: ThreadId.make("thread-1"),
+        messageId: messageA,
+        phase: "runtime-admitted",
+      }),
+    );
+    expect(Option.getOrThrow(completedRuntimeAdmission).messageId).toBe(messageA);
+    await Effect.runPromise(
+      harness.turns.deletePendingTurnStart({
+        threadId: ThreadId.make("thread-1"),
+        messageId: messageA,
+      }),
+    );
+    await Effect.runPromise(
+      harness.finalizeNotebookDocumentAuthorityTurn({
+        threadId: ThreadId.make("thread-1"),
+        messageId: messageA,
+      }),
+    );
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentA]);
     const activeSessionBeforeRejection = (await harness.readModel()).threads.find(
       (entry) => entry.id === ThreadId.make("thread-1"),
     )?.session;
@@ -844,6 +929,7 @@ describe("ProviderCommandReactor", () => {
 
     await waitFor(() => harness.sendTurn.mock.calls.length === 2);
     await waitFor(() => harness.completeNotebookDocumentAuthorityTurn.mock.calls.length === 2);
+    await Effect.runPromise(harness.completeAcceptedTurn("authority-sequential-b"));
     expect(harness.readNotebookDocumentAuthority()).toEqual([documentB]);
   });
 
@@ -1033,15 +1119,346 @@ describe("ProviderCommandReactor", () => {
       },
     });
     expect(
-      (await Effect.runPromise(harness.turns.getAcceptedTurnStartByThreadId({ threadId })))._tag,
-    ).toBe("None");
+      Option.getOrThrow(
+        await Effect.runPromise(harness.turns.getAcceptedTurnStartByThreadId({ threadId })),
+      ),
+    ).toMatchObject({
+      messageId: messageA,
+      providerSendCompleted: false,
+      runtimeAdmitted: true,
+    });
     expect(
       (await Effect.runPromise(harness.turns.getPendingTurnStartByThreadId({ threadId })))._tag,
     ).toBe("None");
 
     await Effect.runPromise(Deferred.succeed(releaseSend, undefined));
     await waitFor(() => harness.completeNotebookDocumentAuthorityTurn.mock.calls.length === 1);
+    await waitFor(() => harness.finalizeNotebookDocumentAuthorityTurn.mock.calls.length === 1);
+    expect(
+      (await Effect.runPromise(harness.turns.getAcceptedTurnStartByThreadId({ threadId })))._tag,
+    ).toBe("None");
     expect(harness.readNotebookDocumentAuthority()).toEqual([documentA]);
+  });
+
+  it("reconciles provider-send-first A after delayed runtime admission and admits sequential B", async () => {
+    const harness = await createHarness();
+    const threadId = ThreadId.make("thread-1");
+    const messageA = asMessageId("user-message-send-first-a");
+    const messageB = asMessageId("user-message-send-first-overlap-b");
+    const messageSequentialB = asMessageId("user-message-send-first-sequential-b");
+    const turnA = asTurnId("turn-send-first-a");
+    const turnB = asTurnId("turn-send-first-sequential-b");
+    const documentA = "a".repeat(64);
+    const documentB = "b".repeat(64);
+    harness.sendTurn.mockImplementationOnce(() => Effect.succeed({ threadId, turnId: turnA }));
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-send-first-a"),
+        threadId,
+        message: {
+          messageId: messageA,
+          role: "user",
+          text: "send A before runtime admission",
+          attachments: [],
+        },
+        documentIds: [documentA],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      }),
+    );
+    await waitFor(() => harness.completeNotebookDocumentAuthorityTurn.mock.calls.length === 1);
+    expect(harness.readNotebookDocumentAuthority()).toEqual([]);
+    expect(
+      Option.getOrThrow(
+        await Effect.runPromise(harness.turns.getAcceptedTurnStartByThreadId({ threadId })),
+      ),
+    ).toMatchObject({
+      messageId: messageA,
+      providerSendCompleted: true,
+      runtimeAdmitted: false,
+    });
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-send-first-overlap-b"),
+        threadId,
+        message: {
+          messageId: messageB,
+          role: "user",
+          text: "overlapping B must be rejected",
+          attachments: [],
+        },
+        documentIds: [documentB],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:02.000Z",
+      }),
+    );
+    await waitFor(async () => {
+      const target = (await harness.readModel()).threads.find((thread) => thread.id === threadId);
+      return (
+        target?.activities.some((activity) => activity.kind === "provider.turn.start.failed") ===
+        true
+      );
+    });
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+
+    const runtimeSession = harness.runtimeSessions.find((session) => session.threadId === threadId);
+    expect(runtimeSession).toBeDefined();
+    if (!runtimeSession) throw new Error("Expected provider session for send-first A.");
+    Object.assign(runtimeSession, {
+      status: "running" as const,
+      activeTurnId: turnA,
+      updatedAt: "2026-01-01T00:00:03.000Z",
+    });
+    harness.emitRuntimeEvent({
+      type: "turn.started",
+      eventId: EventId.make("evt-turn-started-send-first-a"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: "2026-01-01T00:00:03.000Z",
+      threadId,
+      turnId: turnA,
+      payload: {},
+    });
+    await harness.drainIngestion();
+    await waitFor(async () => {
+      const target = (await harness.readModel()).threads.find((thread) => thread.id === threadId);
+      return target?.session?.activeTurnId === turnA;
+    });
+    expect(harness.admitNotebookDocumentAuthorityTurn).toHaveBeenCalledWith({
+      threadId,
+      messageId: messageA,
+    });
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentA]);
+    expect(
+      (await Effect.runPromise(harness.turns.getAcceptedTurnStartByThreadId({ threadId })))._tag,
+    ).toBe("None");
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-ready-send-first-a"),
+        threadId,
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-01-01T00:00:04.000Z",
+        },
+        createdAt: "2026-01-01T00:00:04.000Z",
+      }),
+    );
+    const { activeTurnId: _activeTurnId, ...readyRuntimeSession } = runtimeSession;
+    Object.assign(runtimeSession, readyRuntimeSession, { status: "ready" as const });
+    delete (runtimeSession as { activeTurnId?: TurnId }).activeTurnId;
+    harness.sendTurn.mockImplementationOnce(() => Effect.succeed({ threadId, turnId: turnB }));
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-send-first-sequential-b"),
+        threadId,
+        message: {
+          messageId: messageSequentialB,
+          role: "user",
+          text: "sequential B may now start",
+          attachments: [],
+        },
+        documentIds: [documentB],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:05.000Z",
+      }),
+    );
+    await waitFor(() => harness.completeNotebookDocumentAuthorityTurn.mock.calls.length === 2);
+    Object.assign(runtimeSession, {
+      status: "running" as const,
+      activeTurnId: turnB,
+      updatedAt: "2026-01-01T00:00:06.000Z",
+    });
+    harness.emitRuntimeEvent({
+      type: "turn.started",
+      eventId: EventId.make("evt-turn-started-send-first-sequential-b"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: "2026-01-01T00:00:06.000Z",
+      threadId,
+      turnId: turnB,
+      payload: {},
+    });
+    await harness.drainIngestion();
+    expect(harness.sendTurn).toHaveBeenCalledTimes(2);
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentB]);
+  });
+
+  it("clears exact acquired guards when post-stage project resolution fails", async () => {
+    const harness = await createHarness();
+    const threadId = ThreadId.make("thread-1");
+    vi.spyOn(harness.snapshotQuery, "getProjectShellById").mockImplementationOnce(
+      () => Effect.die(new Error("injected post-stage resolveProject failure")) as never,
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-post-stage-project-failure-a"),
+        threadId,
+        message: {
+          messageId: asMessageId("user-message-post-stage-project-failure-a"),
+          role: "user",
+          text: "fail after staging A",
+          attachments: [],
+        },
+        documentIds: ["a".repeat(64)],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      }),
+    );
+    await waitFor(() => harness.rollbackNotebookDocumentAuthorityTurn.mock.calls.length === 1);
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(
+      (await Effect.runPromise(harness.turns.getAcceptedTurnStartByThreadId({ threadId })))._tag,
+    ).toBe("None");
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-post-stage-project-failure-b"),
+        threadId,
+        message: {
+          messageId: asMessageId("user-message-post-stage-project-failure-b"),
+          role: "user",
+          text: "B starts after A cleanup",
+          attachments: [],
+        },
+        documentIds: ["b".repeat(64)],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:02.000Z",
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+  });
+
+  it("releases registry and local guards even when both durable failure deletes fail", async () => {
+    const harness = await createHarness();
+    const threadId = ThreadId.make("thread-1");
+    const messageA = asMessageId("user-message-cleanup-delete-failure-a");
+    const messageB = asMessageId("user-message-cleanup-delete-failure-b");
+    vi.spyOn(harness.turns, "deleteAcceptedTurnStart").mockImplementationOnce(
+      () => Effect.die(new Error("injected accepted cleanup failure")) as never,
+    );
+    vi.spyOn(harness.turns, "deletePendingTurnStart").mockImplementationOnce(
+      () => Effect.die(new Error("injected pending cleanup failure")) as never,
+    );
+    harness.sendTurn.mockImplementationOnce(
+      () =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: "codex",
+            method: "thread.turn.start",
+            detail: "injected provider send failure",
+          }),
+        ) as never,
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-cleanup-delete-failure-a"),
+        threadId,
+        message: {
+          messageId: messageA,
+          role: "user",
+          text: "leave durable A orphan",
+          attachments: [],
+        },
+        documentIds: ["a".repeat(64)],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      }),
+    );
+    await waitFor(() => harness.rollbackNotebookDocumentAuthorityTurn.mock.calls.length === 1);
+    expect(
+      Option.getOrThrow(
+        await Effect.runPromise(harness.turns.getAcceptedTurnStartByThreadId({ threadId })),
+      ).messageId,
+    ).toBe(messageA);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-cleanup-delete-failure-b"),
+        threadId,
+        message: {
+          messageId: messageB,
+          role: "user",
+          text: "reconcile orphan and start B",
+          attachments: [],
+        },
+        documentIds: ["b".repeat(64)],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:02.000Z",
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+    expect(
+      Option.getOrThrow(
+        await Effect.runPromise(harness.turns.getAcceptedTurnStartByThreadId({ threadId })),
+      ).messageId,
+    ).toBe(messageB);
+  });
+
+  it("reconciles a durable accepted orphan after restart before admitting B", async () => {
+    const harness = await createHarness();
+    const threadId = ThreadId.make("thread-1");
+    const orphanMessageId = asMessageId("user-message-restart-orphan-a");
+    const messageB = asMessageId("user-message-restart-b");
+    expect(
+      await Effect.runPromise(
+        harness.turns.stageAcceptedTurnStart({
+          threadId,
+          messageId: orphanMessageId,
+          sourceProposedPlanThreadId: null,
+          sourceProposedPlanId: null,
+          requestedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      ),
+    ).toBe(true);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-restart-orphan-b"),
+        threadId,
+        message: {
+          messageId: messageB,
+          role: "user",
+          text: "start B after restart",
+          attachments: [],
+        },
+        documentIds: ["b".repeat(64)],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    expect(
+      Option.getOrThrow(
+        await Effect.runPromise(harness.turns.getAcceptedTurnStartByThreadId({ threadId })),
+      ).messageId,
+    ).toBe(messageB);
   });
 
   it("preserves prior notebook authority when session construction fails", async () => {
