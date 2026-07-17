@@ -115,6 +115,30 @@ it.layer(NodeServices.layer)("StudyTextExtractor", (it) => {
     ),
   );
 
+  it.effect("rejects extraction when immutable object bytes disagree with the index identity", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temp = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "study-text-corrupt-object-",
+        });
+        const source = path.join(temp, "integrity.md");
+        yield* fileSystem.writeFileString(source, "# Valid source\n");
+        const paths = yield* resolveStudyLibraryPaths(path.join(temp, "library"));
+        const document = yield* importStudyDocument({ paths, sourcePath: source });
+        const objectPath = path.join(paths.root, ...document.objectKey.split("/"));
+        yield* fileSystem.chmod(objectPath, 0o644);
+        yield* fileSystem.writeFileString(objectPath, "# Corrupt replacement\n");
+
+        const error = yield* extractStudyDocumentText({ paths, document }).pipe(Effect.flip);
+
+        assert.strictEqual(error.operation, "read");
+        assert.match(error.message, /immutable|identity|integrity/i);
+      }),
+    ),
+  );
+
   it.effect("extracts EPUB spine chapters with durable href anchors", () =>
     Effect.scoped(
       Effect.gen(function* () {

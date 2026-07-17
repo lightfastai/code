@@ -1,5 +1,3 @@
-import * as NodeCrypto from "node:crypto";
-
 import {
   StudyLibraryIndex,
   type StudyDocument,
@@ -14,8 +12,15 @@ import * as Schema from "effect/Schema";
 
 import { writeFileStringAtomically } from "../atomicWrite.ts";
 import { withStudyLibraryMutationLock } from "./StudyLibraryMutationLock.ts";
+import {
+  STUDY_OBJECT_MAX_BYTES,
+  expectedStudyObjectKey,
+  hashStudyObjectBytes,
+  hasExpectedStudyObjectMagic,
+  publishStudyObject,
+  readValidatedStudyObject,
+} from "./StudyObjectStore.ts";
 
-const MAX_IMPORT_BYTES = 512 * 1024 * 1024;
 const decodeIndex = Schema.decodeUnknownEffect(Schema.fromJsonString(StudyLibraryIndex));
 const encodeIndex = Schema.encodeEffect(Schema.fromJsonString(StudyLibraryIndex));
 
@@ -108,8 +113,6 @@ export const resolveStudyDocumentMountPaths = Effect.fn("StudyLibrary.resolveMou
     }
 
     return yield* Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
       const index = yield* readStudyLibraryIndex(paths);
       const documents = selectedIds.map((documentId) =>
         index.documents.find((document) => document.id === documentId),
@@ -118,39 +121,11 @@ export const resolveStudyDocumentMountPaths = Effect.fn("StudyLibrary.resolveMou
         return [] as ReadonlyArray<string>;
       }
 
-      const canonicalObjectsRoot = yield* fileSystem.realPath(paths.objects);
       const resolved: string[] = [];
       for (const document of documents) {
-        if (document === undefined || document.sha256 !== document.id) {
-          return [] as ReadonlyArray<string>;
-        }
-        const expectedObjectKey = `objects/${document.id.slice(0, 2)}/${document.id}.${extensionForFormat(document.format)}`;
-        if (document.objectKey !== expectedObjectKey) return [] as ReadonlyArray<string>;
-
-        const candidate = path.resolve(paths.root, ...document.objectKey.split("/"));
-        const lexicalRelative = path.relative(paths.objects, candidate);
-        if (
-          lexicalRelative === "" ||
-          lexicalRelative === ".." ||
-          lexicalRelative.startsWith(`..${path.sep}`) ||
-          path.isAbsolute(lexicalRelative)
-        ) {
-          return [] as ReadonlyArray<string>;
-        }
-
-        const canonicalCandidate = yield* fileSystem.realPath(candidate);
-        const canonicalRelative = path.relative(canonicalObjectsRoot, canonicalCandidate);
-        if (
-          canonicalRelative === "" ||
-          canonicalRelative === ".." ||
-          canonicalRelative.startsWith(`..${path.sep}`) ||
-          path.isAbsolute(canonicalRelative)
-        ) {
-          return [] as ReadonlyArray<string>;
-        }
-        const info = yield* fileSystem.stat(canonicalCandidate);
-        if (info.type !== "File") return [] as ReadonlyArray<string>;
-        resolved.push(canonicalCandidate);
+        if (document === undefined) return [] as ReadonlyArray<string>;
+        const object = yield* readValidatedStudyObject(paths, document);
+        resolved.push(object.canonicalPath);
       }
       return resolved;
     }).pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
@@ -207,20 +182,6 @@ function extensionForFormat(format: StudyDocumentFormat): string {
   return format === "markdown" ? "md" : format;
 }
 
-function hasExpectedMagic(format: StudyDocumentFormat, bytes: Uint8Array): boolean {
-  if (format === "markdown") return true;
-  if (format === "pdf") {
-    return (
-      bytes.length >= 4 &&
-      bytes[0] === 0x25 &&
-      bytes[1] === 0x50 &&
-      bytes[2] === 0x44 &&
-      bytes[3] === 0x46
-    );
-  }
-  return bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4b;
-}
-
 function titleFromFileName(fileName: string): string {
   const extensionIndex = fileName.lastIndexOf(".");
   const stem = extensionIndex > 0 ? fileName.slice(0, extensionIndex) : fileName;
@@ -244,33 +205,6 @@ const normalizeTags = Effect.fn("StudyLibrary.normalizeTags")(function* (
     });
   }
   return normalized;
-});
-
-const persistObject = Effect.fn("StudyLibrary.persistObject")(function* (
-  paths: StudyLibraryPaths,
-  sourcePath: string,
-  objectKey: string,
-) {
-  const fileSystem = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
-  const objectPath = path.join(paths.root, ...objectKey.split("/"));
-  const exists = yield* fileSystem.exists(objectPath);
-  if (exists) return objectPath;
-
-  yield* Effect.scoped(
-    Effect.gen(function* () {
-      const directory = path.dirname(objectPath);
-      yield* fileSystem.makeDirectory(directory, { recursive: true });
-      const tempDirectory = yield* fileSystem.makeTempDirectoryScoped({
-        directory,
-        prefix: ".import-",
-      });
-      const tempPath = path.join(tempDirectory, "content.tmp");
-      yield* fileSystem.copyFile(sourcePath, tempPath);
-      yield* fileSystem.rename(tempPath, objectPath);
-    }),
-  );
-  return objectPath;
 });
 
 export const importStudyDocument = Effect.fn("StudyLibrary.importDocument")(function* (input: {
@@ -309,8 +243,8 @@ export const importStudyDocument = Effect.fn("StudyLibrary.importDocument")(func
       detail: "The import source must be a file.",
     });
   }
-  const sizeBytes = Number(info.size);
-  if (!Number.isSafeInteger(sizeBytes) || sizeBytes > MAX_IMPORT_BYTES) {
+  const inspectedSizeBytes = Number(info.size);
+  if (!Number.isSafeInteger(inspectedSizeBytes) || inspectedSizeBytes > STUDY_OBJECT_MAX_BYTES) {
     return yield* new StudyLibraryError({
       operation: "import",
       path: sourcePath,
@@ -329,7 +263,15 @@ export const importStudyDocument = Effect.fn("StudyLibrary.importDocument")(func
         }),
     ),
   );
-  if (!hasExpectedMagic(format, bytes)) {
+  const sizeBytes = bytes.byteLength;
+  if (sizeBytes > STUDY_OBJECT_MAX_BYTES) {
+    return yield* new StudyLibraryError({
+      operation: "import",
+      path: sourcePath,
+      detail: "The document is larger than the 512 MB local import limit.",
+    });
+  }
+  if (!hasExpectedStudyObjectMagic(format, bytes)) {
     return yield* new StudyLibraryError({
       operation: "import",
       path: sourcePath,
@@ -337,10 +279,14 @@ export const importStudyDocument = Effect.fn("StudyLibrary.importDocument")(func
     });
   }
 
-  const sha256 = NodeCrypto.createHash("sha256").update(bytes).digest("hex") as StudyDocumentId;
-  const objectKey = `objects/${sha256.slice(0, 2)}/${sha256}.${extensionForFormat(format)}`;
+  const sha256 = hashStudyObjectBytes(bytes);
+  const objectKey = expectedStudyObjectKey(sha256, format);
   const tags = yield* normalizeTags(input.tags ?? [], sourcePath);
-  yield* persistObject(input.paths, sourcePath, objectKey).pipe(
+  yield* publishStudyObject(
+    input.paths,
+    { id: sha256, sha256, format, objectKey, sizeBytes },
+    bytes,
+  ).pipe(
     Effect.mapError((cause) =>
       isStudyLibraryError(cause)
         ? cause

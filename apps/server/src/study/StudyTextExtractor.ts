@@ -17,6 +17,7 @@ import { getDocumentProxy } from "unpdf";
 
 import { writeFileStringAtomically } from "../atomicWrite.ts";
 import type { StudyLibraryPaths } from "./StudyLibrary.ts";
+import { readValidatedStudyObject } from "./StudyObjectStore.ts";
 
 const decodeExtractedDocument = Schema.decodeUnknownEffect(
   Schema.fromJsonString(StudyExtractedDocument),
@@ -148,14 +149,6 @@ export const extractedDocumentPath = Effect.fn("StudyTextExtractor.derivedPath")
 ) {
   const path = yield* Path.Path;
   return path.join(paths.root, "derived", document.id.slice(0, 2), `${document.id}.text.json`);
-});
-
-const contentObjectPath = Effect.fn("StudyTextExtractor.objectPath")(function* (
-  paths: StudyLibraryPaths,
-  document: Pick<StudyDocument, "objectKey">,
-) {
-  const path = yield* Path.Path;
-  return path.join(paths.root, ...document.objectKey.split("/"));
 });
 
 function normalizeText(raw: string): string {
@@ -423,15 +416,13 @@ export const extractStudyDocumentText = Effect.fn("StudyTextExtractor.extract")(
   readonly paths: StudyLibraryPaths;
   readonly document: StudyDocument;
 }) {
-  const fileSystem = yield* FileSystem.FileSystem;
-  const objectPath = yield* contentObjectPath(input.paths, input.document);
-  const bytes = yield* fileSystem.readFile(objectPath).pipe(
+  const { bytes } = yield* readValidatedStudyObject(input.paths, input.document).pipe(
     Effect.mapError(
       (cause) =>
         new StudyTextExtractionError({
           operation: "read",
           documentId: input.document.id,
-          detail: "Could not read the immutable study object.",
+          detail: "The immutable study object failed identity and integrity validation.",
           cause,
         }),
     ),
