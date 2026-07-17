@@ -165,6 +165,7 @@ it.effect("revalidates authoritative permission before open and traces a denied 
     expect(traces[0]?.[1]?.event).toMatchObject({
       type: "notebook_permission",
       operation: "execute_cell",
+      operationId: "notebook-operation-denied",
       threadId: invocation(true).threadId,
       permissionGranted: false,
     });
@@ -257,9 +258,13 @@ it.effect(
       expect(result.outputHash).toMatch(/^[0-9a-f]{64}$/);
 
       const execution = traces[0]?.find(({ event }) => event.type === "notebook_execution")?.event;
+      const permission = traces[0]?.find(
+        ({ event }) => event.type === "notebook_permission",
+      )?.event;
       expect(execution).toMatchObject({
         type: "notebook_execution",
         operation: "execute_cell",
+        operationId: "notebook-operation-run-1",
         outcome: "completed",
         permissionGranted: true,
         binding: {
@@ -278,6 +283,11 @@ it.effect(
         cleanup: { attempted: true, succeeded: true },
       });
       if (execution?.type !== "notebook_execution") throw new Error("missing notebook trace");
+      expect(permission).toMatchObject({
+        type: "notebook_permission",
+        operationId: execution.operationId,
+        permissionGranted: true,
+      });
       expect(execution.commands.map(({ type }) => type)).toEqual(["open", "execute", "dispose"]);
       expect(execution.runtimeEvents.map(({ sequence }) => sequence)).toEqual([
         1, 2, 3, 4, 5, 6, 7, 8,

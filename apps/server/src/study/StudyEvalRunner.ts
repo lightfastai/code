@@ -109,19 +109,33 @@ function hasContiguousSubsequence<T>(
   return false;
 }
 
-type NotebookEvidence = StudyNotebookExecutionEvent | StudyNotebookPermissionEvent;
+interface NotebookAttemptEvidence {
+  readonly permission: StudyNotebookPermissionEvent;
+  readonly execution?: StudyNotebookExecutionEvent;
+  readonly pairedExecutionCount: number;
+}
+
 type NotebookAssertion = Extract<StudyEvalAssertion, { readonly operation: unknown }>;
 
-function matchingNotebookEvidence(
+function matchingNotebookAttempts(
   records: ReadonlyArray<StudyTraceRecord>,
   operation: StudyNotebookExecutionEvent["operation"],
-): ReadonlyArray<NotebookEvidence> {
+): ReadonlyArray<NotebookAttemptEvidence> {
+  const executions = records.flatMap((record) => {
+    const event = record.event;
+    return event.type === "notebook_execution" && event.operation === operation ? [event] : [];
+  });
   return records.flatMap((record) => {
     const event = record.event;
-    return (event.type === "notebook_execution" || event.type === "notebook_permission") &&
-      event.operation === operation
-      ? [event]
-      : [];
+    if (event.type !== "notebook_permission" || event.operation !== operation) return [];
+    const paired = executions.filter((execution) => execution.operationId === event.operationId);
+    return [
+      {
+        permission: event,
+        ...(event.permissionGranted && paired.length === 1 ? { execution: paired[0] } : {}),
+        pairedExecutionCount: paired.length,
+      },
+    ];
   });
 }
 
@@ -148,7 +162,7 @@ function evaluateAssertion(
   assertion: StudyEvalAssertion,
   assertionIndex: number,
   records: ReadonlyArray<StudyTraceRecord>,
-  notebookEvidence?: NotebookEvidence,
+  notebookAttempt?: NotebookAttemptEvidence,
 ): StudyEvalAssertionResult {
   const weight = assertionWeight(assertion);
   if (assertion.type === "event_count") {
@@ -186,7 +200,7 @@ function evaluateAssertion(
   }
 
   if (assertion.type === "notebook_output_order") {
-    const event = notebookEvidence?.type === "notebook_execution" ? notebookEvidence : undefined;
+    const event = notebookAttempt?.execution;
     const passed =
       event !== undefined &&
       event.outputHash === assertion.outputHash &&
@@ -209,7 +223,7 @@ function evaluateAssertion(
   }
 
   if (assertion.type === "notebook_max_latency") {
-    const event = notebookEvidence?.type === "notebook_execution" ? notebookEvidence : undefined;
+    const event = notebookAttempt?.execution;
     const duration =
       event !== undefined && Number.isFinite(event.durationMs) && event.durationMs >= 0
         ? event.durationMs
@@ -227,19 +241,22 @@ function evaluateAssertion(
   }
 
   if (assertion.type === "notebook_permission") {
-    const passed = notebookEvidence?.permissionGranted === assertion.required;
+    const permissionGranted = notebookAttempt?.permission.permissionGranted;
+    const deniedWithoutExecution =
+      assertion.required || notebookAttempt?.pairedExecutionCount === 0;
+    const passed = permissionGranted === assertion.required && deniedWithoutExecution;
     return notebookAssertionResult({
       assertion,
       assertionIndex,
       passed,
       detail: passed
         ? `Observed ${assertion.operation} with permissionGranted=${assertion.required}.`
-        : `The selected ${assertion.operation} attempt did not match permissionGranted=${assertion.required}.`,
+        : `The selected ${assertion.operation} permission attempt did not prove permissionGranted=${assertion.required} without contradiction.`,
     });
   }
 
   if (assertion.type === "notebook_isolation") {
-    const event = notebookEvidence?.type === "notebook_execution" ? notebookEvidence : undefined;
+    const event = notebookAttempt?.execution;
     const passed =
       event?.isolation.session === "ephemeral-exclusive" &&
       event.isolation.network === "disabled" &&
@@ -255,7 +272,7 @@ function evaluateAssertion(
   }
 
   if (assertion.type === "notebook_cleanup") {
-    const event = notebookEvidence?.type === "notebook_execution" ? notebookEvidence : undefined;
+    const event = notebookAttempt?.execution;
     const lastCommand = event?.commands.at(-1);
     const disposeCommandId =
       lastCommand?.type === "dispose" && event?.cleanup.commandId === lastCommand.commandId
@@ -292,7 +309,7 @@ function evaluateAssertion(
   }
 
   if (assertion.type === "notebook_identity") {
-    const event = notebookEvidence?.type === "notebook_execution" ? notebookEvidence : undefined;
+    const event = notebookAttempt?.execution;
     const expectedHash = hashStudyValue(assertion.binding);
     const passed = event !== undefined && hashStudyValue(event.binding) === expectedHash;
     return notebookAssertionResult({
@@ -351,7 +368,7 @@ function evaluateAssertions(
   }
 
   for (const [operation, group] of notebookGroups) {
-    const candidates = matchingNotebookEvidence(records, operation);
+    const candidates = matchingNotebookAttempts(records, operation);
     const evaluated = candidates.map((candidate) => ({
       candidate,
       results: group.map(([assertionIndex, assertion]) =>

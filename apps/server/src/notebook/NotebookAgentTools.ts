@@ -245,6 +245,7 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
       );
     const uuid = dependencies.randomUUID().replace(/[^A-Za-z0-9_-]/g, "-");
     const runId = `notebook-${uuid}` as StudyTraceRunId;
+    const operationId = `notebook-operation-${uuid}`.slice(0, 256);
     const sessionId = `notebook-agent-session-${uuid}`.slice(0, 128);
     return yield* Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
@@ -421,6 +422,7 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
         const permission: StudyNotebookPermissionEvent = {
           type: "notebook_permission",
           operation,
+          operationId,
           threadId: invocation.threadId,
           providerSessionId: invocation.providerSessionId,
           permissionGranted,
@@ -429,6 +431,7 @@ export function makeNotebookAgentTools(dependencies: NotebookAgentToolsDependenc
           ? {
               type: "notebook_execution",
               operation,
+              operationId,
               outcome: interrupted
                 ? "interrupted"
                 : executionFailure === undefined && bodyExit._tag === "Success"

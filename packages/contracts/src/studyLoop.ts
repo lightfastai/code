@@ -114,6 +114,7 @@ export type StudyNotebookCommand = typeof StudyNotebookCommand.Type;
 export const StudyNotebookPermissionEvent = Schema.Struct({
   type: Schema.Literal("notebook_permission"),
   operation: StudyNotebookOperation,
+  operationId: BoundedName,
   threadId: ThreadId,
   providerSessionId: BoundedName,
   permissionGranted: Schema.Boolean,
@@ -123,6 +124,7 @@ export type StudyNotebookPermissionEvent = typeof StudyNotebookPermissionEvent.T
 export const StudyNotebookExecutionEvent = Schema.Struct({
   type: Schema.Literal("notebook_execution"),
   operation: StudyNotebookOperation,
+  operationId: BoundedName,
   outcome: Schema.Literals(["completed", "failed", "interrupted"]),
   permissionGranted: Schema.Literal(true),
   binding: StudyNotebookBinding,
