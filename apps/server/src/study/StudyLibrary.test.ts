@@ -1,7 +1,9 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Path from "effect/Path";
 
 import {
@@ -66,6 +68,74 @@ it.layer(NodeServices.layer)("StudyLibrary", (it) => {
 
         assert.strictEqual(tagged.id, imported.id);
         assert.deepStrictEqual(tagged.tags, ["linear algebra", "revision"]);
+      }),
+    ),
+  );
+
+  it.effect("preserves concurrent imports released through one start barrier", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temp = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "study-library-concurrent-import-",
+        });
+        const firstSource = path.join(temp, "first.md");
+        const secondSource = path.join(temp, "second.md");
+        yield* fileSystem.writeFileString(firstSource, "# First\n\nAlpha");
+        yield* fileSystem.writeFileString(secondSource, "# Second\n\nBeta");
+        const paths = yield* resolveStudyLibraryPaths(path.join(temp, "library"));
+        const start = yield* Deferred.make<void>();
+        const first = yield* Deferred.await(start).pipe(
+          Effect.andThen(importStudyDocument({ paths, sourcePath: firstSource })),
+          Effect.forkChild,
+        );
+        const second = yield* Deferred.await(start).pipe(
+          Effect.andThen(importStudyDocument({ paths, sourcePath: secondSource })),
+          Effect.forkChild,
+        );
+
+        yield* Deferred.succeed(start, undefined);
+        yield* Fiber.join(first);
+        yield* Fiber.join(second);
+
+        const index = yield* readStudyLibraryIndex(paths);
+        assert.deepStrictEqual(index.documents.map((document) => document.title).sort(), [
+          "first",
+          "second",
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("merges concurrent tag mutations released through one start barrier", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temp = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "study-library-concurrent-tag-",
+        });
+        const source = path.join(temp, "shared.md");
+        yield* fileSystem.writeFileString(source, "# Shared\n");
+        const paths = yield* resolveStudyLibraryPaths(path.join(temp, "library"));
+        const imported = yield* importStudyDocument({ paths, sourcePath: source });
+        const start = yield* Deferred.make<void>();
+        const first = yield* Deferred.await(start).pipe(
+          Effect.andThen(tagStudyDocument({ paths, documentId: imported.id, tags: ["alpha"] })),
+          Effect.forkChild,
+        );
+        const second = yield* Deferred.await(start).pipe(
+          Effect.andThen(tagStudyDocument({ paths, documentId: imported.id, tags: ["beta"] })),
+          Effect.forkChild,
+        );
+
+        yield* Deferred.succeed(start, undefined);
+        yield* Fiber.join(first);
+        yield* Fiber.join(second);
+
+        const index = yield* readStudyLibraryIndex(paths);
+        assert.deepStrictEqual(index.documents[0]?.tags, ["alpha", "beta"]);
       }),
     ),
   );

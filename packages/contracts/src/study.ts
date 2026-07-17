@@ -116,19 +116,23 @@ export const StudyContextCapsule = Schema.Struct({
 });
 export type StudyContextCapsule = typeof StudyContextCapsule.Type;
 
+export const STUDY_EXTRACTED_MAX_SEGMENTS = 4_096;
+export const STUDY_EXTRACTED_MAX_SEGMENT_CHARACTERS = 1_000_000;
+export const STUDY_EXTRACTED_MAX_UTF8_BYTES = 16 * 1_024 * 1_024;
+
 export const StudyTextSegment = Schema.Struct({
   id: TrimmedNonEmptyString.check(Schema.isMaxLength(160), Schema.isPattern(/^[a-z0-9_-]+$/i)),
   order: NonNegativeInt,
   heading: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(1024))),
   anchor: StudyDocumentAnchor,
-  text: Schema.String,
+  text: Schema.String.check(Schema.isMaxLength(STUDY_EXTRACTED_MAX_SEGMENT_CHARACTERS)),
 });
 export type StudyTextSegment = typeof StudyTextSegment.Type;
 
 export const StudyExtractedDocument = Schema.Struct({
   version: Schema.Literal(1),
   documentId: StudyDocumentId,
-  segments: Schema.Array(StudyTextSegment).check(Schema.isMaxLength(100_000)),
+  segments: Schema.Array(StudyTextSegment).check(Schema.isMaxLength(STUDY_EXTRACTED_MAX_SEGMENTS)),
   extractedAt: IsoDateTime,
 });
 export type StudyExtractedDocument = typeof StudyExtractedDocument.Type;

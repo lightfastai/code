@@ -13,6 +13,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import { writeFileStringAtomically } from "../atomicWrite.ts";
+import { withStudyLibraryMutationLock } from "./StudyLibraryMutationLock.ts";
 
 const MAX_IMPORT_BYTES = 512 * 1024 * 1024;
 const decodeIndex = Schema.decodeUnknownEffect(Schema.fromJsonString(StudyLibraryIndex));
@@ -291,21 +292,6 @@ export const importStudyDocument = Effect.fn("StudyLibrary.importDocument")(func
     ),
   );
 
-  const index = yield* readStudyLibraryIndex(input.paths);
-  const existing = index.documents.find((document) => document.id === sha256);
-  if (existing) {
-    const mergedTags = Array.from(new Set([...existing.tags, ...tags])).sort();
-    if (mergedTags.length === existing.tags.length) return existing;
-    const updated = { ...existing, tags: mergedTags } satisfies StudyDocument;
-    yield* writeStudyLibraryIndex(input.paths, {
-      version: 1,
-      documents: index.documents.map((document) =>
-        document.id === updated.id ? updated : document,
-      ),
-    });
-    return updated;
-  }
-
   const importedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
   const document = {
     id: sha256,
@@ -318,13 +304,33 @@ export const importStudyDocument = Effect.fn("StudyLibrary.importDocument")(func
     tags,
     importedAt,
   } satisfies StudyDocument;
-  yield* writeStudyLibraryIndex(input.paths, {
-    version: 1,
-    documents: [...index.documents, document].sort((left, right) =>
-      left.title.localeCompare(right.title),
-    ),
-  });
-  return document;
+  return yield* withStudyLibraryMutationLock(
+    input.paths.index,
+    Effect.gen(function* () {
+      const index = yield* readStudyLibraryIndex(input.paths);
+      const existing = index.documents.find((candidate) => candidate.id === sha256);
+      if (existing) {
+        const mergedTags = Array.from(new Set([...existing.tags, ...tags])).sort();
+        if (mergedTags.length === existing.tags.length) return existing;
+        const updated = { ...existing, tags: mergedTags } satisfies StudyDocument;
+        yield* writeStudyLibraryIndex(input.paths, {
+          version: 1,
+          documents: index.documents.map((candidate) =>
+            candidate.id === updated.id ? updated : candidate,
+          ),
+        });
+        return updated;
+      }
+
+      yield* writeStudyLibraryIndex(input.paths, {
+        version: 1,
+        documents: [...index.documents, document].sort((left, right) =>
+          left.title.localeCompare(right.title),
+        ),
+      });
+      return document;
+    }),
+  );
 });
 
 export const tagStudyDocument = Effect.fn("StudyLibrary.tagDocument")(function* (input: {
@@ -332,25 +338,30 @@ export const tagStudyDocument = Effect.fn("StudyLibrary.tagDocument")(function* 
   readonly documentId: StudyDocumentId;
   readonly tags: ReadonlyArray<string>;
 }) {
-  const index = yield* readStudyLibraryIndex(input.paths);
-  const existing = index.documents.find((document) => document.id === input.documentId);
-  if (!existing) {
-    return yield* new StudyLibraryError({
-      operation: "tag",
-      path: input.paths.index,
-      detail: `Study document '${input.documentId}' was not found.`,
-    });
-  }
   const tags = yield* normalizeTags(input.tags, input.paths.index);
-  const updated = {
-    ...existing,
-    tags: Array.from(new Set([...existing.tags, ...tags])).sort(),
-  } satisfies StudyDocument;
-  yield* writeStudyLibraryIndex(input.paths, {
-    version: 1,
-    documents: index.documents.map((document) =>
-      document.id === input.documentId ? updated : document,
-    ),
-  });
-  return updated;
+  return yield* withStudyLibraryMutationLock(
+    input.paths.index,
+    Effect.gen(function* () {
+      const index = yield* readStudyLibraryIndex(input.paths);
+      const existing = index.documents.find((document) => document.id === input.documentId);
+      if (!existing) {
+        return yield* new StudyLibraryError({
+          operation: "tag",
+          path: input.paths.index,
+          detail: `Study document '${input.documentId}' was not found.`,
+        });
+      }
+      const updated = {
+        ...existing,
+        tags: Array.from(new Set([...existing.tags, ...tags])).sort(),
+      } satisfies StudyDocument;
+      yield* writeStudyLibraryIndex(input.paths, {
+        version: 1,
+        documents: index.documents.map((document) =>
+          document.id === input.documentId ? updated : document,
+        ),
+      });
+      return updated;
+    }),
+  );
 });
