@@ -36,6 +36,8 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import {
   ProviderService,
   type ProviderServiceShape,
@@ -193,7 +195,10 @@ async function waitForThread(
 
 describe("ProviderRuntimeIngestion", () => {
   let runtime: ManagedRuntime.ManagedRuntime<
-    OrchestrationEngineService | ProviderRuntimeIngestionService | ProjectionSnapshotQuery,
+    | OrchestrationEngineService
+    | ProviderRuntimeIngestionService
+    | ProjectionSnapshotQuery
+    | ProjectionTurnRepository,
     unknown
   > | null = null;
   let scope: Scope.Closeable | null = null;
@@ -241,6 +246,7 @@ describe("ProviderRuntimeIngestion", () => {
       Layer.provide(SqlitePersistenceMemory),
     );
     const layer = ProviderRuntimeIngestionLive.pipe(
+      Layer.provideMerge(ProjectionTurnRepositoryLive),
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
       Layer.provideMerge(SqlitePersistenceMemory),
@@ -253,6 +259,7 @@ describe("ProviderRuntimeIngestion", () => {
     const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
     const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
     const ingestion = await runtime.runPromise(Effect.service(ProviderRuntimeIngestionService));
+    const turns = await runtime.runPromise(Effect.service(ProjectionTurnRepository));
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(ingestion.start().pipe(Scope.provide(scope)));
     const drain = () => Effect.runPromise(ingestion.drain);
@@ -322,6 +329,7 @@ describe("ProviderRuntimeIngestion", () => {
       emit: provider.emit,
       setProviderSession: provider.setSession,
       admitNotebookDocumentAuthorityTurn,
+      turns,
       drain,
     };
   }
@@ -368,7 +376,7 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.lastError).toBe("turn failed");
   });
 
-  it("admits notebook authority only for the accepted pending provider turn", async () => {
+  it("admits notebook authority only for the accepted provider turn", async () => {
     const harness = await createHarness();
     const threadId = asThreadId("thread-1");
     const acceptedMessageId = asMessageId("message-authority-accepted");
@@ -393,6 +401,15 @@ describe("ProviderRuntimeIngestion", () => {
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
         runtimeMode: "approval-required",
         createdAt,
+      }),
+    );
+    await Effect.runPromise(
+      harness.turns.stageAcceptedTurnStart({
+        threadId,
+        messageId: acceptedMessageId,
+        sourceProposedPlanThreadId: null,
+        sourceProposedPlanId: null,
+        requestedAt: createdAt,
       }),
     );
     harness.setProviderSession({
@@ -462,6 +479,76 @@ describe("ProviderRuntimeIngestion", () => {
     await harness.drain();
 
     expect(harness.admitNotebookDocumentAuthorityTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not project an accepted turn when exact authority admission fails", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const messageId = asMessageId("message-authority-mismatch");
+    const turnId = asTurnId("turn-authority-mismatch");
+    const createdAt = "2026-01-01T00:00:00.000Z";
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-authority-mismatch"),
+        threadId,
+        message: {
+          messageId,
+          role: "user",
+          text: "do not admit mismatched authority",
+          attachments: [],
+        },
+        documentIds: ["a".repeat(64)],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt,
+      }),
+    );
+    await Effect.runPromise(
+      harness.turns.stageAcceptedTurnStart({
+        threadId,
+        messageId,
+        sourceProposedPlanThreadId: null,
+        sourceProposedPlanId: null,
+        requestedAt: createdAt,
+      }),
+    );
+    harness.admitNotebookDocumentAuthorityTurn.mockImplementationOnce(() => Effect.succeed(false));
+    harness.setProviderSession({
+      provider: ProviderDriverKind.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId,
+      createdAt,
+      updatedAt: createdAt,
+      activeTurnId: turnId,
+    });
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-authority-mismatch"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt,
+      threadId,
+      turnId,
+    });
+    await harness.drain();
+
+    expect(harness.admitNotebookDocumentAuthorityTurn).toHaveBeenCalledWith({
+      threadId,
+      messageId,
+    });
+    const targetThread = (await harness.readModel()).threads.find(
+      (thread) => thread.id === threadId,
+    );
+    expect(targetThread?.session).toMatchObject({
+      status: "ready",
+      activeTurnId: null,
+    });
+    expect(targetThread?.latestTurn).toBeNull();
+    expect(
+      (await Effect.runPromise(harness.turns.getAcceptedTurnStartByThreadId({ threadId })))._tag,
+    ).toBe("Some");
   });
 
   it("applies provider session.state.changed transitions directly", async () => {
@@ -1165,6 +1252,15 @@ describe("ProviderRuntimeIngestion", () => {
         createdAt: "2026-01-01T00:00:00.000Z",
       }),
     );
+    await Effect.runPromise(
+      harness.turns.stageAcceptedTurnStart({
+        threadId: targetThreadId,
+        messageId: asMessageId("msg-plan-target"),
+        sourceProposedPlanThreadId: sourceThreadId,
+        sourceProposedPlanId: sourcePlan.id,
+        requestedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
 
     const sourceThreadBeforeStart = await waitForThread(
       harness.readModel,
@@ -1334,6 +1430,15 @@ describe("ProviderRuntimeIngestion", () => {
         createdAt: "2026-01-01T00:00:00.000Z",
       }),
     );
+    await Effect.runPromise(
+      harness.turns.stageAcceptedTurnStart({
+        threadId: targetThreadId,
+        messageId: asMessageId("msg-plan-target-guarded"),
+        sourceProposedPlanThreadId: sourceThreadId,
+        sourceProposedPlanId: sourcePlan.id,
+        requestedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
 
     harness.emit({
       type: "turn.started",
@@ -1364,7 +1469,7 @@ describe("ProviderRuntimeIngestion", () => {
     expect(targetThreadAfterRejectedStart?.session?.activeTurnId).toBe(activeTurnId);
   });
 
-  it("accepts a conflicting turn.started for a pending turn start when the provider expects that turn", async () => {
+  it("accepts a conflicting turn.started for an accepted start when the provider expects it", async () => {
     // Steering a running turn: the server requests a new turn while the old
     // one is still active, and providers like opencode open the new turn
     // without ever completing the superseded one. The new turn.started must
@@ -1415,6 +1520,15 @@ describe("ProviderRuntimeIngestion", () => {
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
         runtimeMode: "approval-required",
         createdAt,
+      }),
+    );
+    await Effect.runPromise(
+      harness.turns.stageAcceptedTurnStart({
+        threadId,
+        messageId: asMessageId("msg-steer"),
+        sourceProposedPlanThreadId: null,
+        sourceProposedPlanId: null,
+        requestedAt: createdAt,
       }),
     );
 
@@ -1580,6 +1694,15 @@ describe("ProviderRuntimeIngestion", () => {
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
         runtimeMode: "approval-required",
         createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    await Effect.runPromise(
+      harness.turns.stageAcceptedTurnStart({
+        threadId: targetThreadId,
+        messageId: asMessageId("msg-plan-target-unrelated"),
+        sourceProposedPlanThreadId: sourceThreadId,
+        sourceProposedPlanId: sourcePlan.id,
+        requestedAt: "2026-01-01T00:00:00.000Z",
       }),
     );
 

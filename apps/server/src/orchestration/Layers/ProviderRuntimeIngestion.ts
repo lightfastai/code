@@ -1136,20 +1136,20 @@ const make = Effect.gen(function* () {
     },
   );
 
-  const getPendingTurnStartForAcceptedProviderTurn = Effect.fn(
-    "getPendingTurnStartForAcceptedProviderTurn",
-  )(function* (threadId: ThreadId, eventTurnId: TurnId | undefined) {
-    if (eventTurnId === undefined) {
-      return Option.none();
-    }
+  const getAcceptedTurnStartForProviderTurn = Effect.fn("getAcceptedTurnStartForProviderTurn")(
+    function* (threadId: ThreadId, eventTurnId: TurnId | undefined) {
+      if (eventTurnId === undefined) {
+        return Option.none();
+      }
 
-    const expectedTurnId = yield* getExpectedProviderTurnIdForThread(threadId);
-    if (!sameId(expectedTurnId, eventTurnId)) {
-      return Option.none();
-    }
+      const expectedTurnId = yield* getExpectedProviderTurnIdForThread(threadId);
+      if (!sameId(expectedTurnId, eventTurnId)) {
+        return Option.none();
+      }
 
-    return yield* projectionTurnRepository.getPendingTurnStartByThreadId({ threadId });
-  });
+      return yield* projectionTurnRepository.getAcceptedTurnStartByThreadId({ threadId });
+    },
+  );
 
   const markSourceProposedPlanImplemented = Effect.fn("markSourceProposedPlanImplemented")(
     function* (
@@ -1211,11 +1211,11 @@ const make = Effect.gen(function* () {
       // steering a running turn makes some providers (e.g. opencode) open a
       // new turn without ever completing the superseded one. A stale
       // turn.started for some other turn id still gets rejected.
-      const conflictingTurnStartIsPendingTurnStart =
+      const conflictingTurnStartIsAcceptedTurnStart =
         event.type === "turn.started" && conflictsWithActiveTurn
           ? sameId(yield* getExpectedProviderTurnIdForThread(thread.id), eventTurnId) &&
             Option.isSome(
-              yield* projectionTurnRepository.getPendingTurnStartByThreadId({
+              yield* projectionTurnRepository.getAcceptedTurnStartByThreadId({
                 threadId: thread.id,
               }),
             )
@@ -1232,7 +1232,7 @@ const make = Effect.gen(function* () {
           case "thread.started":
             return true;
           case "turn.started":
-            return !conflictsWithActiveTurn || conflictingTurnStartIsPendingTurnStart;
+            return !conflictsWithActiveTurn || conflictingTurnStartIsAcceptedTurnStart;
           case "turn.completed":
             if (conflictsWithActiveTurn || missingTurnForActiveTurn) {
               return false;
@@ -1247,16 +1247,16 @@ const make = Effect.gen(function* () {
             return true;
         }
       })();
-      const acceptedPendingTurnStart =
+      const acceptedTurnStart =
         event.type === "turn.started" && shouldApplyThreadLifecycle
-          ? yield* getPendingTurnStartForAcceptedProviderTurn(thread.id, eventTurnId)
+          ? yield* getAcceptedTurnStartForProviderTurn(thread.id, eventTurnId)
           : Option.none();
-      const acceptedTurnStartedSourcePlan = Option.isSome(acceptedPendingTurnStart)
-        ? acceptedPendingTurnStart.value.sourceProposedPlanThreadId !== null &&
-          acceptedPendingTurnStart.value.sourceProposedPlanId !== null
+      const acceptedTurnStartedSourcePlan = Option.isSome(acceptedTurnStart)
+        ? acceptedTurnStart.value.sourceProposedPlanThreadId !== null &&
+          acceptedTurnStart.value.sourceProposedPlanId !== null
           ? {
-              sourceThreadId: acceptedPendingTurnStart.value.sourceProposedPlanThreadId,
-              sourcePlanId: acceptedPendingTurnStart.value.sourceProposedPlanId,
+              sourceThreadId: acceptedTurnStart.value.sourceProposedPlanThreadId,
+              sourcePlanId: acceptedTurnStart.value.sourceProposedPlanId,
             }
           : null
         : null;
@@ -1305,11 +1305,23 @@ const make = Effect.gen(function* () {
                 : (thread.session?.lastError ?? null);
 
         if (shouldApplyThreadLifecycle) {
-          if (event.type === "turn.started" && Option.isSome(acceptedPendingTurnStart)) {
-            yield* McpSessionRegistry.admitActiveNotebookDocumentAuthorityTurn({
-              threadId: thread.id,
-              messageId: acceptedPendingTurnStart.value.messageId,
-            });
+          if (event.type === "turn.started" && Option.isSome(acceptedTurnStart)) {
+            const admittedAuthority =
+              yield* McpSessionRegistry.admitActiveNotebookDocumentAuthorityTurn({
+                threadId: thread.id,
+                messageId: acceptedTurnStart.value.messageId,
+              });
+            if (!admittedAuthority) {
+              yield* Effect.logError(
+                "provider runtime ingestion rejected mismatched turn authority admission",
+                {
+                  threadId: thread.id,
+                  turnId: eventTurnId,
+                  acceptedMessageId: acceptedTurnStart.value.messageId,
+                },
+              );
+              return;
+            }
           }
           if (event.type === "turn.started" && acceptedTurnStartedSourcePlan !== null) {
             yield* markSourceProposedPlanImplemented(

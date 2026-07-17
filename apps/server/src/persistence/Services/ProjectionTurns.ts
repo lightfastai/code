@@ -1,8 +1,8 @@
 /**
  * ProjectionTurnRepository - Projection repository interface for unified turn state.
  *
- * Owns persistence operations for pending starts, running/completed turn lifecycle,
- * and checkpoint metadata in a single projection table.
+ * Owns persistence operations for projected turn intent/lifecycle/checkpoint rows and the
+ * separate exact accepted-start admission record used by provider runtime ingestion.
  *
  * @module ProjectionTurnRepository
  */
@@ -78,6 +78,15 @@ export const ProjectionPendingTurnStart = Schema.Struct({
 });
 export type ProjectionPendingTurnStart = typeof ProjectionPendingTurnStart.Type;
 
+export const ProjectionAcceptedTurnStart = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
+  sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
+  requestedAt: IsoDateTime,
+});
+export type ProjectionAcceptedTurnStart = typeof ProjectionAcceptedTurnStart.Type;
+
 export const ListProjectionTurnsByThreadInput = Schema.Struct({
   threadId: ThreadId,
 });
@@ -93,6 +102,12 @@ export const GetProjectionPendingTurnStartInput = Schema.Struct({
   threadId: ThreadId,
 });
 export type GetProjectionPendingTurnStartInput = typeof GetProjectionPendingTurnStartInput.Type;
+
+export const ProjectionTurnStartKey = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+});
+export type ProjectionTurnStartKey = typeof ProjectionTurnStartKey.Type;
 
 export const DeleteProjectionTurnsByThreadInput = Schema.Struct({
   threadId: ThreadId,
@@ -127,6 +142,29 @@ export interface ProjectionTurnRepositoryShape {
   readonly getPendingTurnStartByThreadId: (
     input: GetProjectionPendingTurnStartInput,
   ) => Effect.Effect<Option.Option<ProjectionPendingTurnStart>, ProjectionRepositoryError>;
+
+  /**
+   * Persists the exact turn start admitted by the reactor without replacing a different admission.
+   * Replaying the same `{threadId, messageId}` is idempotent.
+   */
+  readonly stageAcceptedTurnStart: (
+    row: ProjectionAcceptedTurnStart,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
+
+  /** Returns the reactor-admitted turn start independently of the latest projected intent. */
+  readonly getAcceptedTurnStartByThreadId: (
+    input: GetProjectionPendingTurnStartInput,
+  ) => Effect.Effect<Option.Option<ProjectionAcceptedTurnStart>, ProjectionRepositoryError>;
+
+  /** Deletes an accepted turn start only when both its thread and message identity match. */
+  readonly deleteAcceptedTurnStart: (
+    input: ProjectionTurnStartKey,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
+
+  /** Deletes a projected pending intent only when both its thread and message identity match. */
+  readonly deletePendingTurnStart: (
+    input: ProjectionTurnStartKey,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
 
   /**
    * Deletes only pending-start placeholder rows (`turnId = null`) for a thread and leaves concrete turn rows untouched.

@@ -14,6 +14,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -24,6 +25,8 @@ import {
   SqlitePersistenceMemory,
 } from "../../persistence/Layers/Sqlite.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import {
@@ -2400,14 +2403,138 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
   );
 });
 
+const acceptedTurnProjectionLayer = it.layer(
+  Layer.mergeAll(OrchestrationProjectionPipelineLive, ProjectionTurnRepositoryLive).pipe(
+    Layer.provideMerge(OrchestrationEventStoreLive),
+    Layer.provideMerge(
+      ServerConfig.layerTest(process.cwd(), { prefix: "t3-accepted-turn-projection-" }),
+    ),
+    Layer.provideMerge(SqlitePersistenceMemory),
+    Layer.provideMerge(NodeServices.layer),
+  ),
+);
+
+acceptedTurnProjectionLayer("accepted turn-start projection", (it) => {
+  it.effect("projects running A from accepted metadata without consuming projected B", () =>
+    Effect.gen(function* () {
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const turns = yield* ProjectionTurnRepository;
+      const threadId = ThreadId.make("thread-accepted-projection");
+      const messageA = MessageId.make("message-accepted-projection-a");
+      const messageB = MessageId.make("message-accepted-projection-b");
+      const turnA = TurnId.make("turn-accepted-projection-a");
+      const sourceThreadA = ThreadId.make("thread-source-projection-a");
+      const sourcePlanA = "plan-source-projection-a";
+
+      yield* projectionPipeline.projectEvent({
+        type: "thread.turn-start-requested",
+        eventId: EventId.make("evt-turn-start-requested-projection-a"),
+        sequence: 1,
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:00:00.000Z",
+        commandId: CommandId.make("cmd-turn-start-requested-projection-a"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-turn-start-requested-projection-a"),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId: messageA,
+          sourceProposedPlan: {
+            threadId: sourceThreadA,
+            planId: sourcePlanA,
+          },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+      });
+      assert.isTrue(
+        yield* turns.stageAcceptedTurnStart({
+          threadId,
+          messageId: messageA,
+          sourceProposedPlanThreadId: sourceThreadA,
+          sourceProposedPlanId: sourcePlanA,
+          requestedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+      yield* projectionPipeline.projectEvent({
+        type: "thread.turn-start-requested",
+        eventId: EventId.make("evt-turn-start-requested-projection-b"),
+        sequence: 2,
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:00:01.000Z",
+        commandId: CommandId.make("cmd-turn-start-requested-projection-b"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-turn-start-requested-projection-b"),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId: messageB,
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          createdAt: "2026-01-01T00:00:01.000Z",
+        },
+      });
+      yield* projectionPipeline.projectEvent({
+        type: "thread.session-set",
+        eventId: EventId.make("evt-session-running-projection-a"),
+        sequence: 3,
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:00:02.000Z",
+        commandId: CommandId.make("cmd-session-running-projection-a"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-session-running-projection-a"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: turnA,
+            lastError: null,
+            updatedAt: "2026-01-01T00:00:02.000Z",
+          },
+        },
+      });
+
+      assert.deepEqual(Option.getOrThrow(yield* turns.getByTurnId({ threadId, turnId: turnA })), {
+        threadId,
+        turnId: turnA,
+        pendingMessageId: messageA,
+        sourceProposedPlanThreadId: sourceThreadA,
+        sourceProposedPlanId: sourcePlanA,
+        assistantMessageId: null,
+        state: "running",
+        requestedAt: "2026-01-01T00:00:00.000Z",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        completedAt: null,
+        checkpointTurnCount: null,
+        checkpointRef: null,
+        checkpointStatus: null,
+        checkpointFiles: [],
+      });
+      assert.isTrue(Option.isNone(yield* turns.getAcceptedTurnStartByThreadId({ threadId })));
+      assert.equal(
+        Option.getOrThrow(yield* turns.getPendingTurnStartByThreadId({ threadId })).messageId,
+        messageB,
+      );
+    }),
+  );
+});
+
 it.effect("restores pending turn-start metadata across projection pipeline restart", () =>
   Effect.gen(function* () {
     const { dbPath } = yield* ServerConfig;
     const persistenceLayer = makeSqlitePersistenceLive(dbPath);
-    const firstProjectionLayer = OrchestrationProjectionPipelineLive.pipe(
-      Layer.provideMerge(OrchestrationEventStoreLive),
-      Layer.provideMerge(persistenceLayer),
-    );
+    const firstProjectionLayer = Layer.mergeAll(
+      OrchestrationProjectionPipelineLive,
+      ProjectionTurnRepositoryLive,
+    ).pipe(Layer.provideMerge(OrchestrationEventStoreLive), Layer.provideMerge(persistenceLayer));
     const secondProjectionLayer = OrchestrationProjectionPipelineLive.pipe(
       Layer.provideMerge(OrchestrationEventStoreLive),
       Layer.provideMerge(persistenceLayer),
@@ -2424,6 +2551,7 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
     yield* Effect.gen(function* () {
       const eventStore = yield* OrchestrationEventStore;
       const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const turns = yield* ProjectionTurnRepository;
 
       yield* eventStore.append({
         type: "thread.turn-start-requested",
@@ -2448,6 +2576,13 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
       });
 
       yield* projectionPipeline.bootstrap;
+      yield* turns.stageAcceptedTurnStart({
+        threadId,
+        messageId,
+        sourceProposedPlanThreadId: sourcePlanThreadId,
+        sourceProposedPlanId: sourcePlanId,
+        requestedAt: turnStartedAt,
+      });
     }).pipe(Effect.provide(firstProjectionLayer));
 
     const turnRows = yield* Effect.gen(function* () {
