@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+/* oxlint-disable t3code/no-manual-effect-runtime-in-tests -- This integration harness explicitly owns and disposes a ManagedRuntime across imperative provider-event assertions. */
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -22,6 +23,7 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
@@ -147,6 +149,7 @@ describe("ProviderCommandReactor", () => {
     readonly threadModelSelection?: ModelSelection;
     readonly sessionModelSwitch?: "unsupported" | "in-session";
     readonly requiresNewThreadForModelChange?: boolean;
+    readonly initialNotebookDocumentIds?: ReadonlyArray<string>;
   }) {
     const now = "2026-01-01T00:00:00.000Z";
     const baseDir =
@@ -296,15 +299,104 @@ describe("ProviderCommandReactor", () => {
           : {}),
       },
     ];
+    let notebookDocumentIds = Array.from(new Set(input?.initialNotebookDocumentIds ?? [])).sort();
+    let stagedNotebookAuthority:
+      | {
+          readonly messageId: MessageId;
+          readonly previousDocumentIds: ReadonlyArray<string>;
+          readonly documentIds: ReadonlyArray<string>;
+          committed: boolean;
+        }
+      | undefined;
+    const authorityExposures: Array<ReadonlyArray<string>> = [[...notebookDocumentIds]];
+    const exposeNotebookAuthority = (documentIds: ReadonlyArray<string>) => {
+      notebookDocumentIds = [...documentIds];
+      authorityExposures.push([...documentIds]);
+    };
     const setNotebookDocumentAuthority = vi.fn(
       (authority: { readonly documentIds: ReadonlyArray<string> }) =>
         Effect.sync(() => {
-          lifecycleCalls.push(`authority:${authority.documentIds.join(",")}`);
-          return Array.from(new Set(authority.documentIds)).sort();
+          const normalized = Array.from(new Set(authority.documentIds)).sort();
+          lifecycleCalls.push(`authority:${normalized.join(",")}`);
+          stagedNotebookAuthority = undefined;
+          exposeNotebookAuthority(normalized);
+          return normalized;
+        }),
+    );
+    const stageNotebookDocumentAuthorityTurn = vi.fn(
+      (authority: { readonly messageId: MessageId; readonly documentIds: ReadonlyArray<string> }) =>
+        Effect.sync(() => {
+          const normalized = Array.from(new Set(authority.documentIds)).sort();
+          lifecycleCalls.push(`authority-stage:${normalized.join(",")}`);
+          stagedNotebookAuthority = {
+            messageId: authority.messageId,
+            previousDocumentIds: [...notebookDocumentIds],
+            documentIds: normalized,
+            committed: false,
+          };
+          return true;
+        }),
+    );
+    const completeNotebookDocumentAuthorityTurn = vi.fn(
+      (authority: { readonly messageId: MessageId }) =>
+        Effect.sync(() => {
+          if (stagedNotebookAuthority?.messageId !== authority.messageId) {
+            return false;
+          }
+          if (!stagedNotebookAuthority.committed) {
+            exposeNotebookAuthority(stagedNotebookAuthority.documentIds);
+          }
+          lifecycleCalls.push(
+            `authority-complete:${stagedNotebookAuthority.documentIds.join(",")}`,
+          );
+          stagedNotebookAuthority = undefined;
+          return true;
+        }),
+    );
+    const admitNotebookDocumentAuthorityTurn = vi.fn(
+      (authority: { readonly threadId: ThreadId; readonly messageId: MessageId }) =>
+        Effect.sync(() => {
+          if (stagedNotebookAuthority?.messageId !== authority.messageId) {
+            return false;
+          }
+          if (!stagedNotebookAuthority.committed) {
+            exposeNotebookAuthority(stagedNotebookAuthority.documentIds);
+            stagedNotebookAuthority.committed = true;
+          }
+          lifecycleCalls.push(`authority-admit:${stagedNotebookAuthority.documentIds.join(",")}`);
+          return true;
+        }),
+    );
+    const rollbackNotebookDocumentAuthorityTurn = vi.fn(
+      (authority: { readonly messageId: MessageId }) =>
+        Effect.sync(() => {
+          if (stagedNotebookAuthority?.messageId !== authority.messageId) {
+            return false;
+          }
+          if (stagedNotebookAuthority.committed) {
+            exposeNotebookAuthority(stagedNotebookAuthority.previousDocumentIds);
+          }
+          lifecycleCalls.push(
+            `authority-rollback:${stagedNotebookAuthority.documentIds.join(",")}`,
+          );
+          stagedNotebookAuthority = undefined;
+          return true;
         }),
     );
     vi.spyOn(McpSessionRegistry, "setActiveNotebookDocumentAuthority").mockImplementation(
       setNotebookDocumentAuthority,
+    );
+    vi.spyOn(McpSessionRegistry, "stageActiveNotebookDocumentAuthorityTurn").mockImplementation(
+      stageNotebookDocumentAuthorityTurn,
+    );
+    vi.spyOn(McpSessionRegistry, "completeActiveNotebookDocumentAuthorityTurn").mockImplementation(
+      completeNotebookDocumentAuthorityTurn,
+    );
+    vi.spyOn(McpSessionRegistry, "admitActiveNotebookDocumentAuthorityTurn").mockImplementation(
+      admitNotebookDocumentAuthorityTurn,
+    );
+    vi.spyOn(McpSessionRegistry, "rollbackActiveNotebookDocumentAuthorityTurn").mockImplementation(
+      rollbackNotebookDocumentAuthorityTurn,
     );
 
     const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
@@ -438,6 +530,12 @@ describe("ProviderCommandReactor", () => {
       runtimeSessions,
       lifecycleCalls,
       setNotebookDocumentAuthority,
+      stageNotebookDocumentAuthorityTurn,
+      completeNotebookDocumentAuthorityTurn,
+      admitNotebookDocumentAuthorityTurn,
+      rollbackNotebookDocumentAuthorityTurn,
+      readNotebookDocumentAuthority: () => [...notebookDocumentIds],
+      authorityExposures,
       stateDir,
       drain,
     };
@@ -477,14 +575,352 @@ describe("ProviderCommandReactor", () => {
       runtimeMode: "approval-required",
     });
     expect(harness.lifecycleCalls.slice(0, 2)).toEqual([
-      `authority:${"a".repeat(64)},${"b".repeat(64)}`,
+      `authority-stage:${"a".repeat(64)},${"b".repeat(64)}`,
       "start-session",
     ]);
+    await waitFor(() => harness.completeNotebookDocumentAuthorityTurn.mock.calls.length === 1);
+    expect(harness.readNotebookDocumentAuthority()).toEqual(["a".repeat(64), "b".repeat(64)]);
 
     const readModel = await harness.readModel();
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
+  });
+
+  it("keeps a held turn's authority stable, rejects overlap, and rebinds sequentially", async () => {
+    const priorDocumentId = "0".repeat(64);
+    const documentA = "a".repeat(64);
+    const documentB = "b".repeat(64);
+    const harness = await createHarness({ initialNotebookDocumentIds: [priorDocumentId] });
+    const sendEntered = Effect.runSync(Deferred.make<void>());
+    const releaseSend = Effect.runSync(Deferred.make<void>());
+    harness.sendTurn.mockImplementationOnce(() =>
+      Deferred.succeed(sendEntered, undefined).pipe(
+        Effect.andThen(Deferred.await(releaseSend)),
+        Effect.as({
+          threadId: ThreadId.make("thread-1"),
+          turnId: asTurnId("turn-a"),
+        }),
+      ),
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-authority-a"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-authority-a"),
+          role: "user",
+          text: "run with document A",
+          attachments: [],
+        },
+        documentIds: [documentA],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    await Effect.runPromise(Deferred.await(sendEntered));
+    expect(harness.readNotebookDocumentAuthority()).toEqual([priorDocumentId]);
+    expect(harness.authorityExposures).toEqual([[priorDocumentId]]);
+    const sessionBeforeOverlap = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    )?.session;
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-authority-overlap-b"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-authority-overlap-b"),
+          role: "user",
+          text: "overlap with document B",
+          attachments: [],
+        },
+        documentIds: [documentB],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      }),
+    );
+
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return (
+        thread?.activities.some(
+          (activity) =>
+            activity.kind === "provider.turn.start.failed" &&
+            typeof activity.payload === "object" &&
+            activity.payload !== null &&
+            "detail" in activity.payload &&
+            typeof activity.payload.detail === "string" &&
+            activity.payload.detail.includes("active or pending provider turn"),
+        ) === true
+      );
+    });
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    expect(harness.stageNotebookDocumentAuthorityTurn).toHaveBeenCalledTimes(1);
+    expect(harness.readNotebookDocumentAuthority()).toEqual([priorDocumentId]);
+    expect(harness.authorityExposures).toEqual([[priorDocumentId]]);
+    const sessionAfterOverlap = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    )?.session;
+    expect(sessionAfterOverlap).toEqual(sessionBeforeOverlap);
+
+    await Effect.runPromise(Deferred.succeed(releaseSend, undefined));
+    await waitFor(() => harness.completeNotebookDocumentAuthorityTurn.mock.calls.length === 1);
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentA]);
+    expect(harness.authorityExposures).not.toContainEqual([documentB]);
+
+    if (harness.runtimeSessions[0]) {
+      harness.runtimeSessions[0] = {
+        ...harness.runtimeSessions[0],
+        status: "running",
+        activeTurnId: asTurnId("turn-a"),
+      };
+    }
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-running-authority-a"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId("turn-a"),
+          lastError: null,
+          updatedAt: "2026-01-01T00:00:02.000Z",
+        },
+        createdAt: "2026-01-01T00:00:02.000Z",
+      }),
+    );
+    const activeSessionBeforeRejection = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    )?.session;
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-authority-active-b"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-authority-active-b"),
+          role: "user",
+          text: "reject document B while A is active",
+          attachments: [],
+        },
+        documentIds: [documentB],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:02.500Z",
+      }),
+    );
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return (
+        thread?.activities.filter((activity) => activity.kind === "provider.turn.start.failed")
+          .length === 2
+      );
+    });
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    expect(harness.stageNotebookDocumentAuthorityTurn).toHaveBeenCalledTimes(1);
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentA]);
+    expect(
+      (await harness.readModel()).threads.find((entry) => entry.id === ThreadId.make("thread-1"))
+        ?.session,
+    ).toEqual(activeSessionBeforeRejection);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-clear-authority-a"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-01-01T00:00:02.000Z",
+        },
+        createdAt: "2026-01-01T00:00:02.000Z",
+      }),
+    );
+    if (harness.runtimeSessions[0]) {
+      const { activeTurnId: _activeTurnId, ...readySession } = harness.runtimeSessions[0];
+      harness.runtimeSessions[0] = readySession;
+    }
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-authority-sequential-b"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-authority-sequential-b"),
+          role: "user",
+          text: "now run with document B",
+          attachments: [],
+        },
+        documentIds: [documentB],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:03.000Z",
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+    await waitFor(() => harness.completeNotebookDocumentAuthorityTurn.mock.calls.length === 2);
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentB]);
+  });
+
+  it("preserves prior notebook authority when session construction fails", async () => {
+    const documentA = "a".repeat(64);
+    const documentB = "b".repeat(64);
+    const harness = await createHarness({ initialNotebookDocumentIds: [documentA] });
+    harness.startSession.mockImplementationOnce(
+      () =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: "codex",
+            method: "thread.turn.start",
+            detail: "session construction failed",
+          }),
+        ) as never,
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-authority-construction-failure"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-authority-construction-failure"),
+          role: "user",
+          text: "construction failure",
+          attachments: [],
+        },
+        documentIds: [documentB],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    await waitFor(() => harness.rollbackNotebookDocumentAuthorityTurn.mock.calls.length === 1);
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(harness.completeNotebookDocumentAuthorityTurn).not.toHaveBeenCalled();
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentA]);
+    expect(harness.authorityExposures).toEqual([[documentA]]);
+  });
+
+  it("preserves prior notebook authority without transient exposure when sendTurn fails", async () => {
+    const documentA = "a".repeat(64);
+    const documentB = "b".repeat(64);
+    const harness = await createHarness({ initialNotebookDocumentIds: [documentA] });
+    harness.sendTurn.mockImplementationOnce(
+      () =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: "codex",
+            method: "thread.turn.start",
+            detail: "send turn failed",
+          }),
+        ) as never,
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-authority-send-failure"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-authority-send-failure"),
+          role: "user",
+          text: "send failure",
+          attachments: [],
+        },
+        documentIds: [documentB],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    await waitFor(() => harness.rollbackNotebookDocumentAuthorityTurn.mock.calls.length === 1);
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    expect(harness.completeNotebookDocumentAuthorityTurn).not.toHaveBeenCalled();
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentA]);
+    expect(harness.authorityExposures).toEqual([[documentA]]);
+  });
+
+  it("restores prior notebook authority when an admitted sendTurn later fails", async () => {
+    const documentA = "a".repeat(64);
+    const documentB = "b".repeat(64);
+    const messageId = asMessageId("user-message-authority-admitted-send-failure");
+    const harness = await createHarness({ initialNotebookDocumentIds: [documentA] });
+    const sendEntered = Effect.runSync(Deferred.make<void>());
+    const releaseFailure = Effect.runSync(Deferred.make<void>());
+    harness.sendTurn.mockImplementationOnce(
+      () =>
+        Deferred.succeed(sendEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseFailure)),
+          Effect.andThen(
+            Effect.fail(
+              new ProviderAdapterRequestError({
+                provider: "codex",
+                method: "thread.turn.start",
+                detail: "admitted send turn failed",
+              }),
+            ),
+          ),
+        ) as never,
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-authority-admitted-send-failure"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId,
+          role: "user",
+          text: "admitted send failure",
+          attachments: [],
+        },
+        documentIds: [documentB],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    await Effect.runPromise(Deferred.await(sendEntered));
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentA]);
+    await Effect.runPromise(
+      harness.admitNotebookDocumentAuthorityTurn({
+        threadId: ThreadId.make("thread-1"),
+        messageId,
+      }),
+    );
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentB]);
+
+    await Effect.runPromise(Deferred.succeed(releaseFailure, undefined));
+    await waitFor(() => harness.rollbackNotebookDocumentAuthorityTurn.mock.calls.length === 1);
+    expect(harness.completeNotebookDocumentAuthorityTurn).not.toHaveBeenCalled();
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentA]);
+    expect(harness.authorityExposures).toEqual([[documentA], [documentB], [documentA]]);
   });
 
   it("generates a thread title on the first turn", async () => {

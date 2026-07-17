@@ -1,6 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
-import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, MessageId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -159,6 +159,88 @@ it.effect("defaults notebook document authority closed and updates every thread 
     });
     const replacementToken = replacement.config.authorizationHeader.replace(/^Bearer\s+/, "");
     expect((yield* registry.resolve(replacementToken))?.notebookDocumentIds).toEqual(normalized);
+  }),
+);
+
+it.effect("stages notebook authority invisibly and rolls an admitted turn back atomically", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const threadId = ThreadId.make("thread-notebook-authority-transaction");
+    const messageId = MessageId.make("message-notebook-authority-b");
+    const wrongMessageId = MessageId.make("message-notebook-authority-wrong");
+    const documentA = "a".repeat(64);
+    const documentB = "b".repeat(64);
+
+    yield* registry.setNotebookDocumentAuthority({ threadId, documentIds: [documentA] });
+    const issued = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    yield* registry.stageNotebookDocumentAuthorityTurn({
+      threadId,
+      messageId,
+      documentIds: [documentB],
+    });
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentA]);
+
+    expect(
+      yield* registry.stageNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId: wrongMessageId,
+        documentIds: ["c".repeat(64)],
+      }),
+    ).toBe(false);
+    yield* registry.admitNotebookDocumentAuthorityTurn({ threadId, messageId: wrongMessageId });
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentA]);
+
+    yield* registry.admitNotebookDocumentAuthorityTurn({ threadId, messageId });
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentB]);
+
+    yield* registry.rollbackNotebookDocumentAuthorityTurn({ threadId, messageId });
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentA]);
+  }),
+);
+
+it.effect("completes staged notebook authority and direct updates cancel stale transactions", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const threadId = ThreadId.make("thread-notebook-authority-complete");
+    const firstMessageId = MessageId.make("message-notebook-authority-first");
+    const staleMessageId = MessageId.make("message-notebook-authority-stale");
+    const documentA = "a".repeat(64);
+    const documentB = "b".repeat(64);
+    const documentC = "c".repeat(64);
+    const issued = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    yield* registry.stageNotebookDocumentAuthorityTurn({
+      threadId,
+      messageId: firstMessageId,
+      documentIds: [documentB],
+    });
+    yield* registry.completeNotebookDocumentAuthorityTurn({
+      threadId,
+      messageId: firstMessageId,
+    });
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentB]);
+
+    yield* registry.stageNotebookDocumentAuthorityTurn({
+      threadId,
+      messageId: staleMessageId,
+      documentIds: [documentA],
+    });
+    yield* registry.setNotebookDocumentAuthority({ threadId, documentIds: [documentC] });
+    yield* registry.admitNotebookDocumentAuthorityTurn({ threadId, messageId: staleMessageId });
+    yield* registry.completeNotebookDocumentAuthorityTurn({
+      threadId,
+      messageId: staleMessageId,
+    });
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentC]);
   }),
 );
 

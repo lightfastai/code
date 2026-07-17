@@ -4,6 +4,7 @@ import {
   type StudyDocumentId,
   type NotebookAgentExecutionPermission,
   type NotebookAgentExecutionPermissionSetInput,
+  type MessageId,
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -36,6 +37,15 @@ export interface NotebookDocumentAuthorityInput {
   readonly documentIds: ReadonlyArray<StudyDocumentId>;
 }
 
+export interface NotebookDocumentAuthorityTurnInput extends NotebookDocumentAuthorityInput {
+  readonly messageId: MessageId;
+}
+
+export interface NotebookDocumentAuthorityTurnKey {
+  readonly threadId: ThreadId;
+  readonly messageId: MessageId;
+}
+
 export interface McpSessionRegistryShape {
   readonly issue: (request: McpCredentialRequest) => Effect.Effect<McpIssuedCredential>;
   readonly resolve: (
@@ -52,6 +62,18 @@ export interface McpSessionRegistryShape {
   readonly setNotebookDocumentAuthority: (
     input: NotebookDocumentAuthorityInput,
   ) => Effect.Effect<SelectedStudyDocumentIds>;
+  readonly stageNotebookDocumentAuthorityTurn: (
+    input: NotebookDocumentAuthorityTurnInput,
+  ) => Effect.Effect<boolean>;
+  readonly admitNotebookDocumentAuthorityTurn: (
+    input: NotebookDocumentAuthorityTurnKey,
+  ) => Effect.Effect<boolean>;
+  readonly completeNotebookDocumentAuthorityTurn: (
+    input: NotebookDocumentAuthorityTurnKey,
+  ) => Effect.Effect<boolean>;
+  readonly rollbackNotebookDocumentAuthorityTurn: (
+    input: NotebookDocumentAuthorityTurnKey,
+  ) => Effect.Effect<boolean>;
   readonly withNotebookExecutionStart: <A, E, R>(
     invocation: McpInvocationContext.McpInvocationScope,
     documentIds: ReadonlyArray<StudyDocumentId>,
@@ -71,10 +93,18 @@ interface CredentialRecord {
   readonly lastUsedAt: number;
 }
 
+interface NotebookDocumentAuthorityTurn {
+  readonly messageId: MessageId;
+  readonly previousDocumentIds: SelectedStudyDocumentIds;
+  readonly documentIds: SelectedStudyDocumentIds;
+  readonly committed: boolean;
+}
+
 interface RegistryState {
   readonly records: ReadonlyMap<string, CredentialRecord>;
   readonly notebookExecutionPermissions: ReadonlyMap<ThreadId, boolean>;
   readonly notebookDocumentAuthorities: ReadonlyMap<ThreadId, SelectedStudyDocumentIds>;
+  readonly notebookDocumentAuthorityTurns: ReadonlyMap<ThreadId, NotebookDocumentAuthorityTurn>;
 }
 
 export interface McpSessionRegistryOptions {
@@ -113,6 +143,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     records: new Map(),
     notebookExecutionPermissions: new Map(),
     notebookDocumentAuthorities: new Map(),
+    notebookDocumentAuthorityTurns: new Map(),
   });
   const threadPermissionLocks = yield* SynchronizedRef.make<
     ReadonlyMap<ThreadId, Semaphore.Semaphore>
@@ -159,6 +190,31 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     return next.size === records.size ? records : next;
   };
 
+  const updateNotebookDocumentAuthority = (
+    current: RegistryState,
+    threadId: ThreadId,
+    documentIds: SelectedStudyDocumentIds,
+  ): RegistryState => {
+    const nextAuthorities = new Map(current.notebookDocumentAuthorities);
+    nextAuthorities.set(threadId, documentIds);
+    const nextRecords = new Map(
+      Array.from(current.records, ([tokenHash, record]) => [
+        tokenHash,
+        record.scope.threadId === threadId
+          ? {
+              ...record,
+              scope: { ...record.scope, notebookDocumentIds: documentIds },
+            }
+          : record,
+      ]),
+    );
+    return {
+      ...current,
+      records: nextRecords,
+      notebookDocumentAuthorities: nextAuthorities,
+    };
+  };
+
   const issue: McpSessionRegistryShape["issue"] = Effect.fn("McpSessionRegistry.issue")(
     function* (request) {
       const issuedAt = yield* currentTimeMillis;
@@ -170,7 +226,12 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       const providerInstanceId = ProviderInstanceId.make(request.providerInstanceId);
       const scope = yield* SynchronizedRef.modify(
         state,
-        ({ records, notebookExecutionPermissions, notebookDocumentAuthorities }) => {
+        ({
+          records,
+          notebookExecutionPermissions,
+          notebookDocumentAuthorities,
+          notebookDocumentAuthorityTurns,
+        }) => {
           const scope: McpInvocationContext.McpInvocationScope = {
             environmentId,
             threadId,
@@ -186,7 +247,12 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
           next.set(tokenHash, { tokenHash, scope, lastUsedAt: issuedAt });
           return [
             scope,
-            { records: next, notebookExecutionPermissions, notebookDocumentAuthorities },
+            {
+              records: next,
+              notebookExecutionPermissions,
+              notebookDocumentAuthorities,
+              notebookDocumentAuthorityTurns,
+            },
           ] as const;
         },
       );
@@ -211,20 +277,35 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       const timestamp = yield* currentTimeMillis;
       return yield* SynchronizedRef.modify(
         state,
-        ({ records, notebookExecutionPermissions, notebookDocumentAuthorities }) => {
+        ({
+          records,
+          notebookExecutionPermissions,
+          notebookDocumentAuthorities,
+          notebookDocumentAuthorityTurns,
+        }) => {
           const current = pruneExpired(records, timestamp);
           const record = current.get(tokenHash);
           if (!record) {
             return [
               undefined,
-              { records: current, notebookExecutionPermissions, notebookDocumentAuthorities },
+              {
+                records: current,
+                notebookExecutionPermissions,
+                notebookDocumentAuthorities,
+                notebookDocumentAuthorityTurns,
+              },
             ] as const;
           }
           const next = new Map(current);
           next.set(tokenHash, { ...record, lastUsedAt: timestamp });
           return [
             record.scope,
-            { records: next, notebookExecutionPermissions, notebookDocumentAuthorities },
+            {
+              records: next,
+              notebookExecutionPermissions,
+              notebookDocumentAuthorities,
+              notebookDocumentAuthorityTurns,
+            },
           ] as const;
         },
       );
@@ -234,10 +315,16 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const revokeWhere = (predicate: (record: CredentialRecord) => boolean) =>
     SynchronizedRef.update(
       state,
-      ({ records, notebookExecutionPermissions, notebookDocumentAuthorities }) => ({
+      ({
+        records,
+        notebookExecutionPermissions,
+        notebookDocumentAuthorities,
+        notebookDocumentAuthorityTurns,
+      }) => ({
         records: new Map(Array.from(records).filter(([, record]) => !predicate(record))),
         notebookExecutionPermissions,
         notebookDocumentAuthorities,
+        notebookDocumentAuthorityTurns,
       }),
     );
 
@@ -270,7 +357,12 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
           input.threadId,
           SynchronizedRef.update(
             state,
-            ({ records, notebookExecutionPermissions, notebookDocumentAuthorities }) => {
+            ({
+              records,
+              notebookExecutionPermissions,
+              notebookDocumentAuthorities,
+              notebookDocumentAuthorityTurns,
+            }) => {
               const nextPermissions = new Map(notebookExecutionPermissions);
               nextPermissions.set(input.threadId, input.allowNotebookExecution);
               const nextRecords = new Map(
@@ -291,6 +383,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
                 records: nextRecords,
                 notebookExecutionPermissions: nextPermissions,
                 notebookDocumentAuthorities,
+                notebookDocumentAuthorityTurns,
               };
             },
           ).pipe(Effect.as(input)),
@@ -301,31 +394,102 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         const documentIds = normalizeStudyDocumentIds(input.documentIds);
         return withThreadPermissionLock(
           input.threadId,
-          SynchronizedRef.update(
-            state,
-            ({ records, notebookExecutionPermissions, notebookDocumentAuthorities }) => {
-              const nextAuthorities = new Map(notebookDocumentAuthorities);
-              nextAuthorities.set(input.threadId, documentIds);
-              const nextRecords = new Map(
-                Array.from(records, ([tokenHash, record]) => [
-                  tokenHash,
-                  record.scope.threadId === input.threadId
-                    ? {
-                        ...record,
-                        scope: { ...record.scope, notebookDocumentIds: documentIds },
-                      }
-                    : record,
-                ]),
-              );
-              return {
-                records: nextRecords,
-                notebookExecutionPermissions,
-                notebookDocumentAuthorities: nextAuthorities,
-              };
-            },
-          ).pipe(Effect.as(documentIds)),
+          SynchronizedRef.update(state, (current) => {
+            const updated = updateNotebookDocumentAuthority(current, input.threadId, documentIds);
+            const nextTurns = new Map(updated.notebookDocumentAuthorityTurns);
+            nextTurns.delete(input.threadId);
+            return { ...updated, notebookDocumentAuthorityTurns: nextTurns };
+          }).pipe(Effect.as(documentIds)),
         );
       },
+    ),
+    stageNotebookDocumentAuthorityTurn: Effect.fn(
+      "McpSessionRegistry.stageNotebookDocumentAuthorityTurn",
+    )((input) => {
+      const documentIds = normalizeStudyDocumentIds(input.documentIds);
+      return withThreadPermissionLock(
+        input.threadId,
+        SynchronizedRef.modify(state, (current) => {
+          const existing = current.notebookDocumentAuthorityTurns.get(input.threadId);
+          if (existing !== undefined) {
+            return [existing.messageId === input.messageId, current] as const;
+          }
+          const nextTurns = new Map(current.notebookDocumentAuthorityTurns);
+          nextTurns.set(input.threadId, {
+            messageId: input.messageId,
+            previousDocumentIds: current.notebookDocumentAuthorities.get(input.threadId) ?? [],
+            documentIds,
+            committed: false,
+          });
+          return [true, { ...current, notebookDocumentAuthorityTurns: nextTurns }] as const;
+        }),
+      );
+    }),
+    admitNotebookDocumentAuthorityTurn: Effect.fn(
+      "McpSessionRegistry.admitNotebookDocumentAuthorityTurn",
+    )((input) =>
+      withThreadPermissionLock(
+        input.threadId,
+        SynchronizedRef.modify(state, (current) => {
+          const transaction = current.notebookDocumentAuthorityTurns.get(input.threadId);
+          if (transaction === undefined || transaction.messageId !== input.messageId) {
+            return [false, current] as const;
+          }
+          if (transaction.committed) {
+            return [true, current] as const;
+          }
+          const updated = updateNotebookDocumentAuthority(
+            current,
+            input.threadId,
+            transaction.documentIds,
+          );
+          const nextTurns = new Map(updated.notebookDocumentAuthorityTurns);
+          nextTurns.set(input.threadId, { ...transaction, committed: true });
+          return [true, { ...updated, notebookDocumentAuthorityTurns: nextTurns }] as const;
+        }),
+      ),
+    ),
+    completeNotebookDocumentAuthorityTurn: Effect.fn(
+      "McpSessionRegistry.completeNotebookDocumentAuthorityTurn",
+    )((input) =>
+      withThreadPermissionLock(
+        input.threadId,
+        SynchronizedRef.modify(state, (current) => {
+          const transaction = current.notebookDocumentAuthorityTurns.get(input.threadId);
+          if (transaction === undefined || transaction.messageId !== input.messageId) {
+            return [false, current] as const;
+          }
+          const updated = transaction.committed
+            ? current
+            : updateNotebookDocumentAuthority(current, input.threadId, transaction.documentIds);
+          const nextTurns = new Map(updated.notebookDocumentAuthorityTurns);
+          nextTurns.delete(input.threadId);
+          return [true, { ...updated, notebookDocumentAuthorityTurns: nextTurns }] as const;
+        }),
+      ),
+    ),
+    rollbackNotebookDocumentAuthorityTurn: Effect.fn(
+      "McpSessionRegistry.rollbackNotebookDocumentAuthorityTurn",
+    )((input) =>
+      withThreadPermissionLock(
+        input.threadId,
+        SynchronizedRef.modify(state, (current) => {
+          const transaction = current.notebookDocumentAuthorityTurns.get(input.threadId);
+          if (transaction === undefined || transaction.messageId !== input.messageId) {
+            return [false, current] as const;
+          }
+          const updated = transaction.committed
+            ? updateNotebookDocumentAuthority(
+                current,
+                input.threadId,
+                transaction.previousDocumentIds,
+              )
+            : current;
+          const nextTurns = new Map(updated.notebookDocumentAuthorityTurns);
+          nextTurns.delete(input.threadId);
+          return [true, { ...updated, notebookDocumentAuthorityTurns: nextTurns }] as const;
+        }),
+      ),
     ),
     withNotebookExecutionStart: Effect.fn("McpSessionRegistry.withNotebookExecutionStart")(
       (invocation, documentIds, start) =>
@@ -335,7 +499,12 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
             const timestamp = yield* currentTimeMillis;
             const authorized = yield* SynchronizedRef.modify(
               state,
-              ({ records, notebookExecutionPermissions, notebookDocumentAuthorities }) => {
+              ({
+                records,
+                notebookExecutionPermissions,
+                notebookDocumentAuthorities,
+                notebookDocumentAuthorityTurns,
+              }) => {
                 const current = pruneExpired(records, timestamp);
                 const credentialIsCurrent = Array.from(current.values()).some(
                   ({ scope }) =>
@@ -353,7 +522,12 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
                   ) !== null;
                 return [
                   { credentialIsCurrent, permissionGranted, documentScopeGranted },
-                  { records: current, notebookExecutionPermissions, notebookDocumentAuthorities },
+                  {
+                    records: current,
+                    notebookExecutionPermissions,
+                    notebookDocumentAuthorities,
+                    notebookDocumentAuthorityTurns,
+                  },
                 ] as const;
               },
             );
@@ -375,10 +549,15 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     ),
     revokeAll: SynchronizedRef.update(
       state,
-      ({ notebookExecutionPermissions, notebookDocumentAuthorities }) => ({
+      ({
+        notebookExecutionPermissions,
+        notebookDocumentAuthorities,
+        notebookDocumentAuthorityTurns,
+      }) => ({
         records: new Map(),
         notebookExecutionPermissions,
         notebookDocumentAuthorities,
+        notebookDocumentAuthorityTurns,
       }),
     ),
   });
@@ -439,6 +618,34 @@ export const setActiveNotebookDocumentAuthority = (
   activeMcpSessionRegistry
     ? activeMcpSessionRegistry.setNotebookDocumentAuthority(input)
     : Effect.succeed([]);
+
+export const stageActiveNotebookDocumentAuthorityTurn = (
+  input: NotebookDocumentAuthorityTurnInput,
+): Effect.Effect<boolean> =>
+  activeMcpSessionRegistry
+    ? activeMcpSessionRegistry.stageNotebookDocumentAuthorityTurn(input)
+    : Effect.succeed(true);
+
+export const admitActiveNotebookDocumentAuthorityTurn = (
+  input: NotebookDocumentAuthorityTurnKey,
+): Effect.Effect<boolean> =>
+  activeMcpSessionRegistry
+    ? activeMcpSessionRegistry.admitNotebookDocumentAuthorityTurn(input)
+    : Effect.succeed(false);
+
+export const completeActiveNotebookDocumentAuthorityTurn = (
+  input: NotebookDocumentAuthorityTurnKey,
+): Effect.Effect<boolean> =>
+  activeMcpSessionRegistry
+    ? activeMcpSessionRegistry.completeNotebookDocumentAuthorityTurn(input)
+    : Effect.succeed(false);
+
+export const rollbackActiveNotebookDocumentAuthorityTurn = (
+  input: NotebookDocumentAuthorityTurnKey,
+): Effect.Effect<boolean> =>
+  activeMcpSessionRegistry
+    ? activeMcpSessionRegistry.rollbackNotebookDocumentAuthorityTurn(input)
+    : Effect.succeed(false);
 
 /** Exposed for tests. */
 export const __testing = {

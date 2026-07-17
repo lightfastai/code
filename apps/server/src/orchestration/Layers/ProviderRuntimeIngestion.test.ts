@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+/* oxlint-disable t3code/no-manual-effect-runtime-in-tests -- This integration harness explicitly owns and disposes a ManagedRuntime across imperative provider-event assertions. */
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -30,7 +31,7 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
@@ -50,6 +51,7 @@ import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts"
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 
 function makeTestServerSettingsLayer(overrides: Partial<ServerSettings> = {}) {
   return ServerSettingsService.layerTest(overrides);
@@ -204,6 +206,7 @@ describe("ProviderRuntimeIngestion", () => {
   }
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     if (scope) {
       await Effect.runPromise(Scope.close(scope, Exit.void));
     }
@@ -221,6 +224,10 @@ describe("ProviderRuntimeIngestion", () => {
     const workspaceRoot = makeTempDir("t3-provider-project-");
     NodeFS.mkdirSync(NodePath.join(workspaceRoot, ".git"));
     const provider = createProviderServiceHarness();
+    const admitNotebookDocumentAuthorityTurn = vi.fn(() => Effect.succeed(true));
+    vi.spyOn(McpSessionRegistry, "admitActiveNotebookDocumentAuthorityTurn").mockImplementation(
+      admitNotebookDocumentAuthorityTurn,
+    );
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
       Layer.provide(OrchestrationProjectionPipelineLive),
@@ -314,6 +321,7 @@ describe("ProviderRuntimeIngestion", () => {
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
       emit: provider.emit,
       setProviderSession: provider.setSession,
+      admitNotebookDocumentAuthorityTurn,
       drain,
     };
   }
@@ -358,6 +366,102 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(thread.session?.status).toBe("error");
     expect(thread.session?.lastError).toBe("turn failed");
+  });
+
+  it("admits notebook authority only for the accepted pending provider turn", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const acceptedMessageId = asMessageId("message-authority-accepted");
+    const rejectedMessageId = asMessageId("message-authority-rejected");
+    const acceptedTurnId = asTurnId("turn-authority-accepted");
+    const expectedNextTurnId = asTurnId("turn-authority-expected-next");
+    const staleTurnId = asTurnId("turn-authority-stale");
+    const createdAt = "2026-01-01T00:00:00.000Z";
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-authority-accepted"),
+        threadId,
+        message: {
+          messageId: acceptedMessageId,
+          role: "user",
+          text: "accepted authority",
+          attachments: [],
+        },
+        documentIds: ["a".repeat(64)],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt,
+      }),
+    );
+    harness.setProviderSession({
+      provider: ProviderDriverKind.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId,
+      createdAt,
+      updatedAt: createdAt,
+      activeTurnId: acceptedTurnId,
+    });
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-authority-accepted"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt,
+      threadId,
+      turnId: acceptedTurnId,
+    });
+
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.activeTurnId === acceptedTurnId,
+      2_000,
+      threadId,
+    );
+    expect(harness.admitNotebookDocumentAuthorityTurn).toHaveBeenCalledTimes(1);
+    expect(harness.admitNotebookDocumentAuthorityTurn).toHaveBeenCalledWith({
+      threadId,
+      messageId: acceptedMessageId,
+    });
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-authority-rejected"),
+        threadId,
+        message: {
+          messageId: rejectedMessageId,
+          role: "user",
+          text: "rejected authority",
+          attachments: [],
+        },
+        documentIds: ["b".repeat(64)],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      }),
+    );
+    harness.setProviderSession({
+      provider: ProviderDriverKind.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId,
+      createdAt,
+      updatedAt: "2026-01-01T00:00:01.000Z",
+      activeTurnId: expectedNextTurnId,
+    });
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-authority-stale"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+      threadId,
+      turnId: staleTurnId,
+    });
+    await harness.drain();
+
+    expect(harness.admitNotebookDocumentAuthorityTurn).toHaveBeenCalledTimes(1);
   });
 
   it("applies provider session.state.changed transitions directly", async () => {

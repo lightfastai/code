@@ -3,6 +3,7 @@ import {
   CommandId,
   EventId,
   type ModelSelection,
+  type MessageId,
   type OrchestrationEvent,
   ProviderDriverKind,
   type ProjectId,
@@ -214,6 +215,7 @@ const make = Effect.gen(function* () {
     );
 
   const threadModelSelections = new Map<string, ModelSelection>();
+  const pendingTurnStarts = new Map<ThreadId, MessageId>();
 
   const appendProviderFailureActivity = (input: {
     readonly threadId: ThreadId;
@@ -771,6 +773,51 @@ const make = Effect.gen(function* () {
       return;
     }
 
+    const runtimeSession = (yield* providerService.listSessions()).find(
+      (session) => session.threadId === event.payload.threadId,
+    );
+    const pendingMessageId = pendingTurnStarts.get(event.payload.threadId);
+    const hasActiveTurn =
+      thread.session?.activeTurnId !== null && thread.session?.activeTurnId !== undefined;
+    const runtimeHasActiveTurn =
+      runtimeSession?.activeTurnId !== null && runtimeSession?.activeTurnId !== undefined;
+    const rejectBusyTurnStart = (turnId: TurnId | null) =>
+      appendProviderFailureActivity({
+        threadId: event.payload.threadId,
+        kind: "provider.turn.start.failed",
+        summary: "Provider turn start failed",
+        detail: `Thread '${event.payload.threadId}' already has an active or pending provider turn. Wait for it to finish before starting another turn.`,
+        turnId,
+        createdAt: event.payload.createdAt,
+      });
+    if (pendingMessageId !== undefined || hasActiveTurn || runtimeHasActiveTurn) {
+      yield* rejectBusyTurnStart(
+        thread.session?.activeTurnId ?? runtimeSession?.activeTurnId ?? null,
+      );
+      return;
+    }
+
+    pendingTurnStarts.set(event.payload.threadId, event.payload.messageId);
+    const authorityTurn = {
+      threadId: event.payload.threadId,
+      messageId: event.payload.messageId,
+    } as const;
+    const clearPendingTurnStart = Effect.sync(() => {
+      if (pendingTurnStarts.get(event.payload.threadId) === event.payload.messageId) {
+        pendingTurnStarts.delete(event.payload.threadId);
+      }
+    });
+
+    const stagedAuthority = yield* McpSessionRegistry.stageActiveNotebookDocumentAuthorityTurn({
+      ...authorityTurn,
+      documentIds: event.payload.documentIds ?? [],
+    });
+    if (!stagedAuthority) {
+      yield* clearPendingTurnStart;
+      yield* rejectBusyTurnStart(null);
+      return;
+    }
+
     const isFirstUserMessageTurn =
       thread.messages.filter((entry) => entry.role === "user").length === 1;
     const messageImages = message.attachments?.filter((attachment) => attachment.type === "image");
@@ -839,11 +886,6 @@ const make = Effect.gen(function* () {
         ),
       );
 
-    yield* McpSessionRegistry.setActiveNotebookDocumentAuthority({
-      threadId: event.payload.threadId,
-      documentIds: event.payload.documentIds ?? [],
-    });
-
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
       threadId: event.payload.threadId,
       messageText: message.text,
@@ -855,16 +897,31 @@ const make = Effect.gen(function* () {
       createdAt: event.payload.createdAt,
     }).pipe(
       Effect.map(Option.some),
-      Effect.catchCause((cause) => handleTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
+      Effect.catchCause((cause) =>
+        McpSessionRegistry.rollbackActiveNotebookDocumentAuthorityTurn(authorityTurn).pipe(
+          Effect.andThen(handleTurnStartFailure(cause)),
+          Effect.as(Option.none()),
+        ),
+      ),
     );
 
     if (Option.isNone(sendTurnRequest)) {
+      yield* clearPendingTurnStart;
       return;
     }
 
-    yield* providerService
-      .sendTurn(sendTurnRequest.value)
-      .pipe(Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
+    yield* providerService.sendTurn(sendTurnRequest.value).pipe(
+      Effect.tap(() =>
+        McpSessionRegistry.completeActiveNotebookDocumentAuthorityTurn(authorityTurn),
+      ),
+      Effect.catchCause((cause) =>
+        McpSessionRegistry.rollbackActiveNotebookDocumentAuthorityTurn(authorityTurn).pipe(
+          Effect.andThen(recoverTurnStartFailure(cause)),
+        ),
+      ),
+      Effect.ensuring(clearPendingTurnStart),
+      Effect.forkScoped,
+    );
   });
 
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (

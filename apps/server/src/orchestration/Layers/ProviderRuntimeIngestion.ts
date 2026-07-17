@@ -38,6 +38,7 @@ import {
   type ProviderRuntimeIngestionShape,
 } from "../Services/ProviderRuntimeIngestion.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 
@@ -1127,28 +1128,6 @@ const make = Effect.gen(function* () {
       ).pipe(Effect.asVoid);
     });
 
-  const getSourceProposedPlanReferenceForPendingTurnStart = Effect.fn(
-    "getSourceProposedPlanReferenceForPendingTurnStart",
-  )(function* (threadId: ThreadId) {
-    const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
-      threadId,
-    });
-    if (Option.isNone(pendingTurnStart)) {
-      return null;
-    }
-
-    const sourceThreadId = pendingTurnStart.value.sourceProposedPlanThreadId;
-    const sourcePlanId = pendingTurnStart.value.sourceProposedPlanId;
-    if (sourceThreadId === null || sourcePlanId === null) {
-      return null;
-    }
-
-    return {
-      sourceThreadId,
-      sourcePlanId,
-    } as const;
-  });
-
   const getExpectedProviderTurnIdForThread = Effect.fn("getExpectedProviderTurnIdForThread")(
     function* (threadId: ThreadId) {
       const sessions = yield* providerService.listSessions();
@@ -1157,19 +1136,19 @@ const make = Effect.gen(function* () {
     },
   );
 
-  const getSourceProposedPlanReferenceForAcceptedTurnStart = Effect.fn(
-    "getSourceProposedPlanReferenceForAcceptedTurnStart",
+  const getPendingTurnStartForAcceptedProviderTurn = Effect.fn(
+    "getPendingTurnStartForAcceptedProviderTurn",
   )(function* (threadId: ThreadId, eventTurnId: TurnId | undefined) {
     if (eventTurnId === undefined) {
-      return null;
+      return Option.none();
     }
 
     const expectedTurnId = yield* getExpectedProviderTurnIdForThread(threadId);
     if (!sameId(expectedTurnId, eventTurnId)) {
-      return null;
+      return Option.none();
     }
 
-    return yield* getSourceProposedPlanReferenceForPendingTurnStart(threadId);
+    return yield* projectionTurnRepository.getPendingTurnStartByThreadId({ threadId });
   });
 
   const markSourceProposedPlanImplemented = Effect.fn("markSourceProposedPlanImplemented")(
@@ -1268,10 +1247,19 @@ const make = Effect.gen(function* () {
             return true;
         }
       })();
-      const acceptedTurnStartedSourcePlan =
+      const acceptedPendingTurnStart =
         event.type === "turn.started" && shouldApplyThreadLifecycle
-          ? yield* getSourceProposedPlanReferenceForAcceptedTurnStart(thread.id, eventTurnId)
-          : null;
+          ? yield* getPendingTurnStartForAcceptedProviderTurn(thread.id, eventTurnId)
+          : Option.none();
+      const acceptedTurnStartedSourcePlan = Option.isSome(acceptedPendingTurnStart)
+        ? acceptedPendingTurnStart.value.sourceProposedPlanThreadId !== null &&
+          acceptedPendingTurnStart.value.sourceProposedPlanId !== null
+          ? {
+              sourceThreadId: acceptedPendingTurnStart.value.sourceProposedPlanThreadId,
+              sourcePlanId: acceptedPendingTurnStart.value.sourceProposedPlanId,
+            }
+          : null
+        : null;
 
       if (
         event.type === "session.started" ||
@@ -1317,6 +1305,12 @@ const make = Effect.gen(function* () {
                 : (thread.session?.lastError ?? null);
 
         if (shouldApplyThreadLifecycle) {
+          if (event.type === "turn.started" && Option.isSome(acceptedPendingTurnStart)) {
+            yield* McpSessionRegistry.admitActiveNotebookDocumentAuthorityTurn({
+              threadId: thread.id,
+              messageId: acceptedPendingTurnStart.value.messageId,
+            });
+          }
           if (event.type === "turn.started" && acceptedTurnStartedSourcePlan !== null) {
             yield* markSourceProposedPlanImplemented(
               acceptedTurnStartedSourcePlan.sourceThreadId,
