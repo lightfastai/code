@@ -22,6 +22,8 @@ public final class T3StudyCanvasView: ExpoView, PKCanvasViewDelegate {
   private var centeredInitialViewport = false
   private var observingToolPicker = false
   private var isRestoringDrawing = false
+  private var isFrozen = false
+  private var frozenDrawing: PKDrawing?
 
   public required init(appContext: AppContext? = nil) {
     super.init(appContext: appContext)
@@ -107,16 +109,20 @@ public final class T3StudyCanvasView: ExpoView, PKCanvasViewDelegate {
   }
 
   public func setSelectionMode(_ enabled: Bool) {
+    guard !isFrozen else {
+      return
+    }
     if selectionMode, !enabled {
       clearSelection()
     }
     selectionMode = enabled
-    selectionOverlay.isUserInteractionEnabled = enabled
-    canvasView.isUserInteractionEnabled = !enabled
-    updateToolPickerVisibility()
+    updateInteractionState()
   }
 
   public func loadDrawing(dataBase64: String, revision: Int) throws {
+    guard !isFrozen else {
+      return
+    }
     guard let data = Data(base64Encoded: dataBase64) else {
       throw NSError(
         domain: "T3StudyCanvas",
@@ -131,8 +137,17 @@ public final class T3StudyCanvasView: ExpoView, PKCanvasViewDelegate {
     canvasView.drawing = drawing
   }
 
-  public func exportDrawing() -> String {
-    canvasView.drawing.dataRepresentation().base64EncodedString()
+  public func exportSnapshot() -> [String: Any] {
+    drawingSnapshotPayload()
+  }
+
+  public func freezeAndExportSnapshot() -> [String: Any] {
+    setFrozen(true)
+    return drawingSnapshotPayload()
+  }
+
+  public func unfreeze() {
+    setFrozen(false)
   }
 
   public func exportRegion() -> [String: Any] {
@@ -156,15 +171,21 @@ public final class T3StudyCanvasView: ExpoView, PKCanvasViewDelegate {
   }
 
   public func undo() {
+    guard !isFrozen else {
+      return
+    }
     canvasView.undoManager?.undo()
   }
 
   public func redo() {
+    guard !isFrozen else {
+      return
+    }
     canvasView.undoManager?.redo()
   }
 
   public func clear() {
-    guard !canvasView.drawing.strokes.isEmpty else {
+    guard !isFrozen, !canvasView.drawing.strokes.isEmpty else {
       return
     }
     canvasView.drawing = PKDrawing()
@@ -172,6 +193,9 @@ public final class T3StudyCanvasView: ExpoView, PKCanvasViewDelegate {
   }
 
   public func clearSelection() {
+    guard !isFrozen else {
+      return
+    }
     selectionStart = nil
     selectionRectInOverlay = nil
     selectionRectInCanvas = nil
@@ -183,10 +207,18 @@ public final class T3StudyCanvasView: ExpoView, PKCanvasViewDelegate {
     guard !isRestoringDrawing else {
       return
     }
+    guard !isFrozen else {
+      restoreFrozenDrawing()
+      return
+    }
     drawingDidChange()
   }
 
   private func drawingDidChange() {
+    guard !isFrozen else {
+      restoreFrozenDrawing()
+      return
+    }
     revision += 1
     var payload: [String: Any] = ["revision": revision]
     let bounds = canvasView.drawing.bounds
@@ -200,13 +232,19 @@ public final class T3StudyCanvasView: ExpoView, PKCanvasViewDelegate {
     guard window != nil else {
       return
     }
-    toolPicker.setVisible(!selectionMode, forFirstResponder: canvasView)
-    if !selectionMode {
+    let visible = !selectionMode && !isFrozen
+    toolPicker.setVisible(visible, forFirstResponder: canvasView)
+    if visible {
       canvasView.becomeFirstResponder()
+    } else {
+      canvasView.resignFirstResponder()
     }
   }
 
   @objc private func handleSelectionPan(_ gesture: UIPanGestureRecognizer) {
+    guard !isFrozen else {
+      return
+    }
     let point = gesture.location(in: selectionOverlay)
     switch gesture.state {
     case .began:
@@ -264,6 +302,47 @@ public final class T3StudyCanvasView: ExpoView, PKCanvasViewDelegate {
       return
     }
     selectionLayer.path = UIBezierPath(roundedRect: rect, cornerRadius: 8).cgPath
+  }
+
+  private func setFrozen(_ frozen: Bool) {
+    guard frozen != isFrozen else {
+      return
+    }
+    if frozen {
+      frozenDrawing = canvasView.drawing
+    } else {
+      frozenDrawing = nil
+    }
+    isFrozen = frozen
+    updateInteractionState()
+  }
+
+  private func updateInteractionState() {
+    canvasView.isUserInteractionEnabled = !isFrozen && !selectionMode
+    selectionOverlay.isUserInteractionEnabled = !isFrozen && selectionMode
+    updateToolPickerVisibility()
+  }
+
+  private func restoreFrozenDrawing() {
+    guard let frozenDrawing,
+          canvasView.drawing.dataRepresentation() != frozenDrawing.dataRepresentation() else {
+      return
+    }
+    isRestoringDrawing = true
+    canvasView.drawing = frozenDrawing
+    isRestoringDrawing = false
+  }
+
+  private func drawingSnapshotPayload() -> [String: Any] {
+    var payload: [String: Any] = [
+      "drawingDataBase64": canvasView.drawing.dataRepresentation().base64EncodedString(),
+      "revision": revision,
+    ]
+    let bounds = canvasView.drawing.bounds
+    if !bounds.isNull, !bounds.isEmpty {
+      payload["contentBounds"] = rectPayload(bounds)
+    }
+    return payload
   }
 
   private func rectPayload(_ rect: CGRect) -> [String: Double] {

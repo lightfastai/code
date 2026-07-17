@@ -93,6 +93,7 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
   });
   const loadedDrawingRef = useRef(false);
   const mountedRef = useRef(true);
+  const removalPendingRef = useRef(false);
   const removalCoordinator = useMemo(
     () => createStudyCanvasRemovalCoordinator<StudyCanvasRemovalAction>(),
     [],
@@ -128,15 +129,14 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
 
   const persistLatestDrawing = useCallback(async () => {
     const surface = canvasRef.current;
-    if (!nativeAvailable || !surface || !loadedDrawingRef.current) return;
-    const snapshot = { ...latestDrawingRef.current };
+    if (!nativeAvailable || !surface || !loadedDrawingRef.current || removalPendingRef.current)
+      return;
     try {
       if (mountedRef.current) setStatus("saving");
       await saveStudyCanvasSurfaceSnapshot({
         surface,
         canvasId,
         title: canvasTitle,
-        snapshot,
         save: saveStudyCanvasSnapshot,
       });
       if (mountedRef.current) {
@@ -212,6 +212,7 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
 
   const handleDrawingChange = useCallback(
     (event: { readonly nativeEvent: StudyCanvasDrawingChangeEvent }) => {
+      if (removalPendingRef.current) return;
       latestDrawingRef.current = {
         revision: event.nativeEvent.revision,
         ...(event.nativeEvent.contentBounds
@@ -230,6 +231,7 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
 
   const handleSelectionChange = useCallback(
     (event: { readonly nativeEvent: StudyCanvasSelectionChangeEvent }) => {
+      if (removalPendingRef.current) return;
       setSelectedRegion(event.nativeEvent.selected ? (event.nativeEvent.rect ?? null) : null);
     },
     [],
@@ -287,6 +289,8 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
         setError("The canvas is still loading. Try again in a moment.");
         return;
       }
+      if (removalPendingRef.current) return;
+      removalPendingRef.current = true;
 
       const request = removalCoordinator.request({
         action,
@@ -294,7 +298,6 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
         surface,
         canvasId,
         title: canvasTitle,
-        snapshot: { ...latestDrawingRef.current },
         save: saveStudyCanvasSnapshot,
         onReadyToRemove: (readyAction) => {
           if (mountedRef.current) setPendingRemovalAction(readyAction);
@@ -305,16 +308,14 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
       setFinishing(true);
       setStatus("saving");
       setError(null);
-      void request.completion
-        .catch((cause) => {
-          if (mountedRef.current) {
-            setStatus("error");
-            setError(cause instanceof Error ? cause.message : "Could not save the canvas.");
-          }
-        })
-        .finally(() => {
-          if (mountedRef.current) setFinishing(false);
-        });
+      void request.completion.catch((cause) => {
+        removalPendingRef.current = false;
+        if (mountedRef.current) {
+          setFinishing(false);
+          setStatus("error");
+          setError(cause instanceof Error ? cause.message : "Could not save the canvas.");
+        }
+      });
     },
     [cancelScheduledSave, canvasId, removalCoordinator],
   );
@@ -339,6 +340,16 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
     navigation.goBack();
   }, [navigation]);
 
+  const handleSelectionModeToggle = useCallback(() => {
+    if (removalPendingRef.current) return;
+    setSelectionMode((current) => !current);
+  }, []);
+
+  const handleCanvasMutation = useCallback((mutation: "undo" | "redo" | "clear") => {
+    if (removalPendingRef.current) return;
+    void canvasRef.current?.[mutation]();
+  }, []);
+
   const renderStudyCanvasHeaderRight = useCallback(
     () => <StudyCanvasHeaderButton disabled={finishing} onPress={() => void handleDone()} />,
     [finishing, handleDone],
@@ -355,6 +366,7 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
 
       <StudyCanvasSurface
         ref={canvasRef}
+        pointerEvents={finishing ? "none" : "auto"}
         selectionMode={selectionMode}
         onDrawingChange={handleDrawingChange}
         onSelectionChange={handleSelectionChange}
@@ -408,26 +420,30 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
           <ComposerToolbarButton
             accessibilityLabel={selectionMode ? "Return to drawing" : "Select a canvas region"}
             active={selectionMode}
+            disabled={finishing}
             icon={selectionMode ? "pencil.tip" : "crop"}
             label={selectionMode ? "Draw" : "Select"}
-            onPress={() => setSelectionMode((current) => !current)}
+            onPress={handleSelectionModeToggle}
           />
           <ComposerToolbarButton
             accessibilityLabel="Undo drawing"
+            disabled={finishing}
             icon="arrow.uturn.backward"
-            onPress={() => void canvasRef.current?.undo()}
+            onPress={() => handleCanvasMutation("undo")}
             showChevron={false}
           />
           <ComposerToolbarButton
             accessibilityLabel="Redo drawing"
+            disabled={finishing}
             icon="arrow.clockwise"
-            onPress={() => void canvasRef.current?.redo()}
+            onPress={() => handleCanvasMutation("redo")}
             showChevron={false}
           />
           <ComposerToolbarButton
             accessibilityLabel="Clear drawing"
+            disabled={finishing}
             icon="trash"
-            onPress={() => void canvasRef.current?.clear()}
+            onPress={() => handleCanvasMutation("clear")}
             showChevron={false}
           />
           <View className="flex-1" />

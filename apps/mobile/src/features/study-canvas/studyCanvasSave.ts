@@ -1,9 +1,6 @@
 import type { StudyCanvasRegion } from "@t3tools/contracts";
 
-export interface StudyCanvasSaveSnapshot {
-  readonly revision: number;
-  readonly contentBounds?: StudyCanvasRegion;
-}
+import type { StudyCanvasSurfaceSnapshot } from "./StudyCanvasSurface.types";
 
 export interface StudyCanvasSaveInput {
   readonly canvasId: string;
@@ -14,41 +11,76 @@ export interface StudyCanvasSaveInput {
 }
 
 interface StudyCanvasExportSurface {
-  readonly exportDrawing: () => Promise<string>;
+  readonly exportSnapshot: () => Promise<StudyCanvasSurfaceSnapshot>;
+}
+
+interface StudyCanvasRemovalSurface {
+  readonly freezeAndExportSnapshot: () => Promise<StudyCanvasSurfaceSnapshot>;
+  readonly unfreeze: () => Promise<void>;
+}
+
+async function persistExportedSnapshot(input: {
+  readonly canvasId: string;
+  readonly title: string;
+  readonly exportedSnapshot: Promise<StudyCanvasSurfaceSnapshot>;
+  readonly save: (snapshot: StudyCanvasSaveInput) => Promise<unknown>;
+}): Promise<void> {
+  const snapshot = await input.exportedSnapshot;
+  await input.save({
+    canvasId: input.canvasId,
+    title: input.title,
+    revision: snapshot.revision,
+    drawingDataBase64: snapshot.drawingDataBase64,
+    ...(snapshot.contentBounds ? { contentBounds: snapshot.contentBounds } : {}),
+  });
 }
 
 export async function saveStudyCanvasSurfaceSnapshot(input: {
   readonly surface: StudyCanvasExportSurface;
   readonly canvasId: string;
   readonly title: string;
-  readonly snapshot: StudyCanvasSaveSnapshot;
   readonly save: (snapshot: StudyCanvasSaveInput) => Promise<unknown>;
 }): Promise<void> {
-  // Invoke the native export before yielding so callers can capture the view
-  // while its ref is still live during an explicit Done action.
-  const drawingExport = input.surface.exportDrawing();
-  const drawingDataBase64 = await drawingExport;
-  await input.save({
+  // Invoke native export before yielding. Native returns bytes and revision
+  // from one snapshot so asynchronous bridge timing cannot pair mismatched data.
+  const exportedSnapshot = input.surface.exportSnapshot();
+  await persistExportedSnapshot({
     canvasId: input.canvasId,
     title: input.title,
-    revision: input.snapshot.revision,
-    drawingDataBase64,
-    ...(input.snapshot.contentBounds ? { contentBounds: input.snapshot.contentBounds } : {}),
+    exportedSnapshot,
+    save: input.save,
   });
 }
 
-export async function finishStudyCanvas(
-  input: Parameters<typeof saveStudyCanvasSurfaceSnapshot>[0] & {
-    readonly onSaved: () => void | Promise<void>;
-  },
-): Promise<void> {
-  await saveStudyCanvasSurfaceSnapshot(input);
-  await input.onSaved();
+export async function finishStudyCanvas(input: {
+  readonly surface: StudyCanvasRemovalSurface;
+  readonly canvasId: string;
+  readonly title: string;
+  readonly save: (snapshot: StudyCanvasSaveInput) => Promise<unknown>;
+  readonly onSaved: () => void | Promise<void>;
+}): Promise<void> {
+  // This is one native operation: it freezes every mutation path before
+  // reading drawing bytes, revision, and bounds from the same native state.
+  const exportedSnapshot = input.surface.freezeAndExportSnapshot();
+  try {
+    await persistExportedSnapshot({
+      canvasId: input.canvasId,
+      title: input.title,
+      exportedSnapshot,
+      save: input.save,
+    });
+    await input.onSaved();
+  } catch (cause) {
+    await input.surface.unfreeze();
+    throw cause;
+  }
 }
 
-export type StudyCanvasRemovalRequest<Action> = Parameters<
-  typeof saveStudyCanvasSurfaceSnapshot
->[0] & {
+export type StudyCanvasRemovalRequest<Action> = {
+  readonly surface: StudyCanvasRemovalSurface;
+  readonly canvasId: string;
+  readonly title: string;
+  readonly save: (snapshot: StudyCanvasSaveInput) => Promise<unknown>;
   readonly action: Action;
   readonly cancelScheduledSave: () => void;
   readonly onReadyToRemove: (action: Action) => void | Promise<void>;
@@ -75,7 +107,6 @@ export function createStudyCanvasRemovalCoordinator<Action>(): {
           surface: input.surface,
           canvasId: input.canvasId,
           title: input.title,
-          snapshot: input.snapshot,
           save: input.save,
           onSaved: () => input.onReadyToRemove(input.action),
         });

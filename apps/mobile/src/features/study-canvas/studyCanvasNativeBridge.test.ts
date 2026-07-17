@@ -45,4 +45,48 @@ describe("study canvas route removal guard", () => {
     expect(routeSource).toContain("navigation.dispatch(pendingRemovalAction)");
     expect(routeSource).toMatch(/onReadyToRemove:[\s\S]*setPendingRemovalAction\(readyAction\)/);
   });
+
+  it("uses the native atomic freeze snapshot and keeps JS mutation paths disabled", () => {
+    expect(typesSource).toMatch(
+      /freezeAndExportSnapshot:\s*\(\)\s*=>\s*Promise<StudyCanvasSurfaceSnapshot>/,
+    );
+    expect(typesSource).toMatch(/unfreeze:\s*\(\)\s*=>\s*Promise<void>/);
+    expect(routeSource).toContain("if (removalPendingRef.current) return;");
+    expect(routeSource).toMatch(/disabled=\{finishing\}[\s\S]*accessibilityLabel="Undo drawing"/);
+    expect(routeSource).toMatch(/accessibilityLabel="Undo drawing"[\s\S]*disabled=\{finishing\}/);
+    expect(routeSource).toMatch(/accessibilityLabel="Redo drawing"[\s\S]*disabled=\{finishing\}/);
+    expect(routeSource).toMatch(/accessibilityLabel="Clear drawing"[\s\S]*disabled=\{finishing\}/);
+  });
+});
+
+describe("native study canvas removal freeze", () => {
+  it("exports drawing bytes, revision, and bounds atomically after freezing", () => {
+    expect(moduleSource).toMatch(
+      /AsyncFunction\("freezeAndExportSnapshot"\)[\s\S]*view\.freezeAndExportSnapshot\(\)/,
+    );
+    expect(moduleSource).toMatch(/AsyncFunction\("unfreeze"\)[\s\S]*view\.unfreeze\(\)/);
+    expect(viewSource).toMatch(
+      /func freezeAndExportSnapshot\(\)[\s\S]*setFrozen\(true\)[\s\S]*drawingSnapshotPayload\(\)/,
+    );
+    expect(viewSource).toMatch(
+      /private func drawingSnapshotPayload\(\)[\s\S]*"drawingDataBase64"[\s\S]*"revision": revision[\s\S]*"contentBounds"/,
+    );
+  });
+
+  it("blocks PencilKit, tool selection, undo, redo, clear, and selection mutations while frozen", () => {
+    expect(viewSource).toMatch(/func setSelectionMode[\s\S]*guard !isFrozen/);
+    expect(viewSource).toMatch(/func loadDrawing[\s\S]*guard !isFrozen/);
+    expect(viewSource).toMatch(/func undo\(\)[\s\S]*guard !isFrozen/);
+    expect(viewSource).toMatch(/func redo\(\)[\s\S]*guard !isFrozen/);
+    expect(viewSource).toMatch(/func clear\(\)[\s\S]*guard !isFrozen/);
+    expect(viewSource).toMatch(/func clearSelection\(\)[\s\S]*guard !isFrozen/);
+    expect(viewSource).toMatch(/handleSelectionPan[\s\S]*guard !isFrozen/);
+    expect(viewSource).toMatch(
+      /canvasViewDrawingDidChange[\s\S]*guard !isFrozen else[\s\S]*restoreFrozenDrawing\(\)/,
+    );
+    expect(viewSource).toMatch(
+      /setFrozen[\s\S]*canvasView\.isUserInteractionEnabled[\s\S]*selectionOverlay\.isUserInteractionEnabled/,
+    );
+    expect(viewSource).toMatch(/updateToolPickerVisibility[\s\S]*!isFrozen/);
+  });
 });

@@ -15,8 +15,16 @@ public final class T3StudyCanvasModule: Module {
         try view.loadDrawing(dataBase64: dataBase64, revision: revision)
       }
 
-      AsyncFunction("exportDrawing") { (view: T3StudyCanvasView) -> String in
-        view.exportDrawing()
+      AsyncFunction("exportSnapshot") { (view: T3StudyCanvasView) -> [String: Any] in
+        view.exportSnapshot()
+      }
+
+      AsyncFunction("freezeAndExportSnapshot") { (view: T3StudyCanvasView) -> [String: Any] in
+        view.freezeAndExportSnapshot()
+      }
+
+      AsyncFunction("unfreeze") { (view: T3StudyCanvasView) in
+        view.unfreeze()
       }
 
       AsyncFunction("exportRegion") { (view: T3StudyCanvasView) -> [String: Any] in
