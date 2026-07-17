@@ -13,6 +13,7 @@ TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 @dataclass(frozen=True)
 class StudyScope:
     document_ids: tuple[str, ...] = ()
+    has_explicit_selection: bool = False
 
 
 def scope_from_participant_metadata(raw: str) -> StudyScope:
@@ -22,15 +23,24 @@ def scope_from_participant_metadata(raw: str) -> StudyScope:
         payload = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
         return StudyScope()
-    selected = payload.get("selectedDocuments", []) if isinstance(payload, dict) else []
-    document_ids = tuple(
-        item["documentId"]
-        for item in selected
-        if isinstance(item, dict)
-        and isinstance(item.get("documentId"), str)
-        and re.fullmatch(r"[0-9a-f]{64}", item["documentId"])
-    )
-    return StudyScope(document_ids=document_ids[:32])
+    if not isinstance(payload, dict) or "selectedDocuments" not in payload:
+        return StudyScope()
+    selected = payload["selectedDocuments"]
+    if not isinstance(selected, list) or len(selected) > 32:
+        return StudyScope()
+
+    document_ids: list[str] = []
+    seen: set[str] = set()
+    for item in selected:
+        if not isinstance(item, dict):
+            return StudyScope()
+        document_id = item.get("documentId")
+        if not isinstance(document_id, str) or not re.fullmatch(r"[0-9a-f]{64}", document_id):
+            return StudyScope()
+        if document_id not in seen:
+            seen.add(document_id)
+            document_ids.append(document_id)
+    return StudyScope(document_ids=tuple(document_ids), has_explicit_selection=True)
 
 
 class LocalStudyLibrary:
@@ -46,6 +56,8 @@ class LocalStudyLibrary:
         return [document for document in documents if isinstance(document, dict)]
 
     def list_documents(self, scope: StudyScope) -> list[dict[str, Any]]:
+        if not scope.has_explicit_selection:
+            return []
         allowed = set(scope.document_ids)
         return [
             {
@@ -55,7 +67,7 @@ class LocalStudyLibrary:
                 "tags": document.get("tags", []),
             }
             for document in self._index()
-            if not allowed or document.get("id") in allowed
+            if document.get("id") in allowed
         ]
 
     def _derived_document(self, document_id: str) -> dict[str, Any] | None:

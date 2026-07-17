@@ -180,9 +180,22 @@ export class StudyLibraryRequestError extends Schema.TaggedErrorClass<StudyLibra
 ) {}
 
 export const StudyVoiceSessionInput = Schema.Struct({
-  documentIds: Schema.optional(Schema.Array(StudyDocumentId).check(Schema.isMaxLength(32))),
+  documentIds: Schema.Array(StudyDocumentId).check(Schema.isMaxLength(32)),
 });
 export type StudyVoiceSessionInput = typeof StudyVoiceSessionInput.Type;
+
+export const StudyVoiceParticipantMetadata = Schema.Struct({
+  version: Schema.Literal(1),
+  selectedDocuments: Schema.Array(
+    Schema.Struct({
+      documentId: StudyDocumentId,
+      title: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+      format: StudyDocumentFormat,
+      tags: Schema.Array(StudyTag).check(Schema.isMaxLength(64)),
+    }),
+  ).check(Schema.isMaxLength(32)),
+});
+export type StudyVoiceParticipantMetadata = typeof StudyVoiceParticipantMetadata.Type;
 
 export const StudyVoiceSessionResult = Schema.Struct({
   url: TrimmedNonEmptyString.check(Schema.isMaxLength(2_048)),

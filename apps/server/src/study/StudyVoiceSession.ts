@@ -2,6 +2,7 @@ import * as NodeCrypto from "node:crypto";
 
 import {
   StudyVoiceSessionError,
+  type StudyVoiceParticipantMetadata,
   type StudyVoiceSessionInput,
   type StudyVoiceSessionResult,
 } from "@t3tools/contracts";
@@ -74,7 +75,7 @@ export const createStudyVoiceSession = Effect.fn("StudyVoiceSession.create")(fun
         }),
     ),
   );
-  const requestedIds = Array.from(new Set(input.request.documentIds ?? []));
+  const requestedIds = Array.from(new Set(input.request.documentIds));
   const selectedDocuments = requestedIds.map((documentId) =>
     index.documents.find((document) => document.id === documentId),
   );
@@ -84,6 +85,18 @@ export const createStudyVoiceSession = Effect.fn("StudyVoiceSession.create")(fun
       message: "One or more selected study books are no longer available.",
     });
   }
+
+  const participantMetadata = {
+    version: 1,
+    selectedDocuments: selectedDocuments
+      .filter((document) => document !== undefined)
+      .map((document) => ({
+        documentId: document.id,
+        title: document.title,
+        format: document.format,
+        tags: document.tags,
+      })),
+  } satisfies StudyVoiceParticipantMetadata;
 
   const id = (input.randomUUID ?? NodeCrypto.randomUUID)();
   const roomName = `study-${id}`;
@@ -95,17 +108,7 @@ export const createStudyVoiceSession = Effect.fn("StudyVoiceSession.create")(fun
         identity: `study-user-${id}`,
         roomName,
         agentName: environment.agentName?.trim() || "t3-study-voice",
-        metadata: {
-          version: 1,
-          selectedDocuments: selectedDocuments
-            .filter((document) => document !== undefined)
-            .map((document) => ({
-              documentId: document.id,
-              title: document.title,
-              format: document.format,
-              tags: document.tags,
-            })),
-        },
+        metadata: participantMetadata,
         ttlSeconds: 15 * 60,
         ...(input.nowEpochSeconds === undefined ? {} : { nowEpochSeconds: input.nowEpochSeconds }),
       }),

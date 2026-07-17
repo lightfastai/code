@@ -6,10 +6,14 @@ import {
   STUDY_EXTRACTED_MAX_SEGMENTS,
   StudyExtractedDocument,
   StudyTextSegment,
+  StudyVoiceParticipantMetadata,
+  StudyVoiceSessionInput,
 } from "./study.ts";
 
 const decodeSegment = Schema.decodeUnknownSync(StudyTextSegment);
 const decodeDocument = Schema.decodeUnknownSync(StudyExtractedDocument);
+const decodeVoiceSessionInput = Schema.decodeUnknownSync(StudyVoiceSessionInput);
+const decodeVoiceParticipantMetadata = Schema.decodeUnknownSync(StudyVoiceParticipantMetadata);
 const documentId = "a".repeat(64);
 const segment = {
   id: "segment-0",
@@ -55,6 +59,27 @@ describe("study extraction contracts", () => {
           order,
         })),
         extractedAt,
+      }),
+    ).toThrow();
+  });
+});
+
+describe("study voice contracts", () => {
+  it("requires an explicit selected-document list, including for an empty scope", () => {
+    expect(decodeVoiceSessionInput({ documentIds: [] })).toEqual({ documentIds: [] });
+    expect(() => decodeVoiceSessionInput({})).toThrow();
+  });
+
+  it("requires explicit, fully valid participant selection metadata", () => {
+    expect(decodeVoiceParticipantMetadata({ version: 1, selectedDocuments: [] })).toEqual({
+      version: 1,
+      selectedDocuments: [],
+    });
+    expect(() => decodeVoiceParticipantMetadata({ version: 1 })).toThrow();
+    expect(() =>
+      decodeVoiceParticipantMetadata({
+        version: 1,
+        selectedDocuments: [{ documentId: "invalid" }],
       }),
     ).toThrow();
   });

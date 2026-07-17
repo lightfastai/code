@@ -79,7 +79,7 @@ class StudyVoiceAssistant(Agent):
         self.library = library
         self.scope = scope
         self.scene = scene
-        selected = library.list_documents(scope)
+        selected = library.list_documents(scope) if scope.has_explicit_selection else []
         selected_titles = ", ".join(str(item.get("title")) for item in selected) or "none"
         super().__init__(instructions=f"{skill.instructions}\n\nSelected books: {selected_titles}.")
 

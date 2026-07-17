@@ -5,13 +5,22 @@ import * as Effect from "effect/Effect";
 import { resolveStudyLibraryPaths } from "./StudyLibrary.ts";
 import { createStudyVoiceSession } from "./StudyVoiceSession.ts";
 
+function participantMetadata(token: string): unknown {
+  const payloadSegment = token.split(".")[1];
+  if (!payloadSegment) throw new Error("JWT payload is missing.");
+  const payload = JSON.parse(Buffer.from(payloadSegment, "base64url").toString("utf8")) as {
+    metadata?: string;
+  };
+  return payload.metadata === undefined ? undefined : JSON.parse(payload.metadata);
+}
+
 it.layer(NodeServices.layer)("StudyVoiceSession", (it) => {
   it.effect("issues a room-scoped session without exposing provider secrets", () =>
     Effect.gen(function* () {
       const paths = yield* resolveStudyLibraryPaths("/tmp/t3-study-voice-test");
       const session = yield* createStudyVoiceSession({
         paths,
-        request: {},
+        request: { documentIds: [] },
         environment: {
           liveKitUrl: "wss://voice.example.test",
           liveKitApiKey: "test-key",
@@ -28,6 +37,10 @@ it.layer(NodeServices.layer)("StudyVoiceSession", (it) => {
         expiresAt: "2026-07-15T00:15:00.000Z",
       });
       expect(session.token).not.toContain("test-secret");
+      expect(participantMetadata(session.token)).toEqual({
+        version: 1,
+        selectedDocuments: [],
+      });
     }),
   );
 
@@ -36,7 +49,7 @@ it.layer(NodeServices.layer)("StudyVoiceSession", (it) => {
       const paths = yield* resolveStudyLibraryPaths("/tmp/t3-study-voice-test");
       const error = yield* createStudyVoiceSession({
         paths,
-        request: {},
+        request: { documentIds: [] },
         environment: {},
       }).pipe(Effect.flip);
 
