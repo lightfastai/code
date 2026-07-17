@@ -3,9 +3,18 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   NOTEBOOK_RUNTIME_CACHE_MAX_ENTRIES,
   NotebookRuntimeCache,
+  notebookRuntimeCacheKey,
 } from "./notebookRuntimeCache.ts";
 
 describe("NotebookRuntimeCache", () => {
+  it("isolates immutable revisions even if a caller accidentally reuses a session ID", () => {
+    const scope = { environmentId: "environment-1", projectId: "project-1" };
+    const first = notebookRuntimeCacheKey(scope, "session-1", "a".repeat(64));
+    const second = notebookRuntimeCacheKey(scope, "session-1", "b".repeat(64));
+
+    expect(first).not.toBe(second);
+  });
+
   it("bounds retained sessions with LRU eviction and supports explicit disposal", () => {
     const cache = new NotebookRuntimeCache<number>(3);
     cache.set("session-1", 1);

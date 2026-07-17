@@ -82,6 +82,30 @@ const controller = (overrides: Partial<NotebookArtifactController>): NotebookArt
   }) as NotebookArtifactController;
 
 describe("notebook runtime lifecycle", () => {
+  it("gives immutable revisions of one document distinct bounded runtime identities", () => {
+    const first = revision("same-doc", {
+      name: "python3",
+      displayName: "Python 3",
+      language: "python",
+    });
+    const second: NotebookRevision = {
+      ...first,
+      revisionId: hash("e"),
+      contentHash: hash("f"),
+    };
+
+    const firstTarget = notebookRuntimeTarget(createNotebookWorkingCopy(first));
+    const secondTarget = notebookRuntimeTarget(createNotebookWorkingCopy(second));
+
+    expect(firstTarget.sessionId).not.toBe(secondTarget.sessionId);
+    expect(firstTarget.revisionId).toBe(first.revisionId);
+    expect(secondTarget.revisionId).toBe(second.revisionId);
+    expect(firstTarget.sessionId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
+    expect(secondTarget.sessionId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
+    expect(firstTarget.sessionId.length).toBeLessThanOrEqual(128);
+    expect(secondTarget.sessionId.length).toBeLessThanOrEqual(128);
+  });
+
   it("retries the shared revision-load-and-connect flow and clears the load error", async () => {
     const loaded = revision("original-doc", {
       name: "python3",
@@ -115,9 +139,10 @@ describe("notebook runtime lifecycle", () => {
     expect(readRevision).toHaveBeenCalledTimes(2);
     expect(errors).toEqual([null, "revision unavailable", null]);
     expect(workingCopies).toEqual(["original-doc"]);
+    const target = notebookRuntimeTarget(createNotebookWorkingCopy(loaded));
     expect(connect).toHaveBeenCalledWith({
       scope,
-      sessionId: "notebook-original-doc",
+      ...target,
       kernelName: "python3",
       onState: expect.any(Function),
     });
@@ -134,6 +159,8 @@ describe("notebook runtime lifecycle", () => {
       displayName: "Julia 1.11",
       language: "julia",
     });
+    const originalTarget = notebookRuntimeTarget(createNotebookWorkingCopy(original));
+    const importedTarget = notebookRuntimeTarget(createNotebookWorkingCopy(imported));
     const order: string[] = [];
     const bindings = controller({
       importRevision: vi.fn(async () => imported),
@@ -183,20 +210,17 @@ describe("notebook runtime lifecycle", () => {
       },
     });
 
-    expect(notebookRuntimeTarget(current)).toEqual({
-      sessionId: "notebook-imported-doc",
-      kernelName: "julia-1.11",
-    });
+    expect(notebookRuntimeTarget(current)).toEqual(importedTarget);
     expect(order).toEqual([
-      "dispose:notebook-original-doc",
+      `dispose:${originalTarget.sessionId}`,
       "working:imported-doc",
-      "connect:notebook-imported-doc:julia-1.11",
-      "dispose:notebook-imported-doc",
+      `connect:${importedTarget.sessionId}:julia-1.11`,
+      `dispose:${importedTarget.sessionId}`,
       "working:original-doc",
-      "connect:notebook-original-doc:python3",
-      "dispose:notebook-original-doc",
+      `connect:${originalTarget.sessionId}:python3`,
+      `dispose:${originalTarget.sessionId}`,
       "working:imported-doc",
-      "connect:notebook-imported-doc:julia-1.11",
+      `connect:${importedTarget.sessionId}:julia-1.11`,
     ]);
   });
 
@@ -238,6 +262,8 @@ describe("notebook runtime lifecycle", () => {
     let retainedExecutionCounts = new Map([["code-1", 1]]);
     let current = applySavedNotebookRevision(createNotebookWorkingCopy(referenced), latest);
     const nextWorking = viewReferencedNotebookRevision(current);
+    const previousTarget = notebookRuntimeTarget(current);
+    const nextTarget = notebookRuntimeTarget(nextWorking);
     const order: string[] = [];
     const bindings = controller({
       dispose: vi.fn(async (request) => {
@@ -277,9 +303,9 @@ describe("notebook runtime lifecycle", () => {
     });
 
     expect(order).toEqual([
-      "dispose:notebook-same-doc",
+      `dispose:${previousTarget.sessionId}`,
       `working:${referenced.revisionId.slice(0, 8)}`,
-      "connect:notebook-same-doc:python3",
+      `connect:${nextTarget.sessionId}:python3`,
       "runtime:0",
     ]);
     expect(current.document.cells[0]).toMatchObject({ execution_count: null, outputs: [] });
@@ -295,6 +321,7 @@ describe("notebook runtime lifecycle", () => {
       }),
     );
     const order: string[] = [];
+    const target = notebookRuntimeTarget(current);
     const bindings = controller({
       dispose: vi.fn(async () => {
         order.push("dispose");
@@ -313,7 +340,7 @@ describe("notebook runtime lifecycle", () => {
       onWorkingCopy: () => order.push("working"),
     });
 
-    expect(order).toEqual(["working", "connect:notebook-same-doc:python3"]);
+    expect(order).toEqual(["working", `connect:${target.sessionId}:python3`]);
     expect(bindings.dispose).not.toHaveBeenCalled();
   });
 
@@ -388,6 +415,7 @@ describe("notebook runtime lifecycle", () => {
       displayName: "Julia 1.11",
       language: "julia",
     });
+    const importedTarget = notebookRuntimeTarget(createNotebookWorkingCopy(imported));
     const workingCopies: string[] = [];
     const bindings = controller({
       importRevision: vi.fn(async () => imported),
@@ -410,7 +438,11 @@ describe("notebook runtime lifecycle", () => {
 
     expect(workingCopies).toEqual(["imported-doc"]);
     expect(bindings.connect).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: "notebook-imported-doc", kernelName: "julia-1.11" }),
+      expect.objectContaining({
+        sessionId: importedTarget.sessionId,
+        revisionId: importedTarget.revisionId,
+        kernelName: "julia-1.11",
+      }),
     );
   });
 
@@ -426,6 +458,7 @@ describe("notebook runtime lifecycle", () => {
       language: "julia",
     });
     const current = applyImportedNotebookRevision(createNotebookWorkingCopy(original), imported);
+    const originalTarget = notebookRuntimeTarget(createNotebookWorkingCopy(original));
     const workingCopies: string[] = [];
     const bindings = controller({
       dispose: vi.fn(async () => {
@@ -447,7 +480,11 @@ describe("notebook runtime lifecycle", () => {
 
     expect(workingCopies).toEqual(["original-doc"]);
     expect(bindings.connect).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: "notebook-original-doc", kernelName: "python3" }),
+      expect.objectContaining({
+        sessionId: originalTarget.sessionId,
+        revisionId: originalTarget.revisionId,
+        kernelName: "python3",
+      }),
     );
   });
 

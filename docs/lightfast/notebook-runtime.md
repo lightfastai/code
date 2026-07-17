@@ -61,8 +61,9 @@ Expected mounts are empty or read-only `/books/book-N` bindings. `/tmp` and `/wo
 `HostConfig.Tmpfs`, not as writable host mounts. `NetworkMode` must be `none`, `ReadonlyRootfs` must
 be `true`, and `CapDrop` must contain `ALL`.
 
-Normal interruption, restart, disposal, server shutdown, and idle reaping remove owned containers.
-After the server has stopped, audit cleanup with:
+Interruption stops the active execution and restart replaces the kernel process, but both retain the
+same session container. Disposal, server shutdown, and idle reaping remove owned containers. After
+the server has stopped, audit cleanup with:
 
 ```bash
 docker ps --all --quiet --filter label=lightfast.notebook.project

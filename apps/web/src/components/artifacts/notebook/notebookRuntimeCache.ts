@@ -1,5 +1,11 @@
 export const NOTEBOOK_RUNTIME_CACHE_MAX_ENTRIES = 32;
 
+export const notebookRuntimeCacheKey = (
+  scope: { readonly environmentId: string; readonly projectId: string },
+  sessionId: string,
+  revisionId: string,
+): string => `${scope.environmentId}\0${scope.projectId}\0${revisionId}\0${sessionId}`;
+
 export class NotebookRuntimeCache<Value> {
   readonly #entries = new Map<string, Value>();
   readonly #maxEntries: number;

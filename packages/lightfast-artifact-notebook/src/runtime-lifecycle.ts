@@ -1,3 +1,5 @@
+import { sha256 } from "@noble/hashes/sha2";
+
 import type { NotebookRevision } from "./contracts.ts";
 import {
   applyImportedNotebookRevision,
@@ -12,16 +14,22 @@ import type {
 
 export type NotebookRuntimeTarget = {
   readonly sessionId: string;
+  readonly revisionId: string;
   readonly kernelName: string;
 };
 
-const sessionIdFor = (documentId: string): string =>
-  `notebook-${documentId}`.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 128);
+const utf8Encoder = new TextEncoder();
+const hex = (bytes: Uint8Array): string =>
+  Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+
+const sessionIdFor = (documentId: string, revisionId: string): string =>
+  `notebook-${hex(sha256(utf8Encoder.encode(documentId))).slice(0, 32)}-${revisionId}`;
 
 export const notebookRuntimeTarget = (
   working: Pick<NotebookWorkingCopy, "documentId" | "baseRevision">,
 ): NotebookRuntimeTarget => ({
-  sessionId: sessionIdFor(working.documentId),
+  sessionId: sessionIdFor(working.documentId, working.baseRevision.revisionId),
+  revisionId: working.baseRevision.revisionId,
   kernelName: working.baseRevision.kernel.name,
 });
 
@@ -136,6 +144,7 @@ export async function replaceNotebookWorkingCopyRuntime(
       await request.controller.dispose({
         scope: request.scope,
         sessionId: previousTarget.sessionId,
+        revisionId: previousTarget.revisionId,
         onState,
       });
     } catch (cause) {

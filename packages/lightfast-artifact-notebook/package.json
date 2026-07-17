@@ -29,6 +29,7 @@
     "test": "vp test run"
   },
   "dependencies": {
+    "@noble/hashes": "catalog:",
     "@t3tools/lightfast-capability-core": "workspace:*",
     "effect": "catalog:",
     "react": "19.2.6",
@@ -38,8 +39,10 @@
   "devDependencies": {
     "@effect/platform-node": "catalog:",
     "@effect/vitest": "catalog:",
+    "@testing-library/react": "16.3.2",
     "@types/react": "~19.2.14",
     "@types/react-dom": "~19.2.3",
+    "happy-dom": "20.10.6",
     "react-dom": "19.2.6",
     "vite-plus": "catalog:"
   }

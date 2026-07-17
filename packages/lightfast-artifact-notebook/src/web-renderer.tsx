@@ -93,6 +93,7 @@ export function NotebookArtifactEnvelopeRenderer({
   const importInput = useRef<HTMLInputElement | null>(null);
   const runtimeTarget = working === null ? null : notebookRuntimeTarget(working);
   const sessionId = runtimeTarget?.sessionId ?? "notebook-invalid";
+  const runtimeRevisionId = runtimeTarget?.revisionId ?? payload?.revisionId ?? "invalid";
 
   const onRuntimeState = useCallback((next: NotebookRuntimeView) => {
     if (!mounted.current) return;
@@ -226,6 +227,7 @@ export function NotebookArtifactEnvelopeRenderer({
       await bindings.controller.executeCell({
         scope: bindings.scope,
         sessionId: runtimeTarget.sessionId,
+        revisionId: runtimeTarget.revisionId,
         cellId: cell.id,
         code: cell.source,
         onState: onRuntimeState,
@@ -422,6 +424,7 @@ export function NotebookArtifactEnvelopeRenderer({
                   bindings.controller.interrupt({
                     scope: bindings.scope,
                     sessionId,
+                    revisionId: runtimeRevisionId,
                     onState: onRuntimeState,
                   }),
                 )
@@ -438,6 +441,7 @@ export function NotebookArtifactEnvelopeRenderer({
                   bindings.controller.restart({
                     scope: bindings.scope,
                     sessionId,
+                    revisionId: runtimeRevisionId,
                     onState: onRuntimeState,
                   }),
                 )
@@ -456,12 +460,14 @@ export function NotebookArtifactEnvelopeRenderer({
                     await bindings.controller.connect({
                       scope: bindings.scope,
                       sessionId,
+                      revisionId: runtimeRevisionId,
                       kernelName,
                       onState: onRuntimeState,
                     });
                     await bindings.controller.recover({
                       scope: bindings.scope,
                       sessionId,
+                      revisionId: runtimeRevisionId,
                       onState: onRuntimeState,
                     });
                     if (mounted.current) setRuntimeReady(true);
@@ -484,6 +490,7 @@ export function NotebookArtifactEnvelopeRenderer({
                   await bindings.controller.dispose({
                     scope: bindings.scope,
                     sessionId,
+                    revisionId: runtimeRevisionId,
                     onState: onRuntimeState,
                   });
                 })
@@ -524,6 +531,7 @@ export function NotebookArtifactEnvelopeRenderer({
                   bindings.controller.clearError({
                     scope: bindings.scope,
                     sessionId,
+                    revisionId: runtimeRevisionId,
                     onState: onRuntimeState,
                   });
                 }}
@@ -582,6 +590,7 @@ export function NotebookArtifactEnvelopeRenderer({
                         bindings.controller.removeCell({
                           scope: bindings.scope,
                           sessionId,
+                          revisionId: runtimeRevisionId,
                           cellId,
                           onState: onRuntimeState,
                         }),

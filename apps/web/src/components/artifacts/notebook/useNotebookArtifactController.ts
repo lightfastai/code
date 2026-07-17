@@ -22,7 +22,7 @@ import {
   notebookExecutionFailureMessage,
 } from "./notebookExecutionController";
 import { removeNotebookCellRuntimeWithState } from "./notebookCellController";
-import { NotebookRuntimeCache } from "./notebookRuntimeCache";
+import { NotebookRuntimeCache, notebookRuntimeCacheKey } from "./notebookRuntimeCache";
 
 const runtimeStates = new NotebookRuntimeCache<NotebookRuntimeState>();
 const connectionAttempts = new Map<string, Promise<void>>();
@@ -39,9 +39,6 @@ const rpcScope = (scope: NotebookProjectScope) => ({
   environmentId: EnvironmentId.make(scope.environmentId),
   projectId: ProjectId.make(scope.projectId),
 });
-
-const runtimeKey = (scope: NotebookProjectScope, sessionId: string): string =>
-  `${scope.environmentId}\0${scope.projectId}\0${sessionId}`;
 
 const isSessionNotFound = (cause: unknown): boolean =>
   typeof cause === "object" &&
@@ -84,16 +81,18 @@ export function useNotebookArtifactController(): NotebookArtifactController {
     type RuntimeRequest = {
       readonly scope: NotebookProjectScope;
       readonly sessionId: string;
+      readonly revisionId: string;
       readonly onState: (state: NotebookRuntimeView) => void;
     };
-    const current = (request: Pick<RuntimeRequest, "scope" | "sessionId">) =>
-      runtimeStates.get(runtimeKey(request.scope, request.sessionId)) ??
-      createNotebookRuntimeState();
+    const key = (request: Pick<RuntimeRequest, "scope" | "sessionId" | "revisionId">) =>
+      notebookRuntimeCacheKey(request.scope, request.sessionId, request.revisionId);
+    const current = (request: Pick<RuntimeRequest, "scope" | "sessionId" | "revisionId">) =>
+      runtimeStates.get(key(request)) ?? createNotebookRuntimeState();
     const publish = (
       request: RuntimeRequest,
       state: NotebookRuntimeState,
     ): NotebookRuntimeState => {
-      runtimeStates.set(runtimeKey(request.scope, request.sessionId), state);
+      runtimeStates.set(key(request), state);
       request.onState(state);
       return state;
     };
@@ -148,9 +147,9 @@ export function useNotebookArtifactController(): NotebookArtifactController {
         fail(request, cause);
       }
       if (type === "dispose") {
-        const key = runtimeKey(request.scope, request.sessionId);
-        runtimeStates.delete(key);
-        connectionAttempts.delete(key);
+        const requestKey = key(request);
+        runtimeStates.delete(requestKey);
+        connectionAttempts.delete(requestKey);
       }
     };
 
@@ -192,8 +191,8 @@ export function useNotebookArtifactController(): NotebookArtifactController {
         URL.revokeObjectURL(url);
       },
       connect: async (request) => {
-        const key = runtimeKey(request.scope, request.sessionId);
-        const existing = connectionAttempts.get(key);
+        const requestKey = key(request);
+        const existing = connectionAttempts.get(requestKey);
         if (existing !== undefined) {
           await existing;
           request.onState(current(request));
@@ -229,11 +228,11 @@ export function useNotebookArtifactController(): NotebookArtifactController {
             fail(request, cause);
           }
         })();
-        connectionAttempts.set(key, attempt);
+        connectionAttempts.set(requestKey, attempt);
         try {
           await attempt;
         } finally {
-          if (connectionAttempts.get(key) === attempt) connectionAttempts.delete(key);
+          if (connectionAttempts.get(requestKey) === attempt) connectionAttempts.delete(requestKey);
         }
       },
       recover: async (request) => {

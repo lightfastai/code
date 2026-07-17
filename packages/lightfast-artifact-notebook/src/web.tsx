@@ -67,6 +67,7 @@ export type NotebookAgentExecutionPermission = {
 type RuntimeRequest = {
   readonly scope: NotebookProjectScope;
   readonly sessionId: string;
+  readonly revisionId: string;
   readonly onState: (state: NotebookRuntimeView) => void;
 };
 
