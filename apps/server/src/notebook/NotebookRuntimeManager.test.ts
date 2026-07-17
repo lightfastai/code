@@ -35,6 +35,9 @@ class FakeDocker implements DockerCommandRunner {
   readonly #removalsReleased: Promise<void>;
   readonly releaseRemovals: () => void;
   holdRemovals = false;
+  exitNextContainerBeforeBootstrap = false;
+  failMissingContainerRemovals = false;
+  missingContainerReplacement: string | undefined;
   removeFailures = 0;
   runCount = 0;
   imageDigests: string[] = [];
@@ -66,6 +69,19 @@ class FakeDocker implements DockerCommandRunner {
     }
     if (args[0] === "rm") {
       const containerId = args.at(-1);
+      if (
+        containerId !== undefined &&
+        this.failMissingContainerRemovals &&
+        !this.activeContainers.has(containerId)
+      ) {
+        if (this.missingContainerReplacement !== undefined) {
+          this.activeContainers.add(this.missingContainerReplacement);
+        }
+        throw new NotebookRuntimeManagerError({
+          reason: "docker-failed",
+          message: `Docker command failed: Error response from daemon: No such container: ${containerId}`,
+        });
+      }
       if (containerId !== undefined) this.activeContainers.delete(containerId);
     }
     if (args[0] === "rm" && this.holdRemovals) {
@@ -77,6 +93,15 @@ class FakeDocker implements DockerCommandRunner {
       const containerId = `container-id-${this.runCount}`;
       this.activeContainers.add(containerId);
       return { stdout: `${containerId}\n` };
+    }
+    if (args[0] === "exec" && this.exitNextContainerBeforeBootstrap) {
+      this.exitNextContainerBeforeBootstrap = false;
+      const containerId = args[3];
+      if (containerId !== undefined) this.activeContainers.delete(containerId);
+      throw new NotebookRuntimeManagerError({
+        reason: "docker-failed",
+        message: `Docker command failed: Error response from daemon: No such container: ${containerId ?? "unknown"}`,
+      });
     }
     if (args[0] === "image") {
       return { stdout: `${this.imageDigests.shift() ?? `sha256:${"a".repeat(64)}`}\n` };
@@ -832,6 +857,84 @@ it("forwards controls, disposes sessions, reaps idle projects, and removes conta
   expect(docker.calls.some((call) => call.args.join(" ") === "rm --force container-id-2")).toBe(
     true,
   );
+});
+
+it("reaps idle sessions independently and admits a replacement under the project limit", async () => {
+  const { docker, manager, setNow } = await makeHarness({
+    idleTimeoutMs: 10,
+    maxSessionsPerProject: 4,
+    maxSessionsGlobal: 4,
+  });
+  for (const sessionId of ["session-a", "session-b", "session-c", "session-d"]) {
+    await manager.open({
+      projectId: "project-independent-idle",
+      sessionId,
+      commandId: `open-${sessionId}`,
+      kernelName: "python3",
+    });
+  }
+
+  setNow(1_005);
+  await Array.fromAsync(
+    manager.execute({
+      projectId: "project-independent-idle",
+      sessionId: "session-a",
+      commandId: "execute-a",
+      executionId: "execution-a",
+      cellId: "cell-a",
+      code: "print('still active')",
+    }),
+  );
+  setNow(1_011);
+  await manager.reapIdle();
+
+  expect(docker.activeContainers).toEqual(new Set(["container-id-1"]));
+  await expect(
+    manager.open({
+      projectId: "project-independent-idle",
+      sessionId: "session-e",
+      commandId: "open-e",
+      kernelName: "python3",
+    }),
+  ).resolves.toBeDefined();
+  expect(docker.activeContainers).toEqual(new Set(["container-id-1", "container-id-5"]));
+  expect(() => manager.eventsAfter("project-independent-idle", "session-b", 0)).toThrow(
+    expect.objectContaining({ reason: "session-not-found" }),
+  );
+  await manager.close();
+});
+
+it("forgets an owned --rm container that exited before bootstrap without removing a replacement", async () => {
+  const { docker, manager } = await makeHarness({
+    maxSessionsPerProject: 1,
+    maxSessionsGlobal: 1,
+  });
+  docker.exitNextContainerBeforeBootstrap = true;
+  docker.failMissingContainerRemovals = true;
+  docker.missingContainerReplacement = "external-replacement-container";
+
+  await expect(
+    manager.open({
+      projectId: "project-immediate-exit",
+      sessionId: "session-dead",
+      commandId: "open-dead",
+      kernelName: "python3",
+    }),
+  ).rejects.toMatchObject({ reason: "docker-failed" });
+
+  await expect(
+    manager.open({
+      projectId: "project-immediate-exit",
+      sessionId: "session-live",
+      commandId: "open-live",
+      kernelName: "python3",
+    }),
+  ).resolves.toBeDefined();
+  expect(docker.activeContainers).toContain("external-replacement-container");
+  expect(
+    docker.calls.filter((call) => call.args.includes("external-replacement-container")),
+  ).toHaveLength(0);
+  await manager.close();
 });
 
 it("replays a completed dispose after teardown and rejects a conflicting fingerprint", async () => {

@@ -7,6 +7,7 @@ import {
   render,
   type RenderResult,
   waitFor,
+  within,
 } from "@testing-library/react";
 import type { ArtifactEnvelope } from "@t3tools/lightfast-capability-core/artifacts";
 import { Fragment } from "react";
@@ -167,6 +168,95 @@ const expectWorkingCopyMutationControlsDisabled = (
 describe("NotebookArtifactEnvelopeRenderer interactions", () => {
   afterEach(() => cleanup());
 
+  it("mounts historical revisions without runtimes and connects only the revision first run", async () => {
+    const revisions = ["a", "b", "c", "d", "e"].map((character) => {
+      const value = revision(character, `print('${character}')`);
+      return {
+        ...value,
+        document: {
+          ...value.document,
+          cells: [
+            ...value.document.cells.map((cell) =>
+              cell.cell_type === "code"
+                ? {
+                    ...cell,
+                    execution_count: 1,
+                    outputs: [
+                      {
+                        output_type: "stream" as const,
+                        name: "stdout" as const,
+                        text: `static-${character}\n`,
+                      },
+                    ],
+                  }
+                : cell,
+            ),
+            ...(character === "d"
+              ? [
+                  {
+                    cell_type: "code" as const,
+                    id: "code-2",
+                    metadata: {},
+                    source: "print('second')",
+                    execution_count: null,
+                    outputs: [],
+                  },
+                ]
+              : []),
+          ],
+        },
+      } satisfies NotebookRevision;
+    });
+    const byRevision = new Map(revisions.map((value) => [value.revisionId, value]));
+    const order: string[] = [];
+    const connect = vi.fn<NotebookArtifactController["connect"]>(async (request) => {
+      order.push(`connect:${request.sessionId}`);
+      request.onState(runtime());
+    });
+    const executeCell = vi.fn<NotebookArtifactController["executeCell"]>(async (request) => {
+      order.push(`execute:${request.sessionId}`);
+      request.onState(runtime({ output: "fresh-output" }));
+    });
+    const renderer = await mount(
+      bindings(
+        controller({
+          readRevision: vi.fn(async (_scope, _documentId, revisionId) => {
+            const value = byRevision.get(revisionId);
+            if (value === undefined) throw new Error("missing historical revision");
+            return value;
+          }),
+          connect,
+          executeCell,
+        }),
+      ),
+      ...revisions.map((value, index) =>
+        artifact(`history-${index}`, `History ${index + 1}`, value),
+      ),
+    );
+
+    for (const [index] of revisions.entries()) {
+      expect(article(renderer, `History ${index + 1}`).textContent).toContain(
+        `static-${String.fromCharCode(97 + index)}`,
+      );
+    }
+    expect(connect).toHaveBeenCalledTimes(0);
+
+    const selected = revisions[3]!;
+    const selectedTarget = notebookRuntimeTarget(createNotebookWorkingCopy(selected));
+    fireEvent.click(
+      within(article(renderer, "History 4")).getByRole("button", { name: "Run all" }),
+    );
+    await waitFor(() => expect(executeCell).toHaveBeenCalledTimes(2));
+
+    expect(order).toEqual([
+      `connect:${selectedTarget.sessionId}`,
+      `execute:${selectedTarget.sessionId}`,
+      `execute:${selectedTarget.sessionId}`,
+    ]);
+    expect(connect).toHaveBeenCalledTimes(1);
+    renderer.unmount();
+  });
+
   it("blocks working-copy mutations while save persistence is pending", async () => {
     const original = revision("f", "print('original')");
     const saved = revision("g", "print('edited')");
@@ -234,14 +324,12 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
     renderer.unmount();
   });
 
-  it("moves edit and save controls onto the newly opened immutable revision runtime", async () => {
+  it("runs a saved immutable revision by lazily opening only its runtime", async () => {
     const original = revision("a", "print('original')");
     const saved = revision("b", "print('edited')");
-    const originalTarget = notebookRuntimeTarget(createNotebookWorkingCopy(original));
     const savedTarget = notebookRuntimeTarget(createNotebookWorkingCopy(saved));
     const openSessions = new Set<string>();
     const order: string[] = [];
-    const savedConnection = deferred();
     const requireOpen = (sessionId: string) => {
       if (!openSessions.has(sessionId)) throw new Error(`session-not-found: ${sessionId}`);
     };
@@ -255,7 +343,6 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
         }),
         connect: vi.fn(async (request) => {
           order.push(`connect:${request.sessionId}`);
-          if (request.sessionId === savedTarget.sessionId) await savedConnection.promise;
           openSessions.add(request.sessionId);
           request.onState(runtime());
         }),
@@ -288,28 +375,19 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
     await waitFor(() =>
       expect(article(renderer, "Save").textContent).toContain(`Latest ${hash("b").slice(0, 8)}`),
     );
-    expect(openSessions.has(originalTarget.sessionId)).toBe(false);
     expect(openSessions.has(savedTarget.sessionId)).toBe(false);
-    expect(button(renderer, "Run all").disabled).toBe(true);
-
-    await act(async () => {
-      savedConnection.resolve();
-      await savedConnection.promise;
-    });
-    await waitFor(() => expect(button(renderer, "Run all").disabled).toBe(false));
-    expect(openSessions.has(savedTarget.sessionId)).toBe(true);
+    expect(button(renderer, "Run all").disabled).toBe(false);
 
     fireEvent.click(button(renderer, "Run all"));
     await waitFor(() => expect(order).toContain(`execute:${savedTarget.sessionId}`));
+    expect(openSessions.has(savedTarget.sessionId)).toBe(true);
     fireEvent.click(button(renderer, "Restart kernel"));
     await waitFor(() => expect(order).toContain(`restart:${savedTarget.sessionId}`));
     fireEvent.click(button(renderer, "Dispose runtime"));
     await waitFor(() => expect(openSessions.size).toBe(0));
 
     expect(order).toEqual([
-      `connect:${originalTarget.sessionId}`,
       "save",
-      `dispose:${originalTarget.sessionId}`,
       `connect:${savedTarget.sessionId}`,
       `execute:${savedTarget.sessionId}`,
       `restart:${savedTarget.sessionId}`,
@@ -379,7 +457,7 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
     await waitFor(() =>
       expect(renderer.getByRole("alert").textContent).toContain("save unavailable"),
     );
-    expect(order).toEqual([`connect:${originalTarget.sessionId}`, "save"]);
+    expect(order).toEqual(["save"]);
     expect(article(renderer, "Save failure").textContent).toContain("Unsaved changes");
     expect(button(renderer, "Run all").disabled).toBe(false);
     expectWorkingCopyMutationControlsDisabled(renderer, false);
@@ -388,6 +466,11 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
 
     fireEvent.click(button(renderer, "Run all"));
     await waitFor(() => expect(order).toContain(`execute:${originalTarget.sessionId}`));
+    expect(order).toEqual([
+      "save",
+      `connect:${originalTarget.sessionId}`,
+      `execute:${originalTarget.sessionId}`,
+    ]);
     expect(order.filter((entry) => entry.startsWith("execute:"))).toHaveLength(1);
     expect(article(renderer, "Save failure").textContent).not.toContain("session-not-found");
     renderer.unmount();
@@ -419,14 +502,21 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
     );
 
     const firstRenderer = await mount(bindingsValue, artifact("artifact-a", "First", first));
-    expect(article(firstRenderer, "First").textContent).toContain("first-revision-output");
+    expect(connected).toHaveLength(0);
+    fireEvent.click(button(firstRenderer, "Run all"));
+    await waitFor(() =>
+      expect(article(firstRenderer, "First").textContent).toContain("first-revision-output"),
+    );
     firstRenderer.unmount();
 
     const secondRenderer = await mount(bindingsValue, artifact("artifact-b", "Second", second));
 
-    expect(connected[0]).not.toBe(connected[1]);
+    expect(connected).toHaveLength(1);
     expect(article(secondRenderer, "Second").textContent).not.toContain("first-revision-output");
     expect(article(secondRenderer, "Second").textContent).toContain("Execution –");
+    fireEvent.click(button(secondRenderer, "Run all"));
+    await waitFor(() => expect(connected).toHaveLength(2));
+    expect(connected[0]).not.toBe(connected[1]);
     secondRenderer.unmount();
   });
 
@@ -466,6 +556,14 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
       artifact("artifact-d", "Concurrent second", second),
     );
 
+    expect(connected).toHaveLength(0);
+    fireEvent.click(
+      within(article(renderer, "Concurrent first")).getByRole("button", { name: "Run all" }),
+    );
+    fireEvent.click(
+      within(article(renderer, "Concurrent second")).getByRole("button", { name: "Run all" }),
+    );
+    await waitFor(() => expect(connected).toHaveLength(2));
     expect(connected).toHaveLength(2);
     expect(connected[0]).not.toBe(connected[1]);
     expect(article(renderer, "Concurrent first").textContent).toContain("first-only");

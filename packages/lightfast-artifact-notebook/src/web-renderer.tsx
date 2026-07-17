@@ -19,11 +19,12 @@ import {
   type NotebookWorkingCopy,
 } from "./working-copy.ts";
 import {
+  connectNotebookWorkingCopyRuntime,
   importNotebookRevisionAndReplaceRuntime,
   isNotebookExecutionDisabled,
   isNotebookInterruptDisabled,
   isNotebookRevisionSwitchDisabled,
-  loadNotebookRevisionAndConnect,
+  loadNotebookRevision,
   notebookRuntimeTarget,
   replaceNotebookWorkingCopyRuntime,
   runNotebookTrackedAction,
@@ -93,6 +94,11 @@ export function NotebookArtifactEnvelopeRenderer({
   const normalActionOwnerRef = useRef<symbol | null>(null);
   const pendingActionRef = useRef(false);
   const interruptPendingRef = useRef(false);
+  const connectedRuntimeRef = useRef<string | null>(null);
+  const connectionAttemptRef = useRef<{
+    readonly key: string;
+    readonly promise: Promise<ReturnType<typeof notebookRuntimeTarget> | null>;
+  } | null>(null);
   const importInput = useRef<HTMLInputElement | null>(null);
   const runtimeTarget = working === null ? null : notebookRuntimeTarget(working);
   const sessionId = runtimeTarget?.sessionId ?? "notebook-invalid";
@@ -113,13 +119,13 @@ export function NotebookArtifactEnvelopeRenderer({
     };
   }, []);
 
-  const loadRevisionAndConnect = useCallback(async () => {
+  const loadRevision = useCallback(async () => {
     if (bindings === null || payload === null) return;
     const generation = ++lifecycleGeneration.current;
     const isActive = () => mounted.current && lifecycleGeneration.current === generation;
     setRuntimeReady(false);
     try {
-      const next = await loadNotebookRevisionAndConnect({
+      await loadNotebookRevision({
         controller: bindings.controller,
         scope: bindings.scope,
         documentId: payload.documentId,
@@ -131,11 +137,12 @@ export function NotebookArtifactEnvelopeRenderer({
         },
         onWorkingCopy: (next) => {
           if (!isActive()) return;
+          connectedRuntimeRef.current = null;
+          connectionAttemptRef.current = null;
           setRuntime(INITIAL_RUNTIME_STATE);
           setWorking(next);
         },
       });
-      if (isActive() && next !== null) setRuntimeReady(true);
     } catch {
       if (isActive()) setRuntimeReady(false);
       // The shared loader has already surfaced the bounded error message.
@@ -143,11 +150,11 @@ export function NotebookArtifactEnvelopeRenderer({
   }, [bindings, onRuntimeState, payload]);
 
   useEffect(() => {
-    void loadRevisionAndConnect();
+    void loadRevision();
     return () => {
       lifecycleGeneration.current += 1;
     };
-  }, [loadRevisionAndConnect]);
+  }, [loadRevision]);
 
   const runAction = useCallback((label: string, action: () => Promise<void>) => {
     if (normalActionOwnerRef.current !== null) return Promise.resolve();
@@ -189,6 +196,45 @@ export function NotebookArtifactEnvelopeRenderer({
     mutation();
   }, []);
 
+  const ensureRuntime = useCallback(async () => {
+    if (bindings === null || working === null) return null;
+    const target = notebookRuntimeTarget(working);
+    const targetKey = `${target.sessionId}\0${target.kernelName}`;
+    if (connectedRuntimeRef.current === targetKey) return target;
+    const activeAttempt = connectionAttemptRef.current;
+    if (activeAttempt?.key === targetKey) return activeAttempt.promise;
+    const generation = lifecycleGeneration.current;
+    const isActive = () => mounted.current && lifecycleGeneration.current === generation;
+    setRuntimeReady(false);
+    const attempt = connectNotebookWorkingCopyRuntime({
+      controller: bindings.controller,
+      scope: bindings.scope,
+      working,
+      onState: onRuntimeState,
+      isActive,
+      onWorkingCopy: () => undefined,
+    });
+    connectionAttemptRef.current = { key: targetKey, promise: attempt };
+    try {
+      const connectedTarget = await attempt;
+      if (isActive() && connectedTarget !== null) {
+        connectedRuntimeRef.current = targetKey;
+        setRuntimeReady(true);
+      }
+      return connectedTarget;
+    } catch (cause) {
+      if (isActive()) {
+        connectedRuntimeRef.current = null;
+        setRuntimeReady(false);
+      }
+      throw cause;
+    } finally {
+      if (connectionAttemptRef.current?.promise === attempt) {
+        connectionAttemptRef.current = null;
+      }
+    }
+  }, [bindings, onRuntimeState, working]);
+
   const transitionWorkingCopy = useCallback(
     (
       label: string,
@@ -211,13 +257,24 @@ export function NotebookArtifactEnvelopeRenderer({
             ? await resolveNextWorking()
             : resolveNextWorking;
         if (!isActive()) return;
-        setRuntimeReady(false);
+        const previousTarget = notebookRuntimeTarget(working);
+        const nextTarget = notebookRuntimeTarget(nextWorking);
+        const runtimeRetained =
+          runtimeReady &&
+          previousTarget.sessionId === nextTarget.sessionId &&
+          previousTarget.kernelName === nextTarget.kernelName;
+        if (!runtimeRetained) {
+          connectedRuntimeRef.current = null;
+          connectionAttemptRef.current = null;
+          setRuntimeReady(false);
+        }
         try {
           const next = await replaceNotebookWorkingCopyRuntime({
             controller: bindings.controller,
             scope: bindings.scope,
             working,
             nextWorking,
+            disposePreviousRuntime: runtimeReady,
             onState: onRuntimeState,
             isActive,
             onWorkingCopy: (replacement) => {
@@ -226,7 +283,7 @@ export function NotebookArtifactEnvelopeRenderer({
               setWorking(replacement);
             },
           });
-          if (isActive() && next !== null) setRuntimeReady(true);
+          if (isActive() && next !== null) setRuntimeReady(runtimeRetained);
         } catch (cause) {
           if (!isActive()) return;
           setRuntimeReady(false);
@@ -241,24 +298,26 @@ export function NotebookArtifactEnvelopeRenderer({
       pendingAction,
       runAction,
       runtime.runningCellIds,
+      runtimeReady,
       working,
     ],
   );
 
   const runCell = useCallback(
     async (cell: NotebookCellValue) => {
-      if (bindings === null || runtimeTarget === null || !runtimeReady || cell.cell_type !== "code")
-        return;
+      if (bindings === null || runtimeTarget === null || cell.cell_type !== "code") return;
+      const target = await ensureRuntime();
+      if (target === null) return;
       await bindings.controller.executeCell({
         scope: bindings.scope,
-        sessionId: runtimeTarget.sessionId,
-        revisionId: runtimeTarget.revisionId,
+        sessionId: target.sessionId,
+        revisionId: target.revisionId,
         cellId: cell.id,
         code: cell.source,
         onState: onRuntimeState,
       });
     },
-    [bindings, onRuntimeState, runtimeReady, runtimeTarget],
+    [bindings, ensureRuntime, onRuntimeState, runtimeTarget],
   );
 
   const visibleCells = useMemo(() => {
@@ -313,7 +372,7 @@ export function NotebookArtifactEnvelopeRenderer({
         <button
           type="button"
           className="mt-2 rounded border border-border px-2 py-1 text-xs"
-          onClick={() => void loadRevisionAndConnect()}
+          onClick={() => void loadRevision()}
         >
           Retry notebook
         </button>
@@ -462,14 +521,16 @@ export function NotebookArtifactEnvelopeRenderer({
               className="rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
               disabled={executionDisabled}
               onClick={() =>
-                void runAction("restart", () =>
-                  bindings.controller.restart({
+                void runAction("restart", async () => {
+                  const target = await ensureRuntime();
+                  if (target === null) return;
+                  await bindings.controller.restart({
                     scope: bindings.scope,
-                    sessionId,
-                    revisionId: runtimeRevisionId,
+                    sessionId: target.sessionId,
+                    revisionId: target.revisionId,
                     onState: onRuntimeState,
-                  }),
-                )
+                  });
+                })
               }
             >
               Restart kernel
@@ -480,6 +541,8 @@ export function NotebookArtifactEnvelopeRenderer({
               disabled={disabled}
               onClick={() =>
                 void runAction("reconnect", async () => {
+                  connectedRuntimeRef.current = null;
+                  connectionAttemptRef.current = null;
                   setRuntimeReady(false);
                   try {
                     await bindings.controller.connect({
@@ -495,9 +558,15 @@ export function NotebookArtifactEnvelopeRenderer({
                       revisionId: runtimeRevisionId,
                       onState: onRuntimeState,
                     });
-                    if (mounted.current) setRuntimeReady(true);
+                    if (mounted.current) {
+                      connectedRuntimeRef.current = `${sessionId}\0${kernelName}`;
+                      setRuntimeReady(true);
+                    }
                   } catch (cause) {
-                    if (mounted.current) setRuntimeReady(false);
+                    if (mounted.current) {
+                      connectedRuntimeRef.current = null;
+                      setRuntimeReady(false);
+                    }
                     throw cause;
                   }
                 })
@@ -508,9 +577,11 @@ export function NotebookArtifactEnvelopeRenderer({
             <button
               type="button"
               className="rounded border border-border px-2 py-1 text-xs disabled:opacity-40"
-              disabled={disabled}
+              disabled={disabled || !runtimeReady}
               onClick={() =>
                 void runAction("dispose", async () => {
+                  connectedRuntimeRef.current = null;
+                  connectionAttemptRef.current = null;
                   setRuntimeReady(false);
                   await bindings.controller.dispose({
                     scope: bindings.scope,
@@ -594,12 +665,12 @@ export function NotebookArtifactEnvelopeRenderer({
                     )
                   }
                   onRun={
-                    cell.cell_type === "code" && runtimeReady
+                    cell.cell_type === "code"
                       ? () => void runAction(`run ${cell.id}`, () => runCell(cell))
                       : undefined
                   }
                   onRunAbove={
-                    cell.cell_type === "code" && runtimeReady
+                    cell.cell_type === "code"
                       ? () =>
                           void runAction(`run above ${cell.id}`, async () => {
                             for (const previous of working.document.cells.slice(0, actualIndex))
@@ -721,12 +792,15 @@ export function NotebookArtifactEnvelopeRenderer({
                   mounted.current && lifecycleGeneration.current === generation;
                 void runAction("import", async () => {
                   if (isActive()) setRuntimeReady(false);
+                  connectedRuntimeRef.current = null;
+                  connectionAttemptRef.current = null;
                   try {
                     const next = await importNotebookRevisionAndReplaceRuntime({
                       controller: bindings.controller,
                       scope: bindings.scope,
                       working,
                       ipynbJson: await file.text(),
+                      disposePreviousRuntime: runtimeReady,
                       onState: onRuntimeState,
                       isActive,
                       onWorkingCopy: (replacement) => {
@@ -735,7 +809,7 @@ export function NotebookArtifactEnvelopeRenderer({
                         setWorking(replacement);
                       },
                     });
-                    if (isActive() && next !== null) setRuntimeReady(true);
+                    if (isActive() && next !== null) setRuntimeReady(false);
                   } catch (cause) {
                     if (!isActive()) return;
                     setRuntimeReady(false);
