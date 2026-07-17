@@ -164,7 +164,7 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
       .then(async (loaded) => {
         if (cancelled) return;
         if (loaded.drawingDataBase64) {
-          await canvasRef.current?.loadDrawing(loaded.drawingDataBase64);
+          await canvasRef.current?.loadDrawing(loaded.drawingDataBase64, loaded.revision);
         }
         latestDrawingRef.current = {
           revision: loaded.revision,

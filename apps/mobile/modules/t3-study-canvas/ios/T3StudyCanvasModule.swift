@@ -11,8 +11,8 @@ public final class T3StudyCanvasModule: Module {
 
       Events("onDrawingChange", "onSelectionChange")
 
-      AsyncFunction("loadDrawing") { (view: T3StudyCanvasView, dataBase64: String) in
-        try view.loadDrawing(dataBase64: dataBase64)
+      AsyncFunction("loadDrawing") { (view: T3StudyCanvasView, dataBase64: String, revision: Int) in
+        try view.loadDrawing(dataBase64: dataBase64, revision: revision)
       }
 
       AsyncFunction("exportDrawing") { (view: T3StudyCanvasView) -> String in

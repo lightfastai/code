@@ -21,6 +21,7 @@ public final class T3StudyCanvasView: ExpoView, PKCanvasViewDelegate {
   private var selectionRectInCanvas: CGRect?
   private var centeredInitialViewport = false
   private var observingToolPicker = false
+  private var isRestoringDrawing = false
 
   public required init(appContext: AppContext? = nil) {
     super.init(appContext: appContext)
@@ -115,7 +116,7 @@ public final class T3StudyCanvasView: ExpoView, PKCanvasViewDelegate {
     updateToolPickerVisibility()
   }
 
-  public func loadDrawing(dataBase64: String) throws {
+  public func loadDrawing(dataBase64: String, revision: Int) throws {
     guard let data = Data(base64Encoded: dataBase64) else {
       throw NSError(
         domain: "T3StudyCanvas",
@@ -123,7 +124,11 @@ public final class T3StudyCanvasView: ExpoView, PKCanvasViewDelegate {
         userInfo: [NSLocalizedDescriptionKey: "Drawing data is not valid base64."]
       )
     }
-    canvasView.drawing = try PKDrawing(data: data)
+    let drawing = try PKDrawing(data: data)
+    isRestoringDrawing = true
+    defer { isRestoringDrawing = false }
+    self.revision = max(0, revision)
+    canvasView.drawing = drawing
   }
 
   public func exportDrawing() -> String {
@@ -175,6 +180,9 @@ public final class T3StudyCanvasView: ExpoView, PKCanvasViewDelegate {
   }
 
   public func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
+    guard !isRestoringDrawing else {
+      return
+    }
     drawingDidChange()
   }
 

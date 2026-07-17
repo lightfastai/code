@@ -20,7 +20,7 @@ export interface StudyCanvasRegionExport {
 }
 
 export interface StudyCanvasSurfaceHandle {
-  readonly loadDrawing: (dataBase64: string) => Promise<void>;
+  readonly loadDrawing: (dataBase64: string, revision: number) => Promise<void>;
   readonly exportDrawing: () => Promise<string>;
   readonly exportRegion: () => Promise<StudyCanvasRegionExport>;
   readonly undo: () => Promise<void>;
