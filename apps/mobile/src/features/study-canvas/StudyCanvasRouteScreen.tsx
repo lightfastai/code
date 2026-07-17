@@ -1,5 +1,6 @@
 import {
   EnvironmentId,
+  ThreadId,
   type StudyCanvasRegion,
   type StudyContextCapsule,
 } from "@t3tools/contracts";
@@ -63,7 +64,14 @@ function renderStudyCanvasHeaderRight() {
 }
 
 export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
-  const composer = useThreadComposerState();
+  const routeThreadRef = useMemo(
+    () => ({
+      environmentId: EnvironmentId.make(props.route.params.environmentId),
+      threadId: ThreadId.make(props.route.params.threadId),
+    }),
+    [props.route.params.environmentId, props.route.params.threadId],
+  );
+  const composer = useThreadComposerState(routeThreadRef);
   const insets = useSafeAreaInsets();
   const colorScheme = useColorScheme();
   const canvasRef = useRef<StudyCanvasSurfaceHandle>(null);
@@ -85,7 +93,7 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
   const card = useThemeColor("--color-card-translucent");
   const border = useThemeColor("--color-border");
   const canvasId = props.route.params.canvasId;
-  const environmentId = EnvironmentId.make(props.route.params.environmentId);
+  const environmentId = routeThreadRef.environmentId;
   const canvasTitle = "Study notes";
 
   const latestAssistantMessage = useMemo(() => {

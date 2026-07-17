@@ -7,7 +7,7 @@ import {
 } from "@react-navigation/native";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as Option from "effect/Option";
-import { EnvironmentId, ThreadId, type ProjectScript } from "@t3tools/contracts";
+import { type ProjectScript, type ScopedThreadRef } from "@t3tools/contracts";
 import { projectScriptCwd, projectScriptRuntimeEnv } from "@t3tools/shared/projectScripts";
 import { Platform, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -58,6 +58,7 @@ import { useSelectedThreadRequests } from "../../state/use-selected-thread-reque
 import { useSelectedThreadWorktree } from "../../state/use-selected-thread-worktree";
 import { useThreadComposerState } from "../../state/use-thread-composer-state";
 import { threadEnvironment } from "../../state/threads";
+import { resolveThreadRouteTarget, threadRouteTargetKey } from "../../state/thread-route-target";
 import { projectThreadContentPresentation } from "./threadContentPresentation";
 import {
   useAdaptiveWorkspaceLayout,
@@ -130,23 +131,22 @@ export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
   const { connectionState } = useRemoteConnectionStatus();
   const { selectedThread } = useThreadSelection();
   const params = props.route.params;
-  const environmentIdRaw = firstRouteParam(params.environmentId);
-  const threadIdRaw = firstRouteParam(params.threadId);
-  const environmentId = environmentIdRaw ? EnvironmentId.make(environmentIdRaw) : null;
+  const routeThreadRef = useMemo(
+    () => resolveThreadRouteTarget(params, null),
+    [params.environmentId, params.threadId],
+  );
+  const environmentId = routeThreadRef?.environmentId ?? null;
   const routeEnvironmentRuntime = useRemoteEnvironmentRuntime(environmentId);
   const routeConnectionState =
     routeEnvironmentRuntime?.connectionState ?? (environmentId ? "available" : connectionState);
-  const routeThreadKey =
-    environmentId !== null && threadIdRaw !== null
-      ? scopedThreadKey(environmentId, ThreadId.make(threadIdRaw))
-      : null;
+  const routeThreadKey = routeThreadRef === null ? null : threadRouteTargetKey(routeThreadRef);
   const selectedThreadKey =
     selectedThread === null
       ? null
       : scopedThreadKey(selectedThread.environmentId, selectedThread.id);
   const selectedThreadDetailState = useSelectedThreadDetailState();
 
-  if (environmentId === null || threadIdRaw === null) {
+  if (routeThreadRef === null) {
     return <OpeningThreadLoadingScreen />;
   }
 
@@ -155,7 +155,13 @@ export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
   // loading placeholder while messages fetch, and the composer's connection
   // pill reports connecting/reconnecting/syncing status.
   if (selectedThread !== null && selectedThreadKey === routeThreadKey) {
-    return <ThreadRouteContent {...props} selectedThreadDetailState={selectedThreadDetailState} />;
+    return (
+      <ThreadRouteContent
+        {...props}
+        routeThreadRef={routeThreadRef}
+        selectedThreadDetailState={selectedThreadDetailState}
+      />
+    );
   }
 
   const stillHydrating =
@@ -172,6 +178,7 @@ export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
 
 function ThreadRouteContent(
   props: ThreadRouteScreenProps & {
+    readonly routeThreadRef: ScopedThreadRef;
     readonly selectedThreadDetailState: ReturnType<typeof useSelectedThreadDetailState>;
   },
 ) {
@@ -190,7 +197,7 @@ function ThreadRouteContent(
   const selectedThreadDetailState = props.selectedThreadDetailState;
   const selectedThreadDetail = Option.getOrNull(selectedThreadDetailState.data);
   const { selectedThreadCwd } = useSelectedThreadWorktree();
-  const composer = useThreadComposerState();
+  const composer = useThreadComposerState(props.routeThreadRef);
   const gitState = useSelectedThreadGitState();
   const gitActions = useSelectedThreadGitActions();
   const requests = useSelectedThreadRequests();
@@ -198,7 +205,7 @@ function ThreadRouteContent(
   const navigation = useNavigation();
   const params = props.route.params;
   const environmentIdRaw = firstRouteParam(params.environmentId);
-  const environmentId = environmentIdRaw ? EnvironmentId.make(environmentIdRaw) : null;
+  const environmentId = props.routeThreadRef.environmentId;
   const threadId = firstRouteParam(params.threadId);
   const routeThreadIdentity =
     environmentIdRaw !== null && threadId !== null ? `${environmentIdRaw}:${threadId}` : null;
