@@ -90,6 +90,7 @@ export function NotebookArtifactEnvelopeRenderer({
   const [expanded, setExpanded] = useState(true);
   const mounted = useRef(true);
   const lifecycleGeneration = useRef(0);
+  const normalActionOwnerRef = useRef<symbol | null>(null);
   const pendingActionRef = useRef(false);
   const interruptPendingRef = useRef(false);
   const importInput = useRef<HTMLInputElement | null>(null);
@@ -148,20 +149,25 @@ export function NotebookArtifactEnvelopeRenderer({
     };
   }, [loadRevisionAndConnect]);
 
-  const runAction = useCallback(
-    (label: string, action: () => Promise<void>) =>
-      runNotebookTrackedAction({
-        action,
-        onError: (error) => {
-          if (mounted.current) setActionError(error);
-        },
-        onPendingChange: (pending) => {
-          pendingActionRef.current = pending;
-          if (mounted.current) setPendingAction(pending ? label : null);
-        },
-      }),
-    [],
-  );
+  const runAction = useCallback((label: string, action: () => Promise<void>) => {
+    if (normalActionOwnerRef.current !== null) return Promise.resolve();
+    const owner = Symbol(label);
+    normalActionOwnerRef.current = owner;
+    pendingActionRef.current = true;
+    if (mounted.current) setPendingAction(label);
+    return runNotebookTrackedAction({
+      action,
+      onError: (error) => {
+        if (mounted.current) setActionError(error);
+      },
+      onPendingChange: () => undefined,
+    }).finally(() => {
+      if (normalActionOwnerRef.current !== owner) return;
+      normalActionOwnerRef.current = null;
+      pendingActionRef.current = false;
+      if (mounted.current) setPendingAction(null);
+    });
+  }, []);
 
   const runInterruptAction = useCallback(
     (action: () => Promise<void>) =>

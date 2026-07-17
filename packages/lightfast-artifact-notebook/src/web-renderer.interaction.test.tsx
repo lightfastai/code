@@ -1,8 +1,15 @@
 // @vitest-environment happy-dom
 
-import { cleanup, fireEvent, render, type RenderResult, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  type RenderResult,
+  waitFor,
+} from "@testing-library/react";
 import type { ArtifactEnvelope } from "@t3tools/lightfast-capability-core/artifacts";
-import { act, Fragment } from "react";
+import { Fragment } from "react";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type { NotebookRevision } from "./contracts.ts";
@@ -164,6 +171,9 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
     const original = revision("f", "print('original')");
     const saved = revision("g", "print('edited')");
     const persistence = deferred<NotebookRevision>();
+    const executeCell = vi.fn<NotebookArtifactController["executeCell"]>(async (request) => {
+      request.onState(runtime({ output: "should-not-run" }));
+    });
     const saveRevision = vi.fn<NotebookArtifactController["saveRevision"]>(
       async (_scope, _documentId, document) => {
         expect(document.cells).toHaveLength(1);
@@ -177,6 +187,7 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
         saveRevision,
         connect: vi.fn(async (request) => request.onState(runtime())),
         dispose: vi.fn(async () => undefined),
+        executeCell,
       }),
     );
     const renderer = await mount(
@@ -188,8 +199,16 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
     }) as HTMLTextAreaElement;
 
     fireEvent.change(source, { target: { value: "print('edited')" } });
-    fireEvent.click(button(renderer, "Save new revision"));
-    await waitFor(() => expect(button(renderer, "Save new revision").disabled).toBe(true));
+    await waitFor(() => expect(button(renderer, "Run all").disabled).toBe(false));
+    await act(async () => {
+      fireEvent.click(button(renderer, "Save new revision"));
+      fireEvent.click(button(renderer, "Run all"));
+      await Promise.resolve();
+    });
+
+    expect(executeCell).toHaveBeenCalledTimes(0);
+    expect(button(renderer, "Save new revision").disabled).toBe(true);
+    expect(button(renderer, "Run all").disabled).toBe(true);
 
     fireEvent.click(button(renderer, "Add code cell"));
     fireEvent.change(source, { target: { value: "print('late edit')" } });
@@ -205,6 +224,8 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
 
     await waitFor(() => expectWorkingCopyMutationControlsDisabled(renderer, false));
     expect(saveRevision).toHaveBeenCalledTimes(1);
+    expect(executeCell).toHaveBeenCalledTimes(0);
+    expect(button(renderer, "Run all").disabled).toBe(false);
     expect(source.value).toBe("print('edited')");
     expect(renderer.queryByRole("textbox", { name: "Code cell 2 source" })).toBeNull();
     expect(article(renderer, "Pending save").textContent).toContain(
@@ -367,6 +388,7 @@ describe("NotebookArtifactEnvelopeRenderer interactions", () => {
 
     fireEvent.click(button(renderer, "Run all"));
     await waitFor(() => expect(order).toContain(`execute:${originalTarget.sessionId}`));
+    expect(order.filter((entry) => entry.startsWith("execute:"))).toHaveLength(1);
     expect(article(renderer, "Save failure").textContent).not.toContain("session-not-found");
     renderer.unmount();
   });
