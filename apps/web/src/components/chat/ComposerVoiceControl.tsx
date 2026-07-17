@@ -10,7 +10,7 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import { Room, RoomEvent, Track, type Participant, type RemoteTrack } from "livekit-client";
 import { AudioLinesIcon, LoaderCircleIcon, MicIcon, MicOffIcon, XIcon } from "lucide-react";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { studyEnvironment } from "../../state/study";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -49,6 +49,11 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
   const createVoiceSession = useAtomCommand(studyEnvironment.createVoiceSession, {
     reportFailure: false,
   });
+  const documentIds = useMemo(
+    () => [...new Set(selectedDocuments.map((document) => document.id))].sort(),
+    [selectedDocuments],
+  );
+  const scopeKey = JSON.stringify([environmentId, ...documentIds]);
   const [phase, setPhase] = useState<VoicePhase>("idle");
   const [liveArtifact, setLiveArtifact] = useState<ChatScene3DArtifact | null>(null);
   const roomRef = useRef<Room | null>(null);
@@ -56,6 +61,7 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
   const outputRef = useRef<HTMLDivElement | null>(null);
   const requestVersionRef = useRef(0);
   const mountedRef = useRef(true);
+  const scopeKeyRef = useRef(scopeKey);
 
   const clearOutput = useCallback(() => {
     outputRef.current?.replaceChildren();
@@ -81,6 +87,12 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
       stop();
     };
   }, [stop]);
+
+  useEffect(() => {
+    if (scopeKeyRef.current === scopeKey) return;
+    scopeKeyRef.current = scopeKey;
+    stop();
+  }, [scopeKey, stop]);
 
   const start = useCallback(async () => {
     const requestVersion = requestVersionRef.current + 1;
@@ -130,7 +142,7 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
 
     const sessionResult = await createVoiceSession({
       environmentId,
-      input: { documentIds: selectedDocuments.map((document) => document.id) },
+      input: { documentIds },
     });
     if (requestVersionRef.current !== requestVersion || roomRef.current !== room) {
       await room.disconnect(true);
@@ -175,7 +187,7 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
         description: message,
       });
     }
-  }, [clearOutput, createVoiceSession, environmentId, selectedDocuments]);
+  }, [clearOutput, createVoiceSession, documentIds, environmentId]);
 
   const active = ACTIVE_PHASES.has(phase);
   const pending = phase === "requesting" || phase === "connecting";
