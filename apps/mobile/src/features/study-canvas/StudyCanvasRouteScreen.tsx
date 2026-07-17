@@ -5,7 +5,7 @@ import {
   type StudyContextCapsule,
 } from "@t3tools/contracts";
 import { appendStudyContextCapsulesToPrompt } from "@t3tools/shared/studyContext";
-import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
+import { useNavigation, usePreventRemove, type StaticScreenProps } from "@react-navigation/native";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -38,7 +38,10 @@ import type {
   StudyCanvasDrawingChangeEvent,
   StudyCanvasSelectionChangeEvent,
 } from "./StudyCanvasSurface.types";
-import { finishStudyCanvas, saveStudyCanvasSurfaceSnapshot } from "./studyCanvasSave";
+import {
+  createStudyCanvasRemovalCoordinator,
+  saveStudyCanvasSurfaceSnapshot,
+} from "./studyCanvasSave";
 import { loadStudyCanvas, saveStudyCanvasSnapshot } from "./studyCanvasStorage";
 
 const SAVE_DEBOUNCE_MS = 750;
@@ -50,6 +53,9 @@ type StudyCanvasRouteProps = StaticScreenProps<{
 }>;
 
 type CanvasStatus = "loading" | "ready" | "saving" | "saved" | "error";
+type StudyCanvasRemovalAction = Parameters<
+  Parameters<typeof usePreventRemove>[1]
+>[0]["data"]["action"];
 
 function StudyCanvasHeaderButton(props: {
   readonly disabled: boolean;
@@ -87,9 +93,15 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
   });
   const loadedDrawingRef = useRef(false);
   const mountedRef = useRef(true);
-  const finishingRef = useRef(false);
+  const removalCoordinator = useMemo(
+    () => createStudyCanvasRemovalCoordinator<StudyCanvasRemovalAction>(),
+    [],
+  );
   const [status, setStatus] = useState<CanvasStatus>("loading");
   const [finishing, setFinishing] = useState(false);
+  const [pendingRemovalAction, setPendingRemovalAction] = useState<StudyCanvasRemovalAction | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedRegion, setSelectedRegion] = useState<StudyCanvasRegion | null>(null);
@@ -139,24 +151,24 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
     }
   }, [canvasId, nativeAvailable]);
 
+  const cancelScheduledSave = useCallback(() => {
+    if (saveTimerRef.current === null) return;
+    clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = null;
+  }, []);
+
   const flushSave = useCallback(() => {
-    if (saveTimerRef.current !== null) {
-      clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = null;
-    }
+    cancelScheduledSave();
     void persistLatestDrawing();
-  }, [persistLatestDrawing]);
+  }, [cancelScheduledSave, persistLatestDrawing]);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      if (saveTimerRef.current !== null) {
-        clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = null;
-      }
+      cancelScheduledSave();
     };
-  }, []);
+  }, [cancelScheduledSave]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (nextState) => {
@@ -267,50 +279,65 @@ export function StudyCanvasRouteScreen(props: StudyCanvasRouteProps) {
     }
   }, [canvasId, composer, prompt, selectedRegion, sending]);
 
-  const handleDone = useCallback(async () => {
-    if (finishingRef.current) return;
-    if (!nativeAvailable) {
-      navigation.goBack();
-      return;
-    }
-    const surface = canvasRef.current;
-    if (!surface || !loadedDrawingRef.current) {
-      setStatus("error");
-      setError("The canvas is still loading. Try Done again in a moment.");
-      return;
-    }
-    if (saveTimerRef.current !== null) {
-      clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = null;
-    }
+  const handlePreventedRemoval = useCallback(
+    (action: StudyCanvasRemovalAction) => {
+      const surface = canvasRef.current;
+      if (!surface || !loadedDrawingRef.current) {
+        setStatus("error");
+        setError("The canvas is still loading. Try again in a moment.");
+        return;
+      }
 
-    const snapshot = { ...latestDrawingRef.current };
-    finishingRef.current = true;
-    setFinishing(true);
-    setStatus("saving");
-    setError(null);
-    try {
-      await finishStudyCanvas({
+      const request = removalCoordinator.request({
+        action,
+        cancelScheduledSave,
         surface,
         canvasId,
         title: canvasTitle,
-        snapshot,
+        snapshot: { ...latestDrawingRef.current },
         save: saveStudyCanvasSnapshot,
-        onSaved: () => {
-          if (mountedRef.current) setStatus("saved");
-          navigation.goBack();
+        onReadyToRemove: (readyAction) => {
+          if (mountedRef.current) setPendingRemovalAction(readyAction);
         },
       });
-    } catch (cause) {
-      if (mountedRef.current) {
-        setStatus("error");
-        setError(cause instanceof Error ? cause.message : "Could not save the canvas.");
-      }
-    } finally {
-      finishingRef.current = false;
-      if (mountedRef.current) setFinishing(false);
-    }
-  }, [canvasId, nativeAvailable, navigation]);
+      if (!request.started) return;
+
+      setFinishing(true);
+      setStatus("saving");
+      setError(null);
+      void request.completion
+        .catch((cause) => {
+          if (mountedRef.current) {
+            setStatus("error");
+            setError(cause instanceof Error ? cause.message : "Could not save the canvas.");
+          }
+        })
+        .finally(() => {
+          if (mountedRef.current) setFinishing(false);
+        });
+    },
+    [cancelScheduledSave, canvasId, removalCoordinator],
+  );
+
+  usePreventRemove(nativeAvailable && pendingRemovalAction === null, ({ data }) => {
+    handlePreventedRemoval(data.action);
+  });
+
+  useEffect(() => {
+    if (!pendingRemovalAction) return;
+    // Let usePreventRemove publish its disabled state to the navigator before
+    // replaying the exact action that was blocked. Keeping the action pending
+    // until this task runs prevents the replay from re-entering the guard.
+    const replayTimer = setTimeout(() => {
+      navigation.dispatch(pendingRemovalAction);
+      setPendingRemovalAction(null);
+    }, 0);
+    return () => clearTimeout(replayTimer);
+  }, [navigation, pendingRemovalAction]);
+
+  const handleDone = useCallback(() => {
+    navigation.goBack();
+  }, [navigation]);
 
   const renderStudyCanvasHeaderRight = useCallback(
     () => <StudyCanvasHeaderButton disabled={finishing} onPress={() => void handleDone()} />,

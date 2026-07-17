@@ -45,3 +45,51 @@ export async function finishStudyCanvas(
   await saveStudyCanvasSurfaceSnapshot(input);
   await input.onSaved();
 }
+
+export type StudyCanvasRemovalRequest<Action> = Parameters<
+  typeof saveStudyCanvasSurfaceSnapshot
+>[0] & {
+  readonly action: Action;
+  readonly cancelScheduledSave: () => void;
+  readonly onReadyToRemove: (action: Action) => void | Promise<void>;
+};
+
+export type StudyCanvasRemovalRequestResult =
+  | { readonly started: true; readonly completion: Promise<void> }
+  | { readonly started: false; readonly completion: Promise<void> };
+
+export function createStudyCanvasRemovalCoordinator<Action>(): {
+  readonly request: (input: StudyCanvasRemovalRequest<Action>) => StudyCanvasRemovalRequestResult;
+} {
+  let activeCompletion: Promise<void> | null = null;
+
+  return {
+    request(input) {
+      if (activeCompletion) {
+        return { started: false, completion: activeCompletion };
+      }
+
+      const completion = (async () => {
+        input.cancelScheduledSave();
+        await finishStudyCanvas({
+          surface: input.surface,
+          canvasId: input.canvasId,
+          title: input.title,
+          snapshot: input.snapshot,
+          save: input.save,
+          onSaved: () => input.onReadyToRemove(input.action),
+        });
+      })();
+      activeCompletion = completion;
+      void completion.then(
+        () => {
+          if (activeCompletion === completion) activeCompletion = null;
+        },
+        () => {
+          if (activeCompletion === completion) activeCompletion = null;
+        },
+      );
+      return { started: true, completion };
+    },
+  };
+}

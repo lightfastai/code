@@ -35,3 +35,14 @@ describe("native study canvas revision bridge", () => {
     expect(viewSource).toMatch(/private func drawingDidChange\(\)[\s\S]*revision \+= 1/);
   });
 });
+
+describe("study canvas route removal guard", () => {
+  it("guards every native route removal and replays only the saved action", () => {
+    expect(routeSource).toContain(
+      "usePreventRemove(nativeAvailable && pendingRemovalAction === null",
+    );
+    expect(routeSource).toContain("handlePreventedRemoval(data.action)");
+    expect(routeSource).toContain("navigation.dispatch(pendingRemovalAction)");
+    expect(routeSource).toMatch(/onReadyToRemove:[\s\S]*setPendingRemovalAction\(readyAction\)/);
+  });
+});
