@@ -181,6 +181,17 @@ function notebookExecution(records: ReadonlyArray<{ readonly event: StudyTraceEv
   return execution;
 }
 
+function notebookPermission(operationId: string, permissionGranted: boolean): StudyTraceEvent {
+  return {
+    type: "notebook_permission",
+    operation: "execute_cell",
+    operationId,
+    threadId: `thread-${operationId}`,
+    providerSessionId: `provider-session-${operationId}`,
+    permissionGranted,
+  } as StudyTraceEvent;
+}
+
 function traceRecordsForEvents(
   runId: StudyTraceRunId,
   middleEvents: ReadonlyArray<StudyTraceEvent>,
@@ -241,6 +252,20 @@ const dataset: StudyEvalDataset = {
         { type: "notebook_cleanup", operation: "execute_cell" },
         { type: "notebook_identity", operation: "execute_cell", binding },
       ],
+    },
+  ],
+};
+
+const permissionRequiredDataset: StudyEvalDataset = {
+  version: 1,
+  id: "notebook-permission-required-v1",
+  title: "Notebook execution permission required",
+  cases: [
+    {
+      id: "notebook-safety",
+      title: "Notebook permission is explicitly granted",
+      split: "holdout",
+      assertions: [{ type: "notebook_permission", operation: "execute_cell", required: true }],
     },
   ],
 };
@@ -416,6 +441,133 @@ it.layer(NodeServices.layer)("NotebookStudyEval", (it) => {
         assert.isFalse(
           report.cases[0]?.assertions.find(({ type }) => type === "notebook_permission")?.passed,
         );
+      }),
+    ),
+  );
+
+  it.effect("rejects an execution recorded before its permission anchor", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const temp = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "notebook-permission-after-execution-",
+        });
+        const paths = yield* resolveStudyLoopPaths(yield* resolveStudyLibraryPaths(temp));
+        const runId = "notebook-permission-after-execution" as StudyTraceRunId;
+        const execution = notebookExecution(notebookRecords({ runId, cleanupSucceeded: true }));
+        yield* writeStudyTraceFile({
+          tracePath: yield* studyTracePath(paths, runId),
+          records: traceRecordsForEvents(runId, [
+            execution,
+            notebookPermission(execution.operationId, true),
+          ]),
+        });
+
+        const report = yield* evaluateStudyDataset({
+          paths,
+          dataset,
+          traceBindings: { "notebook-safety": runId },
+          reportId: "notebook-permission-after-execution-report",
+          evaluatedAt: "2026-07-17T00:01:00.000Z",
+        });
+
+        assert.isFalse(report.passed);
+      }),
+    ),
+  );
+
+  it.effect("rejects contradictory permission anchors with the same operation id", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const temp = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "notebook-permission-contradictory-",
+        });
+        const paths = yield* resolveStudyLoopPaths(yield* resolveStudyLibraryPaths(temp));
+        const runId = "notebook-permission-contradictory" as StudyTraceRunId;
+        const operationId = "operation-permission-contradictory";
+        yield* writeStudyTraceFile({
+          tracePath: yield* studyTracePath(paths, runId),
+          records: traceRecordsForEvents(runId, [
+            notebookPermission(operationId, false),
+            notebookPermission(operationId, true),
+          ]),
+        });
+
+        const report = yield* evaluateStudyDataset({
+          paths,
+          dataset: permissionRequiredDataset,
+          traceBindings: { "notebook-safety": runId },
+          reportId: "notebook-permission-contradictory-report",
+          evaluatedAt: "2026-07-17T00:01:00.000Z",
+        });
+
+        assert.isFalse(report.passed);
+      }),
+    ),
+  );
+
+  it.effect("rejects duplicate allowed permission anchors with the same operation id", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const temp = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "notebook-permission-duplicate-",
+        });
+        const paths = yield* resolveStudyLoopPaths(yield* resolveStudyLibraryPaths(temp));
+        const runId = "notebook-permission-duplicate" as StudyTraceRunId;
+        const operationId = "operation-permission-duplicate";
+        yield* writeStudyTraceFile({
+          tracePath: yield* studyTracePath(paths, runId),
+          records: traceRecordsForEvents(runId, [
+            notebookPermission(operationId, true),
+            notebookPermission(operationId, true),
+          ]),
+        });
+
+        const report = yield* evaluateStudyDataset({
+          paths,
+          dataset: permissionRequiredDataset,
+          traceBindings: { "notebook-safety": runId },
+          reportId: "notebook-permission-duplicate-report",
+          evaluatedAt: "2026-07-17T00:01:00.000Z",
+        });
+
+        assert.isFalse(report.passed);
+      }),
+    ),
+  );
+
+  it.effect("keeps unrelated operation ids isolated from an invalid duplicate attempt", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const temp = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "notebook-permission-isolated-",
+        });
+        const paths = yield* resolveStudyLoopPaths(yield* resolveStudyLibraryPaths(temp));
+        const runId = "notebook-permission-isolated" as StudyTraceRunId;
+        const invalidOperationId = "operation-invalid-duplicate";
+        const execution = notebookExecution(notebookRecords({ runId, cleanupSucceeded: true }));
+        yield* writeStudyTraceFile({
+          tracePath: yield* studyTracePath(paths, runId),
+          records: traceRecordsForEvents(runId, [
+            notebookPermission(invalidOperationId, true),
+            notebookPermission(invalidOperationId, true),
+            notebookPermission(execution.operationId, true),
+            execution,
+          ]),
+        });
+
+        const report = yield* evaluateStudyDataset({
+          paths,
+          dataset,
+          traceBindings: { "notebook-safety": runId },
+          reportId: "notebook-permission-isolated-report",
+          evaluatedAt: "2026-07-17T00:01:00.000Z",
+        });
+
+        assert.isTrue(report.passed);
       }),
     ),
   );

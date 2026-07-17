@@ -115,25 +115,56 @@ interface NotebookAttemptEvidence {
   readonly pairedExecutionCount: number;
 }
 
+interface IndexedNotebookEvent<Event> {
+  readonly event: Event;
+  readonly recordIndex: number;
+}
+
+interface NotebookAttemptGroup {
+  readonly permissions: Array<IndexedNotebookEvent<StudyNotebookPermissionEvent>>;
+  readonly executions: Array<IndexedNotebookEvent<StudyNotebookExecutionEvent>>;
+}
+
 type NotebookAssertion = Extract<StudyEvalAssertion, { readonly operation: unknown }>;
 
 function matchingNotebookAttempts(
   records: ReadonlyArray<StudyTraceRecord>,
   operation: StudyNotebookExecutionEvent["operation"],
 ): ReadonlyArray<NotebookAttemptEvidence> {
-  const executions = records.flatMap((record) => {
+  const groups = new Map<string, NotebookAttemptGroup>();
+  for (const [recordIndex, record] of records.entries()) {
     const event = record.event;
-    return event.type === "notebook_execution" && event.operation === operation ? [event] : [];
-  });
-  return records.flatMap((record) => {
-    const event = record.event;
-    if (event.type !== "notebook_permission" || event.operation !== operation) return [];
-    const paired = executions.filter((execution) => execution.operationId === event.operationId);
+    if (event.type !== "notebook_permission" && event.type !== "notebook_execution") continue;
+    const group = groups.get(event.operationId) ?? { permissions: [], executions: [] };
+    if (event.type === "notebook_permission") {
+      group.permissions.push({ event, recordIndex });
+    } else {
+      group.executions.push({ event, recordIndex });
+    }
+    groups.set(event.operationId, group);
+  }
+
+  return [...groups.values()].flatMap((group) => {
+    const permission = group.permissions[0];
+    const execution = group.executions[0];
+    if (
+      group.permissions.length !== 1 ||
+      group.executions.length > 1 ||
+      permission === undefined ||
+      permission.event.operation !== operation ||
+      (execution !== undefined &&
+        (execution.event.operation !== operation ||
+          execution.recordIndex <= permission.recordIndex))
+    ) {
+      return [];
+    }
     return [
       {
-        permission: event,
-        ...(event.permissionGranted && paired.length === 1 ? { execution: paired[0] } : {}),
-        pairedExecutionCount: paired.length,
+        permission: permission.event,
+        ...(permission.event.permissionGranted && execution !== undefined
+          ? { execution: execution.event }
+          : {}),
+        pairedExecutionCount: group.executions.length,
       },
     ];
   });
