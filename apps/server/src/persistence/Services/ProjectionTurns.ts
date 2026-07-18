@@ -125,6 +125,20 @@ export const ProjectionAcceptedTurnStartPhaseResult = Schema.Struct({
 export type ProjectionAcceptedTurnStartPhaseResult =
   typeof ProjectionAcceptedTurnStartPhaseResult.Type;
 
+export const ProjectionCancelledTurnStart = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  providerTurnId: TurnId,
+  cancelledAt: IsoDateTime,
+});
+export type ProjectionCancelledTurnStart = typeof ProjectionCancelledTurnStart.Type;
+
+export const GetProjectionCancelledTurnStartInput = Schema.Struct({
+  threadId: ThreadId,
+  providerTurnId: TurnId,
+});
+export type GetProjectionCancelledTurnStartInput = typeof GetProjectionCancelledTurnStartInput.Type;
+
 export const ListProjectionTurnsByThreadInput = Schema.Struct({
   threadId: ThreadId,
 });
@@ -201,6 +215,16 @@ export interface ProjectionTurnRepositoryShape {
     Option.Option<ProjectionAcceptedTurnStartPhaseResult>,
     ProjectionRepositoryError
   >;
+
+  /** Atomically records an exact failed provider generation and removes its accepted start. */
+  readonly cancelAcceptedTurnStart: (
+    input: ProjectionCancelledTurnStart,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
+
+  /** Returns an exact failed provider generation tombstone when present. */
+  readonly getCancelledTurnStartByProviderTurn: (
+    input: GetProjectionCancelledTurnStartInput,
+  ) => Effect.Effect<Option.Option<ProjectionCancelledTurnStart>, ProjectionRepositoryError>;
 
   /** Deletes an accepted turn start only when both its thread and message identity match. */
   readonly deleteAcceptedTurnStart: (

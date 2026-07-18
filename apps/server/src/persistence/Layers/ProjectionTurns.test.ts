@@ -1,4 +1,4 @@
-import { MessageId, ThreadId } from "@t3tools/contracts";
+import { MessageId, ThreadId, TurnId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -165,6 +165,89 @@ layer("ProjectionTurnRepository accepted starts", (it) => {
       assert.isFalse(
         Option.getOrThrow(yield* repository.getAcceptedTurnStartByThreadId({ threadId }))
           .providerSendCompleted,
+      );
+    }),
+  );
+
+  it.effect("tombstones cancelled A by exact provider turn while admitting later B", () =>
+    Effect.gen(function* () {
+      const repository = yield* ProjectionTurnRepository;
+      const threadId = ThreadId.make("thread-cancelled-turn-start");
+      const messageA = MessageId.make("message-cancelled-a");
+      const messageB = MessageId.make("message-after-cancelled-b");
+      const providerTurnA = TurnId.make("provider-turn-cancelled-a");
+      const acceptedA = {
+        threadId,
+        messageId: messageA,
+        sourceProposedPlanThreadId: null,
+        sourceProposedPlanId: null,
+        requestedAt: "2026-01-01T00:00:00.000Z",
+      } as const;
+      const cancelledA = {
+        threadId,
+        messageId: messageA,
+        providerTurnId: providerTurnA,
+        cancelledAt: "2026-01-01T00:00:01.000Z",
+      } as const;
+
+      assert.isTrue(yield* repository.stageAcceptedTurnStart(acceptedA));
+      assert.isTrue(yield* repository.cancelAcceptedTurnStart(cancelledA));
+      assert.isTrue(Option.isNone(yield* repository.getAcceptedTurnStartByThreadId({ threadId })));
+      assert.deepEqual(
+        Option.getOrThrow(
+          yield* repository.getCancelledTurnStartByProviderTurn({
+            threadId,
+            providerTurnId: providerTurnA,
+          }),
+        ),
+        cancelledA,
+      );
+
+      assert.isTrue(yield* repository.cancelAcceptedTurnStart(cancelledA));
+      assert.isFalse(
+        yield* repository.cancelAcceptedTurnStart({
+          ...cancelledA,
+          messageId: messageB,
+        }),
+      );
+      assert.deepEqual(
+        Option.getOrThrow(
+          yield* repository.getCancelledTurnStartByProviderTurn({
+            threadId,
+            providerTurnId: providerTurnA,
+          }),
+        ),
+        cancelledA,
+      );
+
+      assert.isTrue(
+        yield* repository.stageAcceptedTurnStart({
+          ...acceptedA,
+          messageId: messageB,
+          requestedAt: "2026-01-01T00:00:02.000Z",
+        }),
+      );
+      assert.equal(
+        Option.getOrThrow(yield* repository.getAcceptedTurnStartByThreadId({ threadId })).messageId,
+        messageB,
+      );
+      assert.isTrue(
+        Option.isSome(
+          yield* repository.getCancelledTurnStartByProviderTurn({
+            threadId,
+            providerTurnId: providerTurnA,
+          }),
+        ),
+      );
+
+      yield* repository.deleteByThreadId({ threadId });
+      assert.isTrue(
+        Option.isNone(
+          yield* repository.getCancelledTurnStartByProviderTurn({
+            threadId,
+            providerTurnId: providerTurnA,
+          }),
+        ),
       );
     }),
   );

@@ -1298,6 +1298,376 @@ describe("ProviderCommandReactor", () => {
     expect(harness.readNotebookDocumentAuthority()).toEqual([documentB]);
   });
 
+  it("replays a deferred runtime-admission phase before admitting same-process B", async () => {
+    const harness = await createHarness();
+    const threadId = ThreadId.make("thread-1");
+    const messageA = asMessageId("user-message-runtime-phase-retry-a");
+    const messageB = asMessageId("user-message-runtime-phase-retry-b");
+    const turnA = asTurnId("turn-runtime-phase-retry-a");
+    const turnB = asTurnId("turn-runtime-phase-retry-b");
+    const documentA = "a".repeat(64);
+    const documentB = "b".repeat(64);
+    harness.sendTurn.mockImplementationOnce(() => Effect.succeed({ threadId, turnId: turnA }));
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-runtime-phase-retry-a"),
+        threadId,
+        message: {
+          messageId: messageA,
+          role: "user",
+          text: "project A before the runtime phase write succeeds",
+          attachments: [],
+        },
+        documentIds: [documentA],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      }),
+    );
+    await waitFor(() => harness.completeNotebookDocumentAuthorityTurn.mock.calls.length === 1);
+
+    const completeAcceptedTurnStartPhase = harness.turns.completeAcceptedTurnStartPhase;
+    let rejectedRuntimePhaseWrites = 0;
+    vi.spyOn(harness.turns, "completeAcceptedTurnStartPhase").mockImplementation((input) => {
+      if (input.phase === "runtime-admitted" && rejectedRuntimePhaseWrites === 0) {
+        rejectedRuntimePhaseWrites += 1;
+        return Effect.die(
+          new Error("injected first runtime-admission phase write failure"),
+        ) as never;
+      }
+      return completeAcceptedTurnStartPhase(input);
+    });
+
+    const runtimeSession = harness.runtimeSessions.find((session) => session.threadId === threadId);
+    expect(runtimeSession).toBeDefined();
+    if (!runtimeSession) throw new Error("Expected provider session for runtime-phase A.");
+    Object.assign(runtimeSession, {
+      status: "running" as const,
+      activeTurnId: turnA,
+      updatedAt: "2026-01-01T00:00:02.000Z",
+    });
+    harness.emitRuntimeEvent({
+      type: "turn.started",
+      eventId: EventId.make("evt-runtime-phase-retry-a-started"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      createdAt: "2026-01-01T00:00:02.000Z",
+      threadId,
+      turnId: turnA,
+      payload: {},
+    });
+    await harness.drainIngestion();
+
+    expect(rejectedRuntimePhaseWrites).toBe(1);
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentA]);
+    expect(
+      Option.getOrThrow(
+        await Effect.runPromise(harness.turns.getAcceptedTurnStartByThreadId({ threadId })),
+      ),
+    ).toMatchObject({
+      messageId: messageA,
+      providerSendCompleted: true,
+      runtimeAdmitted: false,
+    });
+    expect(
+      Option.getOrThrow(
+        await Effect.runPromise(harness.turns.getByTurnId({ threadId, turnId: turnA })),
+      ).pendingMessageId,
+    ).toBe(messageA);
+
+    const { activeTurnId: _activeTurnId, ...readyRuntimeSession } = runtimeSession;
+    Object.assign(runtimeSession, readyRuntimeSession, {
+      status: "ready" as const,
+      updatedAt: "2026-01-01T00:00:03.000Z",
+    });
+    delete (runtimeSession as { activeTurnId?: TurnId }).activeTurnId;
+    harness.emitRuntimeEvent({
+      type: "turn.completed",
+      eventId: EventId.make("evt-runtime-phase-retry-a-completed"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      createdAt: "2026-01-01T00:00:03.000Z",
+      threadId,
+      turnId: turnA,
+      payload: { state: "completed" },
+    });
+    await harness.drainIngestion();
+    harness.sendTurn.mockImplementationOnce(() => Effect.succeed({ threadId, turnId: turnB }));
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-runtime-phase-retry-b"),
+        threadId,
+        message: {
+          messageId: messageB,
+          role: "user",
+          text: "start B after replaying exact A",
+          attachments: [],
+        },
+        documentIds: [documentB],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:04.000Z",
+      }),
+    );
+    await harness.drain();
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+    expect(harness.sendTurn).toHaveBeenCalledTimes(2);
+    expect(
+      Option.getOrThrow(
+        await Effect.runPromise(harness.turns.getAcceptedTurnStartByThreadId({ threadId })),
+      ).messageId,
+    ).toBe(messageB);
+
+    Object.assign(runtimeSession, {
+      status: "running" as const,
+      activeTurnId: turnB,
+      updatedAt: "2026-01-01T00:00:05.000Z",
+    });
+    harness.emitRuntimeEvent({
+      type: "turn.started",
+      eventId: EventId.make("evt-runtime-phase-retry-b-started"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      createdAt: "2026-01-01T00:00:05.000Z",
+      threadId,
+      turnId: turnB,
+      payload: {},
+    });
+    await harness.drainIngestion();
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentB]);
+    expect(
+      (await Effect.runPromise(harness.turns.getAcceptedTurnStartByThreadId({ threadId })))._tag,
+    ).toBe("None");
+  });
+
+  it("rejects queued late A after send failure and admits B across reactor and ingestion workers", async () => {
+    const harness = await createHarness();
+    const threadId = ThreadId.make("thread-1");
+    const sourceThreadId = ThreadId.make("thread-late-cancelled-source-plan");
+    const sourceTurnId = asTurnId("turn-late-cancelled-source-plan");
+    const messageA = asMessageId("user-message-late-cancelled-a");
+    const messageB = asMessageId("user-message-after-late-cancelled-b");
+    const turnA = asTurnId("turn-late-cancelled-a");
+    const turnB = asTurnId("turn-after-late-cancelled-b");
+    const documentA = "a".repeat(64);
+    const documentB = "b".repeat(64);
+    const sendEntered = Effect.runSync(Deferred.make<void>());
+    const releaseSend = Effect.runSync(Deferred.make<void>());
+    const ingestionHeld = Effect.runSync(Deferred.make<void>());
+    const releaseIngestion = Effect.runSync(Deferred.make<void>());
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-thread-create-late-cancelled-source-plan"),
+        threadId: sourceThreadId,
+        projectId: asProjectId("project-1"),
+        title: "Late cancelled source plan",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        interactionMode: "plan",
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    harness.emitRuntimeEvent({
+      type: "turn.proposed.completed",
+      eventId: EventId.make("evt-late-cancelled-source-plan-completed"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      threadId: sourceThreadId,
+      turnId: sourceTurnId,
+      payload: {
+        planMarkdown: "# Late cancelled source plan",
+      },
+    });
+    await waitFor(async () => {
+      const sourceThread = (await harness.readModel()).threads.find(
+        (thread) => thread.id === sourceThreadId,
+      );
+      return sourceThread?.proposedPlans.length === 1;
+    });
+    const sourcePlan = (await harness.readModel()).threads
+      .find((thread) => thread.id === sourceThreadId)
+      ?.proposedPlans.at(0);
+    expect(sourcePlan).toBeDefined();
+    if (!sourcePlan) throw new Error("Expected the late-cancelled source plan.");
+
+    harness.sendTurn.mockImplementationOnce(
+      () =>
+        Deferred.succeed(sendEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseSend)),
+          Effect.andThen(
+            Effect.fail(
+              new ProviderAdapterRequestError({
+                provider: "codex",
+                method: "thread.turn.start",
+                detail: "injected send rejection after queued turn.started",
+              }),
+            ),
+          ),
+        ) as never,
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-late-cancelled-a"),
+        threadId,
+        message: {
+          messageId: messageA,
+          role: "user",
+          text: "queue A before send rejection",
+          attachments: [],
+        },
+        documentIds: [documentA],
+        sourceProposedPlan: {
+          threadId: sourceThreadId,
+          planId: sourcePlan.id,
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      }),
+    );
+    await Effect.runPromise(Deferred.await(sendEntered));
+
+    const runtimeSession = harness.runtimeSessions.find((session) => session.threadId === threadId);
+    expect(runtimeSession).toBeDefined();
+    if (!runtimeSession) throw new Error("Expected provider session for cancelled A.");
+    Object.assign(runtimeSession, {
+      status: "running" as const,
+      activeTurnId: turnA,
+      updatedAt: "2026-01-01T00:00:02.000Z",
+    });
+    harness.listSessions.mockImplementationOnce(() =>
+      Deferred.succeed(ingestionHeld, undefined).pipe(
+        Effect.andThen(Deferred.await(releaseIngestion)),
+        Effect.as(harness.runtimeSessions),
+      ),
+    );
+    harness.emitRuntimeEvent({
+      type: "turn.started",
+      eventId: EventId.make("evt-late-cancelled-a-started"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      createdAt: "2026-01-01T00:00:02.000Z",
+      threadId,
+      turnId: turnA,
+      payload: {},
+    });
+    await Effect.runPromise(Deferred.await(ingestionHeld));
+
+    await Effect.runPromise(Deferred.succeed(releaseSend, undefined));
+    await waitFor(() => harness.rollbackNotebookDocumentAuthorityTurn.mock.calls.length === 1);
+    await Effect.runPromise(Deferred.succeed(releaseIngestion, undefined));
+    await harness.drainIngestion();
+    await harness.drain();
+
+    expect(
+      Option.getOrThrow(
+        await Effect.runPromise(
+          harness.turns.getCancelledTurnStartByProviderTurn({
+            threadId,
+            providerTurnId: turnA,
+          }),
+        ),
+      ).messageId,
+    ).toBe(messageA);
+    expect(
+      (await Effect.runPromise(harness.turns.getByTurnId({ threadId, turnId: turnA })))._tag,
+    ).toBe("None");
+    expect(harness.readNotebookDocumentAuthority()).toEqual([]);
+    expect(harness.admitNotebookDocumentAuthorityTurn).not.toHaveBeenCalledWith({
+      threadId,
+      messageId: messageA,
+    });
+    const readModelAfterCancelledA = await harness.readModel();
+    expect(
+      readModelAfterCancelledA.threads.find((thread) => thread.id === sourceThreadId)
+        ?.proposedPlans,
+    ).toContainEqual(
+      expect.objectContaining({
+        id: sourcePlan.id,
+        implementedAt: null,
+        implementationThreadId: null,
+      }),
+    );
+    expect(
+      readModelAfterCancelledA.threads.find((thread) => thread.id === threadId)?.session,
+    ).toMatchObject({
+      status: "ready",
+      activeTurnId: null,
+    });
+
+    harness.emitRuntimeEvent({
+      type: "turn.started",
+      eventId: EventId.make("evt-late-cancelled-a-duplicate"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      createdAt: "2026-01-01T00:00:03.000Z",
+      threadId,
+      turnId: turnA,
+      payload: {},
+    });
+    await harness.drainIngestion();
+    expect(
+      (await Effect.runPromise(harness.turns.getByTurnId({ threadId, turnId: turnA })))._tag,
+    ).toBe("None");
+
+    const { activeTurnId: _cancelledTurnId, ...readyRuntimeSession } = runtimeSession;
+    Object.assign(runtimeSession, readyRuntimeSession, {
+      status: "ready" as const,
+      updatedAt: "2026-01-01T00:00:04.000Z",
+    });
+    delete (runtimeSession as { activeTurnId?: TurnId }).activeTurnId;
+    harness.sendTurn.mockImplementationOnce(() => Effect.succeed({ threadId, turnId: turnB }));
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-after-late-cancelled-b"),
+        threadId,
+        message: {
+          messageId: messageB,
+          role: "user",
+          text: "start B after rejecting late A",
+          attachments: [],
+        },
+        documentIds: [documentB],
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:04.000Z",
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+    Object.assign(runtimeSession, {
+      status: "running" as const,
+      activeTurnId: turnB,
+      updatedAt: "2026-01-01T00:00:05.000Z",
+    });
+    harness.emitRuntimeEvent({
+      type: "turn.started",
+      eventId: EventId.make("evt-after-late-cancelled-b-started"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      createdAt: "2026-01-01T00:00:05.000Z",
+      threadId,
+      turnId: turnB,
+      payload: {},
+    });
+    await harness.drainIngestion();
+    expect(harness.readNotebookDocumentAuthority()).toEqual([documentB]);
+  });
+
   it("clears exact acquired guards when post-stage project resolution fails", async () => {
     const harness = await createHarness();
     const threadId = ThreadId.make("thread-1");

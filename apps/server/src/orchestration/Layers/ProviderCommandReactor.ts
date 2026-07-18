@@ -46,7 +46,10 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
-import { completeTurnStartAdmissionPhase } from "../TurnStartAdmission.ts";
+import {
+  completeTurnStartAdmissionPhase,
+  reconcileInactiveTurnStartAdmission,
+} from "../TurnStartAdmission.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
 
@@ -832,6 +835,7 @@ const make = Effect.gen(function* () {
         pendingTurnStarts.delete(event.payload.threadId);
       }
     });
+    let providerSendAttempted = false;
 
     const runFailureCleanupStep = <A, E, R>(operation: string, effect: Effect.Effect<A, E, R>) =>
       effect.pipe(
@@ -845,8 +849,34 @@ const make = Effect.gen(function* () {
         Effect.asVoid,
       );
 
+    const cleanupAcceptedTurnStart = Effect.gen(function* () {
+      if (!providerSendAttempted) {
+        yield* deleteAcceptedTurnStart;
+        return;
+      }
+
+      const sessions = yield* providerService.listSessions();
+      const failedSession = sessions.find((session) => session.threadId === event.payload.threadId);
+      if (failedSession?.activeTurnId === undefined) {
+        yield* deleteAcceptedTurnStart;
+        return;
+      }
+
+      const cancelled = yield* projectionTurnRepository.cancelAcceptedTurnStart({
+        ...authorityTurn,
+        providerTurnId: failedSession.activeTurnId,
+        cancelledAt: event.payload.createdAt,
+      });
+      if (!cancelled) {
+        yield* Effect.logWarning("provider turn failure cancellation tombstone deferred", {
+          ...authorityTurn,
+          providerTurnId: failedSession.activeTurnId,
+        });
+      }
+    });
+
     const cleanupAcquiredTurnStart = Effect.gen(function* () {
-      yield* runFailureCleanupStep("accepted-turn", deleteAcceptedTurnStart);
+      yield* runFailureCleanupStep("accepted-turn", cleanupAcceptedTurnStart);
       yield* runFailureCleanupStep("pending-turn", deleteProjectedTurnStart);
       yield* runFailureCleanupStep(
         "notebook-authority",
@@ -854,6 +884,21 @@ const make = Effect.gen(function* () {
       );
       yield* clearPendingTurnStart;
     });
+
+    const preAuthorityReconciliation = yield* reconcileInactiveTurnStartAdmission(
+      projectionTurnRepository,
+      {
+        threadId: event.payload.threadId,
+        nextMessageId: event.payload.messageId,
+      },
+    ).pipe(
+      Effect.onExit((exit) => (Exit.isFailure(exit) ? cleanupAcquiredTurnStart : Effect.void)),
+    );
+    if (preAuthorityReconciliation === "blocked") {
+      yield* cleanupAcquiredTurnStart;
+      yield* appendBusyTurnStartFailure(null);
+      return;
+    }
 
     const stagedAuthority = yield* McpSessionRegistry.stageActiveNotebookDocumentAuthorityTurn({
       ...authorityTurn,
@@ -865,37 +910,34 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    const stagedAcceptedTurn = yield* Effect.gen(function* () {
-      const existingAccepted = yield* projectionTurnRepository.getAcceptedTurnStartByThreadId({
-        threadId: event.payload.threadId,
-      });
-      if (
-        Option.isSome(existingAccepted) &&
-        existingAccepted.value.messageId !== event.payload.messageId
-      ) {
-        const staleTurnKey = {
+    if (preAuthorityReconciliation === "authority-probe-required") {
+      const postAuthorityReconciliation = yield* reconcileInactiveTurnStartAdmission(
+        projectionTurnRepository,
+        {
           threadId: event.payload.threadId,
-          messageId: existingAccepted.value.messageId,
-        } as const;
-        yield* projectionTurnRepository.deleteAcceptedTurnStart(staleTurnKey);
-        yield* projectionTurnRepository.deletePendingTurnStart(staleTurnKey).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("stale accepted turn reconciled with pending cleanup deferred", {
-              ...staleTurnKey,
-              cause: Cause.pretty(cause),
-            }),
-          ),
-        );
+          nextMessageId: event.payload.messageId,
+          authorityProbeSucceeded: true,
+        },
+      ).pipe(
+        Effect.onExit((exit) => (Exit.isFailure(exit) ? cleanupAcquiredTurnStart : Effect.void)),
+      );
+      if (postAuthorityReconciliation !== "ready") {
+        yield* cleanupAcquiredTurnStart;
+        yield* appendBusyTurnStartFailure(null);
+        return;
       }
-      return yield* projectionTurnRepository.stageAcceptedTurnStart({
+    }
+
+    const stagedAcceptedTurn = yield* projectionTurnRepository
+      .stageAcceptedTurnStart({
         ...authorityTurn,
         sourceProposedPlanThreadId: event.payload.sourceProposedPlan?.threadId ?? null,
         sourceProposedPlanId: event.payload.sourceProposedPlan?.planId ?? null,
         requestedAt: event.payload.createdAt,
-      });
-    }).pipe(
-      Effect.onExit((exit) => (Exit.isFailure(exit) ? cleanupAcquiredTurnStart : Effect.void)),
-    );
+      })
+      .pipe(
+        Effect.onExit((exit) => (Exit.isFailure(exit) ? cleanupAcquiredTurnStart : Effect.void)),
+      );
     if (!stagedAcceptedTurn) {
       yield* cleanupAcquiredTurnStart;
       yield* appendBusyTurnStartFailure(null);
@@ -984,6 +1026,7 @@ const make = Effect.gen(function* () {
         createdAt: event.payload.createdAt,
       });
 
+      providerSendAttempted = true;
       yield* providerService.sendTurn(sendTurnRequest);
       yield* McpSessionRegistry.completeActiveNotebookDocumentAuthorityTurn(authorityTurn);
       yield* completeTurnStartAdmissionPhase(projectionTurnRepository, {

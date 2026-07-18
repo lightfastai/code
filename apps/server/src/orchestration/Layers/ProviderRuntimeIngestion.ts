@@ -1137,21 +1137,6 @@ const make = Effect.gen(function* () {
     },
   );
 
-  const getAcceptedTurnStartForProviderTurn = Effect.fn("getAcceptedTurnStartForProviderTurn")(
-    function* (threadId: ThreadId, eventTurnId: TurnId | undefined) {
-      if (eventTurnId === undefined) {
-        return Option.none();
-      }
-
-      const expectedTurnId = yield* getExpectedProviderTurnIdForThread(threadId);
-      if (!sameId(expectedTurnId, eventTurnId)) {
-        return Option.none();
-      }
-
-      return yield* projectionTurnRepository.getAcceptedTurnStartByThreadId({ threadId });
-    },
-  );
-
   const markSourceProposedPlanImplemented = Effect.fn("markSourceProposedPlanImplemented")(
     function* (
       sourceThreadId: ThreadId,
@@ -1200,6 +1185,47 @@ const make = Effect.gen(function* () {
 
       const now = event.createdAt;
       const eventTurnId = toTurnId(event.turnId);
+      const expectedProviderTurnId =
+        event.type === "turn.started" && eventTurnId !== undefined
+          ? yield* getExpectedProviderTurnIdForThread(thread.id)
+          : undefined;
+      const cancelledTurnStart =
+        event.type === "turn.started" && eventTurnId !== undefined
+          ? yield* projectionTurnRepository.getCancelledTurnStartByProviderTurn({
+              threadId: thread.id,
+              providerTurnId: eventTurnId,
+            })
+          : Option.none();
+      if (Option.isSome(cancelledTurnStart)) {
+        const cancelledKey = {
+          threadId: thread.id,
+          messageId: cancelledTurnStart.value.messageId,
+        } as const;
+        yield* projectionTurnRepository.deleteAcceptedTurnStart(cancelledKey).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("cancelled provider turn accepted cleanup deferred", {
+              ...cancelledKey,
+              providerTurnId: eventTurnId,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        );
+        yield* projectionTurnRepository.deletePendingTurnStart(cancelledKey).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("cancelled provider turn pending cleanup deferred", {
+              ...cancelledKey,
+              providerTurnId: eventTurnId,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        );
+        yield* McpSessionRegistry.rollbackActiveNotebookDocumentAuthorityTurn(cancelledKey);
+        yield* Effect.logWarning("provider runtime ingestion ignored cancelled turn start", {
+          ...cancelledKey,
+          providerTurnId: eventTurnId,
+        });
+        return;
+      }
       const activeTurnId = thread.session?.activeTurnId ?? null;
 
       const conflictsWithActiveTurn =
@@ -1214,7 +1240,7 @@ const make = Effect.gen(function* () {
       // turn.started for some other turn id still gets rejected.
       const conflictingTurnStartIsAcceptedTurnStart =
         event.type === "turn.started" && conflictsWithActiveTurn
-          ? sameId(yield* getExpectedProviderTurnIdForThread(thread.id), eventTurnId) &&
+          ? sameId(expectedProviderTurnId, eventTurnId) &&
             Option.isSome(
               yield* projectionTurnRepository.getAcceptedTurnStartByThreadId({
                 threadId: thread.id,
@@ -1249,8 +1275,12 @@ const make = Effect.gen(function* () {
         }
       })();
       const acceptedTurnStart =
-        event.type === "turn.started" && shouldApplyThreadLifecycle
-          ? yield* getAcceptedTurnStartForProviderTurn(thread.id, eventTurnId)
+        event.type === "turn.started" &&
+        shouldApplyThreadLifecycle &&
+        sameId(expectedProviderTurnId, eventTurnId)
+          ? yield* projectionTurnRepository.getAcceptedTurnStartByThreadId({
+              threadId: thread.id,
+            })
           : Option.none();
       const acceptedTurnStartedSourcePlan = Option.isSome(acceptedTurnStart)
         ? acceptedTurnStart.value.sourceProposedPlanThreadId !== null &&
@@ -1367,7 +1397,16 @@ const make = Effect.gen(function* () {
               threadId: thread.id,
               messageId: acceptedTurnStart.value.messageId,
               phase: "runtime-admitted",
-            });
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("runtime turn-start admission phase persistence deferred", {
+                  threadId: thread.id,
+                  turnId: eventTurnId,
+                  messageId: acceptedTurnStart.value.messageId,
+                  cause: Cause.pretty(cause),
+                }),
+              ),
+            );
           }
         }
       }

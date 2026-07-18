@@ -12,11 +12,13 @@ import {
   ClearCheckpointTurnConflictInput,
   CompleteProjectionAcceptedTurnStartPhaseInput,
   DeleteProjectionTurnsByThreadInput,
+  GetProjectionCancelledTurnStartInput,
   GetProjectionPendingTurnStartInput,
   GetProjectionTurnByTurnIdInput,
   ListProjectionTurnsByThreadInput,
   ProjectionAcceptedTurnStart,
   ProjectionAcceptedTurnStartState,
+  ProjectionCancelledTurnStart,
   ProjectionPendingTurnStart,
   ProjectionTurn,
   ProjectionTurnById,
@@ -271,6 +273,63 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
       `,
   });
 
+  const upsertCancelledProjectionTurnStart = SqlSchema.findOneOption({
+    Request: ProjectionCancelledTurnStart,
+    Result: ProjectionCancelledTurnStart,
+    execute: ({ threadId, messageId, providerTurnId, cancelledAt }) =>
+      sql`
+        INSERT INTO projection_turn_start_cancellations (
+          thread_id,
+          message_id,
+          provider_turn_id,
+          cancelled_at
+        )
+        SELECT
+          ${threadId},
+          ${messageId},
+          ${providerTurnId},
+          ${cancelledAt}
+        WHERE EXISTS (
+          SELECT 1
+          FROM projection_turn_start_admissions
+          WHERE thread_id = ${threadId}
+            AND message_id = ${messageId}
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM projection_turn_start_cancellations
+          WHERE thread_id = ${threadId}
+            AND provider_turn_id = ${providerTurnId}
+            AND message_id = ${messageId}
+        )
+        ON CONFLICT (thread_id, provider_turn_id) DO UPDATE SET
+          cancelled_at = excluded.cancelled_at
+        WHERE projection_turn_start_cancellations.message_id = excluded.message_id
+        RETURNING
+          thread_id AS "threadId",
+          message_id AS "messageId",
+          provider_turn_id AS "providerTurnId",
+          cancelled_at AS "cancelledAt"
+      `,
+  });
+
+  const getCancelledProjectionTurnStart = SqlSchema.findOneOption({
+    Request: GetProjectionCancelledTurnStartInput,
+    Result: ProjectionCancelledTurnStart,
+    execute: ({ threadId, providerTurnId }) =>
+      sql`
+        SELECT
+          thread_id AS "threadId",
+          message_id AS "messageId",
+          provider_turn_id AS "providerTurnId",
+          cancelled_at AS "cancelledAt"
+        FROM projection_turn_start_cancellations
+        WHERE thread_id = ${threadId}
+          AND provider_turn_id = ${providerTurnId}
+        LIMIT 1
+      `,
+  });
+
   const deletePendingProjectionTurnStart = SqlSchema.findOneOption({
     Request: ProjectionTurnStartKey,
     Result: ProjectionTurnStartKey,
@@ -378,6 +437,15 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
     execute: ({ threadId }) =>
       sql`
         DELETE FROM projection_turn_start_admissions
+        WHERE thread_id = ${threadId}
+      `,
+  });
+
+  const deleteCancelledProjectionTurnStartsByThread = SqlSchema.void({
+    Request: DeleteProjectionTurnsByThreadInput,
+    execute: ({ threadId }) =>
+      sql`
+        DELETE FROM projection_turn_start_cancellations
         WHERE thread_id = ${threadId}
       `,
   });
@@ -498,6 +566,40 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
       ),
     );
 
+  const cancelAcceptedTurnStart: ProjectionTurnRepositoryShape["cancelAcceptedTurnStart"] = (
+    input,
+  ) =>
+    sql
+      .withTransaction(
+        upsertCancelledProjectionTurnStart(input).pipe(
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Effect.succeed(false),
+              onSome: () => deleteAcceptedProjectionTurnStart(input).pipe(Effect.as(true)),
+            }),
+          ),
+        ),
+      )
+      .pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionTurnRepository.cancelAcceptedTurnStart:query",
+            "ProjectionTurnRepository.cancelAcceptedTurnStart:decodeRow",
+          ),
+        ),
+      );
+
+  const getCancelledTurnStartByProviderTurn: ProjectionTurnRepositoryShape["getCancelledTurnStartByProviderTurn"] =
+    (input) =>
+      getCancelledProjectionTurnStart(input).pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionTurnRepository.getCancelledTurnStartByProviderTurn:query",
+            "ProjectionTurnRepository.getCancelledTurnStartByProviderTurn:decodeRow",
+          ),
+        ),
+      );
+
   const deletePendingTurnStart: ProjectionTurnRepositoryShape["deletePendingTurnStart"] = (input) =>
     deletePendingProjectionTurnStart(input).pipe(
       Effect.map(Option.isSome),
@@ -558,6 +660,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
       .withTransaction(
         deleteProjectionTurnsByThread(input).pipe(
           Effect.andThen(deleteAcceptedProjectionTurnStartsByThread(input)),
+          Effect.andThen(deleteCancelledProjectionTurnStartsByThread(input)),
         ),
       )
       .pipe(
@@ -571,6 +674,8 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
     stageAcceptedTurnStart,
     getAcceptedTurnStartByThreadId,
     completeAcceptedTurnStartPhase,
+    cancelAcceptedTurnStart,
+    getCancelledTurnStartByProviderTurn,
     deleteAcceptedTurnStart,
     deletePendingTurnStart,
     deletePendingTurnStartByThreadId,
