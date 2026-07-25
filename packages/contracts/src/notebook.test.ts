@@ -2,6 +2,8 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
 import {
+  CreateNotebookArtifactInput,
+  CreateNotebookArtifactResult,
   NotebookAgentExecutionPermission,
   NotebookAgentExecutionPermissionGetInput,
   NotebookAgentExecutionPermissionSetInput,
@@ -21,6 +23,8 @@ const decodePermission = Schema.decodeUnknownSync(NotebookAgentExecutionPermissi
 const decodePermissionGet = Schema.decodeUnknownSync(NotebookAgentExecutionPermissionGetInput);
 const decodePermissionSet = Schema.decodeUnknownSync(NotebookAgentExecutionPermissionSetInput);
 const decodePublishNotebook = Schema.decodeUnknownSync(PublishNotebookArtifactInput);
+const decodeCreateArtifact = Schema.decodeUnknownSync(CreateNotebookArtifactInput);
+const decodeCreateArtifactResult = Schema.decodeUnknownSync(CreateNotebookArtifactResult);
 const decodeExecuteCell = Schema.decodeUnknownSync(NotebookAgentExecuteCellInput);
 const decodeExecuteAll = Schema.decodeUnknownSync(NotebookAgentExecuteAllInput);
 const decodeSessionOpen = Schema.decodeUnknownSync(NotebookSessionOpenInput);
@@ -207,5 +211,63 @@ describe("notebook agent contracts", () => {
         initialView: { mode: "notebook" },
       }),
     ).toThrow();
+  });
+
+  it("accepts an nbformat-safe notebook document for agent-authored immutable revisions", () => {
+    const document = {
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {
+        kernelspec: {
+          name: "python3",
+          display_name: "Python 3",
+          language: "python",
+        },
+        lightfast: { title: "Squares" },
+      },
+      cells: [
+        {
+          cell_type: "markdown",
+          id: "intro",
+          metadata: {},
+          source: "# Squares",
+        },
+        {
+          cell_type: "code",
+          id: "calculate",
+          metadata: {},
+          source: "print([x * x for x in range(5)])",
+          execution_count: null,
+          outputs: [],
+        },
+      ],
+    } as const;
+
+    expect(() =>
+      decodeCreateArtifact({
+        document: {
+          ...document,
+          cells: [{ ...document.cells[1], id: "../unsafe" }],
+        },
+        initialView: { mode: "notebook" },
+      }),
+    ).toThrow();
+
+    expect(
+      decodeCreateArtifact({
+        document,
+        title: "Python Artifact Smoke Test",
+        initialView: { mode: "cell", cellId: "calculate" },
+      }),
+    ).toMatchObject({ document, initialView: { mode: "cell", cellId: "calculate" } });
+    expect(
+      decodeCreateArtifactResult({
+        artifactId: "artifact-created",
+        messageId: "artifact-message-created",
+        documentId: "notebook-created",
+        revisionId: "a".repeat(64),
+        contentHash: "a".repeat(64),
+      }),
+    ).toMatchObject({ artifactId: "artifact-created", documentId: "notebook-created" });
   });
 });

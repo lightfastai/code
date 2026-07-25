@@ -541,6 +541,97 @@ describe("deriveMessagesTimelineRows", () => {
     ).toBeDefined();
   });
 
+  it("keeps artifact-bearing assistant messages visible when settled-turn work is folded", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        {
+          id: "user-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:00Z",
+          message: {
+            id: "user-1" as never,
+            role: "user",
+            text: "Show me the coordinates",
+            turnId: null,
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            streaming: false,
+          },
+        },
+        {
+          id: "work-entry",
+          kind: "work",
+          createdAt: "2026-01-01T00:00:05Z",
+          entry: {
+            id: "work-1",
+            createdAt: "2026-01-01T00:00:05Z",
+            turnId: "turn-1" as never,
+            label: "Published interactive 3D scene",
+            tone: "tool",
+          },
+        },
+        {
+          id: "artifact-message-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:08Z",
+          message: {
+            id: "artifact-message" as never,
+            role: "assistant",
+            text: "",
+            attachments: [
+              {
+                type: "artifact",
+                id: "coordinate-scene",
+                kind: "3d-scene",
+                schemaVersion: 1,
+                title: "Coordinate Scene",
+                payload: {
+                  objects: [
+                    {
+                      type: "sphere",
+                      id: "point",
+                      center: [1, 1, 1],
+                      radius: 0.1,
+                    },
+                  ],
+                },
+              },
+            ],
+            turnId: "turn-1" as never,
+            createdAt: "2026-01-01T00:00:08Z",
+            updatedAt: "2026-01-01T00:00:08Z",
+            streaming: false,
+          },
+        },
+        {
+          id: "assistant-final-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:10Z",
+          message: {
+            id: "assistant-final" as never,
+            role: "assistant",
+            text: "The interactive coordinate scene is ready.",
+            turnId: "turn-1" as never,
+            createdAt: "2026-01-01T00:00:10Z",
+            updatedAt: "2026-01-01T00:00:11Z",
+            streaming: false,
+          },
+        },
+      ],
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(rows.map((row) => row.id)).toEqual([
+      "user-entry",
+      "turn-fold:turn-1",
+      "artifact-message-entry",
+      "assistant-final-entry",
+    ]);
+  });
+
   it("derives a sane duration for a steer-superseded turn with one instant commentary message", () => {
     // A steer ends the previous turn early: its only message completes the
     // instant it is created, and trailing work entries land after it. The

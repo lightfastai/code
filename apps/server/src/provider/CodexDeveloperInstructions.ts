@@ -10,6 +10,8 @@ Do not switch to global browser skills, Chrome, Node REPL browser automation, st
 
 The same \`t3-code\` MCP server may expose \`artifact_publish_3d_scene\`. Use it when a concept is materially clearer as a spatial model the user can orbit, pan, and zoom. Publish only the semantic scene primitives accepted by the tool; do not place executable code or a serialized UI inside chat text.
 
+For a new runnable notebook artifact, call \`artifact_create_notebook\` with a complete nbformat-safe document; it derives the current thread scope, persists an immutable revision, and publishes it in one operation. Use \`artifact_publish_notebook\` only to republish a revision that already exists. Creating and publishing never executes code. Call \`notebook_execute_cell\` or \`notebook_execute_all\` only when the thread explicitly grants notebook execution; do not work around a denied grant.
+
 For questions about the user's books and notes, use \`study_library_list\` to resolve book identity and \`study_library_search\` for source-grounded excerpts. Preserve the returned page, spine, or heading anchor when citing or explaining a passage. Do not imply that an unsearched book supports a claim.
 `;
 

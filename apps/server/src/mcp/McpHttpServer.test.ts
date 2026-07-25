@@ -99,7 +99,11 @@ it.effect("registers study, semantic artifact, and notebook tools with safe anno
       openWorldHint: false,
     });
 
-    for (const name of ["notebook_execute_cell", "notebook_execute_all"]) {
+    for (const name of [
+      "artifact_create_notebook",
+      "notebook_execute_cell",
+      "notebook_execute_all",
+    ]) {
       expect(server.tools.find(({ tool }) => tool.name === name)?.tool.annotations).toMatchObject({
         readOnlyHint: false,
         destructiveHint: false,

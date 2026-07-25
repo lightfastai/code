@@ -215,6 +215,22 @@ export const PublishNotebookArtifactResult = Schema.Struct({
 });
 export type PublishNotebookArtifactResult = typeof PublishNotebookArtifactResult.Type;
 
+export const CreateNotebookArtifactInput = Schema.Struct({
+  document: NotebookDocument,
+  title: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(255))),
+  initialView: NotebookInitialView,
+});
+export type CreateNotebookArtifactInput = typeof CreateNotebookArtifactInput.Type;
+
+export const CreateNotebookArtifactResult = Schema.Struct({
+  artifactId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  messageId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  documentId: NotebookDocumentId,
+  revisionId: NotebookRevisionId,
+  contentHash: NotebookContentHash,
+});
+export type CreateNotebookArtifactResult = typeof CreateNotebookArtifactResult.Type;
+
 export const NotebookAgentExecuteCellInput = Schema.Struct({
   ...NotebookRevisionRef.fields,
   ...NotebookSelectedStudyDocuments.fields,

@@ -455,6 +455,42 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect("keeps forwarding runtime events after the startSession caller completes", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const startFiber = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("codex"),
+          threadId: asThreadId("thread-start-caller-complete"),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Fiber.join(startFiber);
+
+      const runtime = lifecycleRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+
+      yield* runtime.emit({
+        id: asEventId("evt-after-start-caller-complete"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "turn/started",
+        threadId: asThreadId("thread-start-caller-complete"),
+        turnId: asTurnId("turn-after-start-caller-complete"),
+      });
+
+      const firstEvent = yield* Fiber.join(firstEventFiber).pipe(Effect.timeout("1 second"));
+      NodeAssert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some") {
+        return;
+      }
+      NodeAssert.equal(firstEvent.value.type, "turn.started");
+      NodeAssert.equal(firstEvent.value.turnId, "turn-after-start-caller-complete");
+    }),
+  );
+
   it.effect(
     "correlates Codex turn.started before publishing an event queued before send returns",
     () =>

@@ -1,8 +1,12 @@
-# Lightfast pending tasks after the core cutoff
+# Lightfast PR #1 pre-merge task list
 
-This is the handoff for the core-testable prototype slice. Items marked complete are part of that
-slice; unchecked work is deferred parity, polish, validation, or integration work rather than a
-claim that the core is blocked.
+This is the handoff for the core-testable prototype slice in
+[PR #1](https://github.com/lightfastai/code/pull/1). Items marked complete are part of the tested
+slice. Every unchecked item is a merge blocker: it must be completed or explicitly resolved and
+recorded in the PR before the draft can be marked ready or merged.
+
+For a cold restart after time away from the project, begin with
+[the PR #1 restart packet](./pr-1-restart.md).
 
 ## Core-shippable slice
 
@@ -18,7 +22,7 @@ claim that the core is blocked.
       clears the live semantic scene and a later room accepts a fresh generation; see the local
       [operator and test runbook](./local-testing.md#livekit-voice-and-semantic-3d-scenes).
 
-## Next few days: validation and local tooling
+## Required before merge: validation and local tooling
 
 - [ ] **Owner: mobile/native maintainer — validate the notebook renderer on a real iPad.** Pair
       the device with a Mac running the server and Docker runtime; accept only after the complete
@@ -47,10 +51,11 @@ claim that the core is blocked.
       deliberate recursive package-script run. Follow the exact Docker, voice, study, and mobile
       commands in the [operator runbook](./local-testing.md).
 
-## Next few days: mobile notebook parity and polish
+## Required before merge: mobile notebook parity and polish
 
-These are intentionally outside the core renderer. They are concrete gaps in the current native
-card, which presently offers per-cell source editing and Run but not the following UI workflows.
+These are outside the currently tested core renderer but are required before PR #1 merges. They
+are concrete gaps in the current native card, which presently offers per-cell source editing and
+Run but not the following UI workflows.
 
 - [ ] **Owner: mobile notebook maintainer — add/remove/reorder/duplicate cells.** Preserve stable
       cell IDs, immutable revisions, and offline/pending mutation locks; acceptance includes native
@@ -66,7 +71,7 @@ card, which presently offers per-cell source editing and Run but not the followi
       JavaScript, and unsupported active MIME remain inert fallbacks. Define safe, bounded plot formats
       with web parity tests before rendering anything richer.
 
-## Future artifact parity
+## Required before merge: artifact parity
 
 - [ ] **Owner: artifact/mobile maintainer — decide the mobile handoff for rich interactive
       artifacts.** Until an audited native renderer exists, keep full interactive 3D and any other

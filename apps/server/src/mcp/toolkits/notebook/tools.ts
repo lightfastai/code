@@ -1,5 +1,7 @@
 import {
   ArtifactPublishError,
+  CreateNotebookArtifactInput,
+  CreateNotebookArtifactResult,
   NotebookAgentExecuteAllInput,
   NotebookAgentExecuteCellInput,
   NotebookAgentExecutionResult,
@@ -24,6 +26,20 @@ const sharedDependencies = [
   NotebookRevisionStore,
   ProjectionSnapshotQuery,
 ];
+
+export const CreateNotebookArtifactTool = Tool.make("artifact_create_notebook", {
+  description:
+    "Create an immutable nbformat-safe notebook revision and publish it directly into this conversation in one operation. Supply markdown and code cells in a complete notebook document. This never executes code; notebook execution remains a separate, explicitly permission-gated action.",
+  parameters: CreateNotebookArtifactInput,
+  success: CreateNotebookArtifactResult,
+  failure: ArtifactPublishError,
+  dependencies: [...sharedDependencies, OrchestrationEngineService],
+})
+  .annotate(Tool.Title, "Create notebook artifact")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, false)
+  .annotate(Tool.OpenWorld, false);
 
 export const PublishNotebookArtifactTool = Tool.make("artifact_publish_notebook", {
   description:
@@ -77,6 +93,7 @@ export const ExecuteNotebookAllTool = Tool.make("notebook_execute_all", {
   .annotate(Tool.OpenWorld, false);
 
 export const NotebookToolkit = Toolkit.make(
+  CreateNotebookArtifactTool,
   PublishNotebookArtifactTool,
   ExecuteNotebookCellTool,
   ExecuteNotebookAllTool,

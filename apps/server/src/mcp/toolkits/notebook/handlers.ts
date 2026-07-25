@@ -3,6 +3,8 @@ import * as NodeCrypto from "node:crypto";
 import {
   ArtifactPublishError,
   CommandId,
+  type CreateNotebookArtifactInput,
+  type CreateNotebookArtifactResult,
   MessageId,
   NotebookAgentToolError,
   type NotebookAgentExecuteAllInput,
@@ -10,6 +12,7 @@ import {
   type PublishNotebookArtifactInput,
   type PublishNotebookArtifactResult,
 } from "@t3tools/contracts";
+import type { NotebookRevision } from "@t3tools/lightfast-artifact-notebook/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -74,6 +77,49 @@ const requireThreadProject = Effect.fn("NotebookToolkit.requireThreadProject")(f
   return invocation;
 });
 
+const publishRevision = Effect.fn("NotebookToolkit.publishRevision")(function* (input: {
+  readonly invocation: McpInvocationContext.McpInvocationScope;
+  readonly revision: NotebookRevision;
+  readonly title: string | undefined;
+  readonly initialView: PublishNotebookArtifactInput["initialView"];
+  readonly documentIds: PublishNotebookArtifactInput["documentIds"];
+}) {
+  const orchestration = yield* OrchestrationEngineService;
+  const id = NodeCrypto.randomUUID();
+  const artifactId = `artifact-${id}`;
+  const messageId = `artifact-message-${id}`;
+  const createdAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+  const artifact = yield* lightfastServerCapabilities.artifactRegistry
+    .decodeForPublication(
+      lightfastServerCapabilities.notebook.makeArtifact({
+        id: artifactId,
+        title: input.title ?? input.revision.document.metadata.lightfast?.title ?? "Notebook",
+        payload: {
+          documentId: input.revision.documentId,
+          revisionId: input.revision.revisionId,
+          contentHash: input.revision.contentHash,
+          kernel: input.revision.kernel,
+          initialView: input.initialView,
+          documentIds: input.documentIds,
+        },
+      }),
+    )
+    .pipe(Effect.mapError(() => publicationError()));
+
+  yield* orchestration
+    .dispatch({
+      type: "thread.message.artifact.publish",
+      commandId: CommandId.make(`artifact-command-${id}`),
+      threadId: input.invocation.threadId,
+      messageId: MessageId.make(messageId),
+      artifact: artifact.artifact,
+      createdAt,
+    })
+    .pipe(Effect.mapError(() => publicationError()));
+
+  return { artifactId, messageId };
+});
+
 export const publishNotebook = Effect.fn("NotebookToolkit.publishNotebook")(function* (
   input: PublishNotebookArtifactInput,
 ) {
@@ -88,41 +134,51 @@ export const publishNotebook = Effect.fn("NotebookToolkit.publishNotebook")(func
   }
   const store = yield* NotebookRevisionStore;
   const revision = yield* store.read(input).pipe(Effect.mapError(() => publicationError()));
-  const orchestration = yield* OrchestrationEngineService;
-  const id = NodeCrypto.randomUUID();
-  const artifactId = `artifact-${id}`;
-  const messageId = `artifact-message-${id}`;
-  const createdAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
-  const artifact = yield* lightfastServerCapabilities.artifactRegistry
-    .decodeForPublication(
-      lightfastServerCapabilities.notebook.makeArtifact({
-        id: artifactId,
-        title: input.title ?? revision.document.metadata.lightfast?.title ?? "Notebook",
-        payload: {
-          documentId: revision.documentId,
-          revisionId: revision.revisionId,
-          contentHash: revision.contentHash,
-          kernel: revision.kernel,
-          initialView: input.initialView,
-          documentIds,
-        },
-      }),
-    )
-    .pipe(Effect.mapError(() => publicationError()));
-
-  yield* orchestration
-    .dispatch({
-      type: "thread.message.artifact.publish",
-      commandId: CommandId.make(`artifact-command-${id}`),
-      threadId: invocation.threadId,
-      messageId: MessageId.make(messageId),
-      artifact: artifact.artifact,
-      createdAt,
-    })
-    .pipe(Effect.mapError(() => publicationError()));
-
-  return { artifactId, messageId } satisfies PublishNotebookArtifactResult;
+  return (yield* publishRevision({
+    invocation,
+    revision,
+    title: input.title,
+    initialView: input.initialView,
+    documentIds,
+  })) satisfies PublishNotebookArtifactResult;
 });
+
+export const createNotebookArtifact = Effect.fn("NotebookToolkit.createNotebookArtifact")(
+  function* (input: CreateNotebookArtifactInput) {
+    const invocation = yield* McpInvocationContext.requireArtifactCapability();
+    const projections = yield* ProjectionSnapshotQuery;
+    const thread = yield* projections
+      .getThreadShellById(invocation.threadId)
+      .pipe(Effect.mapError(() => publicationError()));
+    if (Option.isNone(thread)) return yield* publicationError();
+
+    const store = yield* NotebookRevisionStore;
+    const revision = yield* store
+      .save({
+        scope: {
+          environmentId: invocation.environmentId,
+          projectId: thread.value.projectId,
+        },
+        documentId: `notebook-${NodeCrypto.randomUUID()}`,
+        notebook: input.document,
+      })
+      .pipe(Effect.mapError(() => publicationError()));
+    const published = yield* publishRevision({
+      invocation,
+      revision,
+      title: input.title,
+      initialView: input.initialView,
+      documentIds: invocation.notebookDocumentIds ?? [],
+    });
+
+    return {
+      ...published,
+      documentId: revision.documentId,
+      revisionId: revision.revisionId,
+      contentHash: revision.contentHash,
+    } satisfies CreateNotebookArtifactResult;
+  },
+);
 
 const withAgentTools = Effect.fn("NotebookToolkit.withAgentTools")(function* <A>(
   operation: (
@@ -194,6 +250,7 @@ const executeAll = (input: NotebookAgentExecuteAllInput) =>
   });
 
 export const NotebookToolkitHandlersLive = NotebookToolkit.toLayer({
+  artifact_create_notebook: createNotebookArtifact,
   artifact_publish_notebook: publishNotebook,
   notebook_execute_cell: executeCell,
   notebook_execute_all: executeAll,
