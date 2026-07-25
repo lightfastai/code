@@ -261,6 +261,9 @@ importers:
       '@t3tools/lightfast-artifact-3d':
         specifier: workspace:*
         version: link:../../packages/lightfast-artifact-3d
+      '@t3tools/lightfast-artifact-notebook':
+        specifier: workspace:*
+        version: link:../../packages/lightfast-artifact-notebook
       '@t3tools/lightfast-capability-core':
         specifier: workspace:*
         version: link:../../packages/lightfast-capability-core

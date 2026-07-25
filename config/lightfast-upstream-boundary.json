@@ -64,6 +64,7 @@
         "apps/mobile/src/lib/composerImages.ts",
         "apps/mobile/src/lib/projectThreadStartTurn.test.ts",
         "apps/mobile/src/lib/projectThreadStartTurn.ts",
+        "apps/mobile/src/state/notebook.ts",
         "apps/mobile/src/state/study.ts",
         "apps/mobile/src/state/thread-outbox-model.ts",
         "apps/mobile/src/state/thread-outbox.test.ts",
@@ -75,7 +76,7 @@
         "apps/mobile/src/state/use-thread-outbox-drain.ts",
         "apps/mobile/src/state/use-thread-selection.ts"
       ],
-      "prefixes": []
+      "prefixes": ["apps/mobile/src/features/threads/notebook/"]
     },
     {
       "name": "server-product-shell",
@@ -194,6 +195,8 @@
       "rationale": "Cross-web/mobile RPC and state projections for notebook execution, retained outputs, and selected study books.",
       "paths": [
         "packages/client-runtime/src/rpc/client.ts",
+        "packages/client-runtime/src/state/notebook-controller.test.ts",
+        "packages/client-runtime/src/state/notebook-controller.ts",
         "packages/client-runtime/src/state/notebook-output-retention.ts",
         "packages/client-runtime/src/state/notebook.test.ts",
         "packages/client-runtime/src/state/notebook.ts",

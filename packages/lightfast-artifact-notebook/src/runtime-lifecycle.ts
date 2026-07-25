@@ -1,16 +1,95 @@
 import { sha256 } from "@noble/hashes/sha2";
 
-import type { NotebookRevision } from "./contracts.ts";
+import type { NotebookDocument, NotebookOutput, NotebookRevision } from "./contracts.ts";
+import type { NotebookOutputRetentionNotice } from "./notebook-output-rendering.ts";
 import {
   applyImportedNotebookRevision,
   createNotebookWorkingCopy,
   type NotebookWorkingCopy,
 } from "./working-copy.ts";
-import type {
-  NotebookArtifactController,
-  NotebookProjectScope,
-  NotebookRuntimeView,
-} from "./web.tsx";
+
+export type NotebookProjectScope = {
+  readonly environmentId: string;
+  readonly projectId: string;
+};
+
+export type NotebookRuntimeView = {
+  readonly kernelStatus:
+    | "disconnected"
+    | "starting"
+    | "busy"
+    | "idle"
+    | "interrupted"
+    | "restarted"
+    | "terminated";
+  readonly lastSequence: number;
+  readonly recoveryAfterSequence: number | null;
+  readonly outputsByCell: ReadonlyMap<string, ReadonlyArray<NotebookOutput>>;
+  readonly outputKeysByCell: ReadonlyMap<string, ReadonlyArray<string>>;
+  readonly outputRetentionByCell: ReadonlyMap<string, NotebookOutputRetentionNotice>;
+  readonly executionCountByCell: ReadonlyMap<string, number | null>;
+  readonly runningCellIds: ReadonlySet<string>;
+  readonly error: string | null;
+};
+
+export type NotebookAgentExecutionPermission = {
+  readonly status: "granted" | "denied" | "unavailable";
+  readonly label: string;
+  readonly change?: () => void;
+};
+
+type RuntimeRequest = {
+  readonly scope: NotebookProjectScope;
+  readonly sessionId: string;
+  readonly revisionId: string;
+  readonly onState: (state: NotebookRuntimeView) => void;
+};
+
+export interface NotebookArtifactController {
+  readonly readRevision: (
+    scope: NotebookProjectScope,
+    documentId: string,
+    revisionId: string,
+  ) => Promise<NotebookRevision>;
+  readonly saveRevision: (
+    scope: NotebookProjectScope,
+    documentId: string,
+    document: NotebookDocument,
+  ) => Promise<NotebookRevision>;
+  readonly importRevision: (
+    scope: NotebookProjectScope,
+    ipynbJson: string,
+  ) => Promise<NotebookRevision>;
+  readonly exportRevision: (
+    scope: NotebookProjectScope,
+    documentId: string,
+    revisionId: string,
+  ) => Promise<{
+    readonly fileName: string;
+    readonly contentType: string;
+    readonly ipynbJson: string;
+  }>;
+  readonly downloadExport: (file: {
+    readonly fileName: string;
+    readonly contentType: string;
+    readonly ipynbJson: string;
+  }) => void;
+  readonly connect: (
+    request: RuntimeRequest & {
+      readonly kernelName: string;
+      readonly documentIds: ReadonlyArray<string>;
+    },
+  ) => Promise<void>;
+  readonly recover: (request: RuntimeRequest) => Promise<void>;
+  readonly executeCell: (
+    request: RuntimeRequest & { readonly cellId: string; readonly code: string },
+  ) => Promise<void>;
+  readonly removeCell: (request: RuntimeRequest & { readonly cellId: string }) => void;
+  readonly interrupt: (request: RuntimeRequest) => Promise<void>;
+  readonly restart: (request: RuntimeRequest) => Promise<void>;
+  readonly dispose: (request: RuntimeRequest) => Promise<void>;
+  readonly clearError: (request: RuntimeRequest) => void;
+}
 
 export type NotebookRuntimeTarget = {
   readonly sessionId: string;

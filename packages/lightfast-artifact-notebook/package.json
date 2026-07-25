@@ -15,6 +15,10 @@
       "types": "./src/server.ts",
       "import": "./src/server.ts"
     },
+    "./mobile": {
+      "types": "./src/mobile.ts",
+      "import": "./src/mobile.ts"
+    },
     "./web": {
       "types": "./src/web.tsx",
       "import": "./src/web.tsx"
@@ -22,6 +26,10 @@
     "./working-copy": {
       "types": "./src/working-copy.ts",
       "import": "./src/working-copy.ts"
+    },
+    "./runtime": {
+      "types": "./src/runtime-lifecycle.ts",
+      "import": "./src/runtime-lifecycle.ts"
     }
   },
   "scripts": {

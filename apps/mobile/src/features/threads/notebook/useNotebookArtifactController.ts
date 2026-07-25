@@ -7,30 +7,23 @@ import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import type {
   NotebookArtifactController,
   NotebookProjectScope,
-} from "@t3tools/lightfast-artifact-notebook/web";
+} from "@t3tools/lightfast-artifact-notebook/runtime";
 import { useMemo } from "react";
 
-import { notebookEnvironment } from "~/state/notebook";
-import { useAtomCommand } from "~/state/use-atom-command";
+import { notebookEnvironment } from "../../../state/notebook";
+import { useAtomCommand } from "../../../state/use-atom-command";
 
 let commandSequence = 0;
 const commandId = (type: string): string => {
   commandSequence += 1;
-  const values = new Uint32Array(4);
-  crypto.getRandomValues(values);
-  return `${type}-${[...values].map((value) => value.toString(16).padStart(8, "0")).join("")}-${commandSequence}`;
+  const random = Math.random().toString(36).slice(2);
+  return `${type}-mobile-${Date.now().toString(36)}-${random}-${commandSequence}`;
 };
 
 const rpcScope = (scope: NotebookProjectScope) => ({
   environmentId: EnvironmentId.make(scope.environmentId),
   projectId: ProjectId.make(scope.projectId),
 });
-
-const isSessionNotFound = (cause: unknown): boolean =>
-  typeof cause === "object" &&
-  cause !== null &&
-  "reason" in cause &&
-  cause.reason === "session-not-found";
 
 async function unwrapCommand<A>(
   promise: Promise<
@@ -66,7 +59,11 @@ export function useNotebookArtifactController(): NotebookArtifactController {
   return useMemo(() => {
     const transport: NotebookRuntimeControllerTransport = {
       createCommandId: commandId,
-      isSessionNotFound,
+      isSessionNotFound: (cause) =>
+        typeof cause === "object" &&
+        cause !== null &&
+        "reason" in cause &&
+        cause.reason === "session-not-found",
       recover: (request) =>
         unwrapCommand(
           events({
@@ -123,7 +120,6 @@ export function useNotebookArtifactController(): NotebookArtifactController {
       },
     };
     const runtime = createNotebookRuntimeController(transport);
-
     return {
       readRevision: (scope, documentId, revisionId) =>
         unwrapCommand(
@@ -153,14 +149,7 @@ export function useNotebookArtifactController(): NotebookArtifactController {
             input: { scope: rpcScope(scope), documentId, revisionId },
           }),
         ),
-      downloadExport: (file) => {
-        const url = URL.createObjectURL(new Blob([file.ipynbJson], { type: file.contentType }));
-        const anchor = document.createElement("a");
-        anchor.href = url;
-        anchor.download = file.fileName;
-        anchor.click();
-        URL.revokeObjectURL(url);
-      },
+      downloadExport: () => undefined,
       ...runtime,
     } satisfies NotebookArtifactController;
   }, [

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { describeMobileArtifact } from "./register";
+import {
+  describeMobileArtifact,
+  lightfastMobileCapabilities,
+  resolveMobileArtifactNativeRenderer,
+} from "./register";
 
 describe("mobile artifact capability fallback", () => {
   it("preserves the 3D handoff presentation", () => {
@@ -27,5 +31,29 @@ describe("mobile artifact capability fallback", () => {
         payload: { opaque: true },
       }),
     ).toBe("Unsupported artifact · vendor.future v7");
+  });
+
+  it("registers the namespaced notebook capability with a native presentation", () => {
+    const artifact = {
+      type: "artifact" as const,
+      id: "artifact-notebook",
+      kind: "notebook",
+      schemaVersion: 1,
+      title: "Analysis",
+      payload: {
+        documentId: "notebook-1",
+        revisionId: "a".repeat(64),
+        contentHash: "b".repeat(64),
+        kernel: { name: "python3", displayName: "Python 3", language: "python" },
+        initialView: { mode: "notebook" as const },
+      },
+    };
+
+    expect(lightfastMobileCapabilities.productCapabilities).toContain("lightfast.notebook");
+    expect(lightfastMobileCapabilities.artifactRegistry.definitions.has("notebook")).toBe(true);
+    expect(describeMobileArtifact(artifact)).toBe(
+      "Interactive notebook · run securely on your paired Mac",
+    );
+    expect(resolveMobileArtifactNativeRenderer(artifact)).toBe("lightfast.notebook");
   });
 });

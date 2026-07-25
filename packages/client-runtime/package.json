@@ -71,6 +71,10 @@
       "types": "./src/state/notebook.ts",
       "default": "./src/state/notebook.ts"
     },
+    "./state/notebook-controller": {
+      "types": "./src/state/notebook-controller.ts",
+      "default": "./src/state/notebook-controller.ts"
+    },
     "./state/orchestration": {
       "types": "./src/state/orchestration.ts",
       "default": "./src/state/orchestration.ts"
