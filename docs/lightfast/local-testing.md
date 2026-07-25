@@ -171,8 +171,10 @@ to this configuration: public Clerk and observability values are read from local
 by `apps/mobile/app.config.ts`; the server-side LiveKit secrets above stay off the device.
 
 ```bash
+cd apps/mobile
 EXPO_NO_DOTENV=1 APP_VARIANT=development node_modules/.bin/expo config --type public
 EXPO_NO_DOTENV=1 APP_VARIANT=development node_modules/.bin/expo prebuild --platform ios --no-install
+cd ../..
 vp run --filter @t3tools/mobile dev:client
 ```
 
