@@ -145,6 +145,23 @@
       "prefixes": []
     },
     {
+      "name": "server-provider-generation-correlation",
+      "rationale": "Exact provider-adapter seams that correlate an accepted {threadId, messageId} to its provider generation before start-event publication and through send failure.",
+      "paths": [
+        "apps/server/src/provider/Layers/ClaudeAdapter.ts",
+        "apps/server/src/provider/Layers/CodexAdapter.test.ts",
+        "apps/server/src/provider/Layers/CodexAdapter.ts",
+        "apps/server/src/provider/Layers/CursorAdapter.ts",
+        "apps/server/src/provider/Layers/GrokAdapter.ts",
+        "apps/server/src/provider/Layers/OpenCodeAdapter.test.ts",
+        "apps/server/src/provider/Layers/OpenCodeAdapter.ts",
+        "apps/server/src/provider/Layers/ProviderService.ts",
+        "apps/server/src/provider/Services/ProviderAdapter.ts",
+        "apps/server/src/provider/Services/ProviderService.ts"
+      ],
+      "prefixes": []
+    },
+    {
       "name": "server-turn-persistence",
       "rationale": "Exact projection and migrations for immutable notebook revisions and accepted provider-turn lifecycle phases.",
       "paths": [
