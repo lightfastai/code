@@ -23,6 +23,10 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 
 type VoicePhase = "idle" | "requesting" | "connecting" | "listening" | "speaking" | "error";
 
+interface TeardownVoiceSessionOptions {
+  readonly disconnectRoom: boolean;
+}
+
 const ACTIVE_PHASES = new Set<VoicePhase>(["requesting", "connecting", "listening", "speaking"]);
 
 function errorMessage(cause: unknown): string {
@@ -67,18 +71,27 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
     outputRef.current?.replaceChildren();
   }, []);
 
+  const teardownVoiceSession = useCallback(
+    (room: Room | null, { disconnectRoom }: TeardownVoiceSessionOptions) => {
+      if (room !== null && roomRef.current !== room) return;
+
+      requestVersionRef.current += 1;
+      roomRef.current = null;
+      liveSequenceRef.current = -1;
+      clearOutput();
+      if (mountedRef.current) {
+        setPhase("idle");
+        setLiveArtifact(null);
+      }
+      if (disconnectRoom && room) void room.disconnect(true);
+    },
+    [clearOutput],
+  );
+
   const stop = useCallback(() => {
-    requestVersionRef.current += 1;
     const room = roomRef.current;
-    roomRef.current = null;
-    liveSequenceRef.current = -1;
-    clearOutput();
-    if (mountedRef.current) {
-      setPhase("idle");
-      setLiveArtifact(null);
-    }
-    if (room) void room.disconnect(true);
-  }, [clearOutput]);
+    teardownVoiceSession(room, { disconnectRoom: true });
+  }, [teardownVoiceSession]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -134,10 +147,7 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
       .on(RoomEvent.Reconnecting, () => updatePhase("connecting"))
       .on(RoomEvent.Reconnected, () => updatePhase("listening"))
       .on(RoomEvent.Disconnected, () => {
-        if (roomRef.current !== room) return;
-        roomRef.current = null;
-        clearOutput();
-        if (mountedRef.current) setPhase("idle");
+        teardownVoiceSession(room, { disconnectRoom: false });
       });
 
     const sessionResult = await createVoiceSession({
@@ -187,7 +197,7 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
         description: message,
       });
     }
-  }, [clearOutput, createVoiceSession, documentIds, environmentId]);
+  }, [createVoiceSession, documentIds, environmentId, teardownVoiceSession]);
 
   const active = ACTIVE_PHASES.has(phase);
   const pending = phase === "requesting" || phase === "connecting";

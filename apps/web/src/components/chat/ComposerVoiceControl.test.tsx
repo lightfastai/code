@@ -1,4 +1,4 @@
-import { EnvironmentId, type StudyDocument } from "@t3tools/contracts";
+import { EnvironmentId, StudyLiveSceneTopic, type StudyDocument } from "@t3tools/contracts";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -6,6 +6,7 @@ const voiceMocks = vi.hoisted(() => ({
   createVoiceSession: vi.fn(),
   rooms: [] as Array<{
     readonly disconnect: ReturnType<typeof vi.fn>;
+    emit(event: string, ...args: ReadonlyArray<unknown>): void;
   }>,
 }));
 
@@ -24,13 +25,19 @@ vi.mock("livekit-client", () => ({
       identity: "local-user",
       setMicrophoneEnabled: vi.fn(async () => undefined),
     };
+    readonly handlers = new Map<string, (...args: ReadonlyArray<unknown>) => void>();
 
     constructor() {
       voiceMocks.rooms.push(this);
     }
 
-    on() {
+    on(event: string, handler: (...args: ReadonlyArray<unknown>) => void) {
+      this.handlers.set(event, handler);
       return this;
+    }
+
+    emit(event: string, ...args: ReadonlyArray<unknown>) {
+      this.handlers.get(event)?.(...args);
     }
 
     startAudio() {
@@ -59,8 +66,11 @@ vi.mock("lucide-react", () => ({
   MicOffIcon: () => <span />,
   XIcon: () => <span />,
 }));
-vi.mock("../artifacts/Scene3DArtifact", () => ({ Scene3DArtifact: () => null }));
-vi.mock("../artifacts/studyLiveScene", () => ({ decodeStudyLiveSceneMessage: () => null }));
+vi.mock("../artifacts/Scene3DArtifact", () => ({
+  Scene3DArtifact: ({ artifact }: { readonly artifact: { readonly title: string } }) => (
+    <span data-scene-title={artifact.title}>{artifact.title}</span>
+  ),
+}));
 vi.mock("../ui/button", () => ({
   Button: (props: React.ButtonHTMLAttributes<HTMLButtonElement>) => <button {...props} />,
 }));
@@ -104,12 +114,32 @@ function renderControl(selectedDocuments: ReadonlyArray<StudyDocument>) {
 }
 
 async function startVoice(renderer: ReactTestRenderer): Promise<void> {
-  const button = renderer.root.findByType("button");
+  const button = renderer.root.findByProps({ "aria-label": "Start voice study" });
   await act(async () => {
     button.props.onClick();
     await Promise.resolve();
     await Promise.resolve();
   });
+}
+
+function sceneMessage(sequence: number, title: string): Uint8Array {
+  return new TextEncoder().encode(
+    JSON.stringify({
+      type: "study.scene.replace",
+      version: 1,
+      sequence,
+      artifact: {
+        type: "artifact",
+        id: `voice-scene-${sequence}`,
+        kind: "3d-scene",
+        schemaVersion: 1,
+        title,
+        payload: {
+          objects: [{ type: "vector", id: "v", start: [0, 0, 0], end: [1, 1, 0] }],
+        },
+      },
+    }),
+  );
 }
 
 beforeEach(() => {
@@ -162,6 +192,57 @@ describe("ComposerVoiceControl document scope", () => {
       value: { url: "wss://voice.example.test", token: "token" },
     });
     await startPromise;
+    await act(async () => renderer!.unmount());
+  });
+});
+
+describe("ComposerVoiceControl live scene lifecycle", () => {
+  it("resets the scene sequence when a room disconnects naturally", async () => {
+    voiceMocks.createVoiceSession.mockResolvedValue({
+      _tag: "Success",
+      value: { url: "wss://voice.example.test", token: "token" },
+    });
+    let renderer: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(renderControl([studyDocument("a")]));
+    });
+    await startVoice(renderer!);
+
+    const roomA = voiceMocks.rooms[0]!;
+    await act(async () => {
+      roomA.emit(
+        "DataReceived",
+        sceneMessage(5, "Room A scene"),
+        undefined,
+        undefined,
+        StudyLiveSceneTopic,
+      );
+    });
+    expect(renderer!.root.findByProps({ "aria-label": "Live voice study scene" })).toBeDefined();
+    expect(renderer!.root.findByProps({ "data-scene-title": "Room A scene" })).toBeDefined();
+
+    await act(async () => {
+      roomA.emit("Disconnected");
+    });
+    expect(renderer!.root.findAllByProps({ "aria-label": "Live voice study scene" })).toHaveLength(
+      0,
+    );
+    expect(roomA.disconnect).not.toHaveBeenCalled();
+
+    await startVoice(renderer!);
+    const roomB = voiceMocks.rooms[1]!;
+    await act(async () => {
+      roomB.emit(
+        "DataReceived",
+        sceneMessage(0, "Room B scene"),
+        undefined,
+        undefined,
+        StudyLiveSceneTopic,
+      );
+    });
+
+    expect(renderer!.root.findByProps({ "aria-label": "Live voice study scene" })).toBeDefined();
+    expect(renderer!.root.findByProps({ "data-scene-title": "Room B scene" })).toBeDefined();
     await act(async () => renderer!.unmount());
   });
 });
