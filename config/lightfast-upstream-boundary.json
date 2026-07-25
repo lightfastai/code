@@ -17,6 +17,219 @@
     "apps/web/src/lightfast/register.tsx",
     "apps/mobile/src/lightfast/register.ts"
   ],
+  "productIntegrationGroups": [
+    {
+      "name": "repository-product-setup",
+      "rationale": "Lightfast product configuration, CI, documentation entry points, and ignore policy.",
+      "paths": [
+        ".env.example",
+        ".github/workflows/ci.yml",
+        ".gitignore",
+        "README.md",
+        "docs/README.md"
+      ],
+      "prefixes": []
+    },
+    {
+      "name": "mobile-product-shell",
+      "rationale": "Expo entry points and native shell hooks for study, voice, canvas, and artifact capabilities.",
+      "paths": [
+        "apps/mobile/app.config.ts",
+        "apps/mobile/index.ts",
+        "apps/mobile/src/Stack.tsx",
+        "apps/mobile/src/components/AppSymbol.tsx",
+        "apps/mobile/src/livekit-globals.ts"
+      ],
+      "prefixes": []
+    },
+    {
+      "name": "mobile-study-canvas",
+      "rationale": "Dedicated native module and React Native feature for the Lightfast study canvas.",
+      "paths": [],
+      "prefixes": ["apps/mobile/modules/t3-study-canvas/", "apps/mobile/src/features/study-canvas/"]
+    },
+    {
+      "name": "mobile-thread-study-voice",
+      "rationale": "Explicit thread and composer integration points for selected study books, voice, canvas, and route-authoritative sends.",
+      "paths": [
+        "apps/mobile/src/features/threads/NewTaskDraftScreen.tsx",
+        "apps/mobile/src/features/threads/StudyVoiceToolbarButton.tsx",
+        "apps/mobile/src/features/threads/ThreadComposer.tsx",
+        "apps/mobile/src/features/threads/ThreadDetailScreen.tsx",
+        "apps/mobile/src/features/threads/ThreadFeed.tsx",
+        "apps/mobile/src/features/threads/ThreadRouteScreen.tsx",
+        "apps/mobile/src/features/threads/new-task-flow-provider.tsx",
+        "apps/mobile/src/features/threads/use-project-actions.ts",
+        "apps/mobile/src/lib/composerImages.test.ts",
+        "apps/mobile/src/lib/composerImages.ts",
+        "apps/mobile/src/lib/projectThreadStartTurn.test.ts",
+        "apps/mobile/src/lib/projectThreadStartTurn.ts",
+        "apps/mobile/src/state/study.ts",
+        "apps/mobile/src/state/thread-outbox-model.ts",
+        "apps/mobile/src/state/thread-outbox.test.ts",
+        "apps/mobile/src/state/thread-route-target.test.ts",
+        "apps/mobile/src/state/thread-route-target.ts",
+        "apps/mobile/src/state/use-composer-drafts.test.ts",
+        "apps/mobile/src/state/use-composer-drafts.ts",
+        "apps/mobile/src/state/use-thread-composer-state.ts",
+        "apps/mobile/src/state/use-thread-outbox-drain.ts",
+        "apps/mobile/src/state/use-thread-selection.ts"
+      ],
+      "prefixes": []
+    },
+    {
+      "name": "server-product-shell",
+      "rationale": "Server entry, configuration, attachment, CLI, WebSocket, and provider wiring for Lightfast capabilities.",
+      "paths": [
+        "apps/server/src/attachmentStore.ts",
+        "apps/server/src/bin.ts",
+        "apps/server/src/cli/config.ts",
+        "apps/server/src/cli/study.ts",
+        "apps/server/src/config.ts",
+        "apps/server/src/provider/CodexDeveloperInstructions.ts",
+        "apps/server/src/provider/opencodeRuntime.ts",
+        "apps/server/src/server.ts",
+        "apps/server/src/textGeneration/OpenCodeTextGeneration.ts",
+        "apps/server/src/textGeneration/TextGeneration.ts",
+        "apps/server/src/textGeneration/TextGenerationPrompts.ts",
+        "apps/server/src/ws.ts"
+      ],
+      "prefixes": []
+    },
+    {
+      "name": "server-capability-tooling",
+      "rationale": "Authenticated MCP integration for artifact, notebook, study, and invocation-scoped Lightfast tools.",
+      "paths": [
+        "apps/server/src/mcp/McpHttpServer.test.ts",
+        "apps/server/src/mcp/McpHttpServer.ts",
+        "apps/server/src/mcp/McpInvocationContext.test.ts",
+        "apps/server/src/mcp/McpInvocationContext.ts",
+        "apps/server/src/mcp/McpSessionRegistry.test.ts",
+        "apps/server/src/mcp/McpSessionRegistry.ts",
+        "apps/server/src/mcp/PreviewAutomationBroker.test.ts"
+      ],
+      "prefixes": [
+        "apps/server/src/mcp/toolkits/artifacts/",
+        "apps/server/src/mcp/toolkits/notebook/",
+        "apps/server/src/mcp/toolkits/study/"
+      ]
+    },
+    {
+      "name": "server-notebook",
+      "rationale": "Dedicated notebook revision, runtime, RPC, selected-book, and agent execution module.",
+      "paths": [],
+      "prefixes": ["apps/server/src/notebook/"]
+    },
+    {
+      "name": "server-study",
+      "rationale": "Dedicated study library, extraction, trace, search, voice, and evaluation module.",
+      "paths": [],
+      "prefixes": ["apps/server/src/study/"]
+    },
+    {
+      "name": "server-turn-authority",
+      "rationale": "Exact orchestration seams that bind accepted provider generations to study and notebook authority.",
+      "paths": [
+        "apps/server/src/orchestration/Layers/ProjectionPipeline.test.ts",
+        "apps/server/src/orchestration/Layers/ProjectionPipeline.ts",
+        "apps/server/src/orchestration/Layers/ProviderCommandReactor.test.ts",
+        "apps/server/src/orchestration/Layers/ProviderCommandReactor.ts",
+        "apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.test.ts",
+        "apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts",
+        "apps/server/src/orchestration/TurnStartAdmission.ts",
+        "apps/server/src/orchestration/decider.artifacts.test.ts",
+        "apps/server/src/orchestration/decider.projectScripts.test.ts",
+        "apps/server/src/orchestration/decider.ts"
+      ],
+      "prefixes": []
+    },
+    {
+      "name": "server-turn-persistence",
+      "rationale": "Exact projection and migrations for immutable notebook revisions and accepted provider-turn lifecycle phases.",
+      "paths": [
+        "apps/server/src/persistence/Layers/ProjectionTurns.test.ts",
+        "apps/server/src/persistence/Layers/ProjectionTurns.ts",
+        "apps/server/src/persistence/Migrations.ts",
+        "apps/server/src/persistence/Migrations/033_NotebookRevisions.ts",
+        "apps/server/src/persistence/Migrations/034_ProjectionTurnStartAdmissions.ts",
+        "apps/server/src/persistence/Migrations/035_ProjectionTurnStartAdmissionPhases.ts",
+        "apps/server/src/persistence/Migrations/036_ProjectionTurnStartCancellations.ts",
+        "apps/server/src/persistence/Services/ProjectionTurns.ts"
+      ],
+      "prefixes": []
+    },
+    {
+      "name": "web-artifacts",
+      "rationale": "Native chat artifact registry, 3D scene, notebook renderer/controller, and live-scene integration.",
+      "paths": [
+        "apps/web/src/components/artifacts/ArtifactRenderer.test.ts",
+        "apps/web/src/components/artifacts/ArtifactRenderer.tsx",
+        "apps/web/src/components/artifacts/Scene3DArtifact.tsx",
+        "apps/web/src/components/artifacts/studyLiveScene.test.ts",
+        "apps/web/src/components/artifacts/studyLiveScene.ts"
+      ],
+      "prefixes": ["apps/web/src/components/artifacts/notebook/"]
+    },
+    {
+      "name": "web-study-voice",
+      "rationale": "Exact chat, composer, selected-book, voice, and notebook client-state integration points.",
+      "paths": [
+        "apps/web/src/components/ChatView.tsx",
+        "apps/web/src/components/chat/ChatComposer.tsx",
+        "apps/web/src/components/chat/ComposerStudyDocumentChips.tsx",
+        "apps/web/src/components/chat/ComposerStudyLibrary.tsx",
+        "apps/web/src/components/chat/ComposerVoiceControl.test.tsx",
+        "apps/web/src/components/chat/ComposerVoiceControl.tsx",
+        "apps/web/src/components/chat/MessagesTimeline.tsx",
+        "apps/web/src/composerDraftStore.ts",
+        "apps/web/src/state/notebook.ts",
+        "apps/web/src/state/study.ts",
+        "apps/web/src/types.ts"
+      ],
+      "prefixes": []
+    },
+    {
+      "name": "shared-client-runtime",
+      "rationale": "Cross-web/mobile RPC and state projections for notebook execution, retained outputs, and selected study books.",
+      "paths": [
+        "packages/client-runtime/src/rpc/client.ts",
+        "packages/client-runtime/src/state/notebook-output-retention.ts",
+        "packages/client-runtime/src/state/notebook.test.ts",
+        "packages/client-runtime/src/state/notebook.ts",
+        "packages/client-runtime/src/state/study.ts"
+      ],
+      "prefixes": []
+    },
+    {
+      "name": "shared-contracts",
+      "rationale": "Exact schema-only contracts for open artifacts, notebooks, orchestration authority, RPC, provider events, and study traces.",
+      "paths": [
+        "packages/contracts/src/artifacts.ts",
+        "packages/contracts/src/index.ts",
+        "packages/contracts/src/notebook.test.ts",
+        "packages/contracts/src/notebook.ts",
+        "packages/contracts/src/orchestration.test.ts",
+        "packages/contracts/src/orchestration.ts",
+        "packages/contracts/src/provider.ts",
+        "packages/contracts/src/rpc.ts",
+        "packages/contracts/src/study.test.ts",
+        "packages/contracts/src/study.ts",
+        "packages/contracts/src/studyLoop.ts"
+      ],
+      "prefixes": []
+    },
+    {
+      "name": "shared-study-runtime",
+      "rationale": "Cross-client/server LiveKit token and selected-study-context normalization modules.",
+      "paths": [
+        "packages/shared/src/liveKitToken.test.ts",
+        "packages/shared/src/liveKitToken.ts",
+        "packages/shared/src/studyContext.test.ts",
+        "packages/shared/src/studyContext.ts"
+      ],
+      "prefixes": []
+    }
+  ],
   "sharedSurfacePaths": [
     ".npmrc",
     "package.json",

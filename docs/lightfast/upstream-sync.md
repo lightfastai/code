@@ -61,8 +61,11 @@ workflow never needs a main-branch bypass.
 ## Boundary audit
 
 `config/lightfast-upstream-boundary.json` classifies changed files as Lightfast-owned paths,
-intentional application bridges, shared surfaces, or unexpected upstream divergence. Run the same
-audit locally after constructing an upstream merge:
+intentional application bridges, shared surfaces, or unexpected upstream divergence. Permanent
+product integrations in upstream directories are recorded as named groups with a rationale and
+either exact paths or narrowly scoped feature-directory prefixes. A group is reviewable ownership
+documentation, not a general application-directory wildcard. Run the same audit locally after
+constructing an upstream merge:
 
 ```bash
 git fetch --prune upstream main
@@ -71,8 +74,9 @@ node scripts/lightfast-upstream-audit.ts --base upstream/main --head HEAD
 
 An `unexpected` path fails the workflow. Prefer moving Lightfast functionality into
 `packages/lightfast-*`, `apps/*/src/lightfast/`, dedicated sidecars, or `docs/lightfast/`. When an
-upstream-owned file really is a permanent bridge, update the policy and its tests intentionally in
-the same pull request; do not suppress the result ad hoc.
+upstream-owned file really is a permanent bridge, add it to the narrowest named group (or create a
+new documented group) and update the negative tests intentionally in the same pull request; do not
+suppress the result ad hoc. Unrelated files beside grouped paths must remain `unexpected`.
 
 ## Conflict recovery
 

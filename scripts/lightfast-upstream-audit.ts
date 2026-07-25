@@ -9,9 +9,17 @@ import * as NodeURL from "node:url";
 export interface UpstreamBoundaryPolicy {
   readonly lightfastOwnedPrefixes: readonly string[];
   readonly bridgePaths: readonly string[];
+  readonly productIntegrationGroups: readonly ProductIntegrationGroup[];
   readonly sharedSurfacePaths: readonly string[];
   readonly sharedSurfacePrefixes: readonly string[];
   readonly sharedSurfaceSuffixes: readonly string[];
+}
+
+export interface ProductIntegrationGroup {
+  readonly name: string;
+  readonly rationale: string;
+  readonly paths: readonly string[];
+  readonly prefixes: readonly string[];
 }
 
 export interface UpstreamDiffReport {
@@ -45,10 +53,20 @@ export function auditUpstreamDiff(
     unexpected: [],
   };
   const bridgePaths = new Set(policy.bridgePaths.map(normalizePath));
+  const groupedBridgePaths = new Set(
+    policy.productIntegrationGroups.flatMap((group) => group.paths.map(normalizePath)),
+  );
+  const groupedBridgePrefixes = policy.productIntegrationGroups.flatMap((group) =>
+    group.prefixes.map(normalizePath),
+  );
   const sharedSurfacePaths = new Set(policy.sharedSurfacePaths.map(normalizePath));
 
   for (const path of new Set(paths.map(normalizePath).filter(Boolean))) {
-    if (bridgePaths.has(path)) {
+    if (
+      bridgePaths.has(path) ||
+      groupedBridgePaths.has(path) ||
+      matchesAnyPrefix(path, groupedBridgePrefixes)
+    ) {
       report.bridges.push(path);
     } else if (matchesAnyPrefix(path, policy.lightfastOwnedPrefixes)) {
       report.lightfastOwned.push(path);
@@ -82,6 +100,35 @@ const readStringArray = (candidate: Record<string, unknown>, key: string): reado
   return value;
 };
 
+const readProductIntegrationGroups = (
+  candidate: Record<string, unknown>,
+): readonly ProductIntegrationGroup[] => {
+  const value = candidate.productIntegrationGroups;
+  if (!Array.isArray(value)) {
+    throw new Error("Upstream boundary policy field 'productIntegrationGroups' must be an array.");
+  }
+
+  return value.map((entry, index) => {
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error(`Product integration group at index ${index} must be an object.`);
+    }
+    const group = entry as Record<string, unknown>;
+    if (typeof group.name !== "string" || group.name.length === 0) {
+      throw new Error(`Product integration group at index ${index} must have a name.`);
+    }
+    if (typeof group.rationale !== "string" || group.rationale.length === 0) {
+      throw new Error(`Product integration group '${group.name}' must have a rationale.`);
+    }
+
+    return {
+      name: group.name,
+      rationale: group.rationale,
+      paths: readStringArray(group, "paths"),
+      prefixes: readStringArray(group, "prefixes"),
+    };
+  });
+};
+
 export function parseUpstreamBoundaryPolicy(value: unknown): UpstreamBoundaryPolicy {
   if (typeof value !== "object" || value === null) {
     throw new Error("Upstream boundary policy must be a JSON object.");
@@ -92,6 +139,7 @@ export function parseUpstreamBoundaryPolicy(value: unknown): UpstreamBoundaryPol
   return {
     lightfastOwnedPrefixes: readStringArray(candidate, "lightfastOwnedPrefixes"),
     bridgePaths: readStringArray(candidate, "bridgePaths"),
+    productIntegrationGroups: readProductIntegrationGroups(candidate),
     sharedSurfacePaths: readStringArray(candidate, "sharedSurfacePaths"),
     sharedSurfacePrefixes: readStringArray(candidate, "sharedSurfacePrefixes"),
     sharedSurfaceSuffixes: readStringArray(candidate, "sharedSurfaceSuffixes"),

@@ -16,7 +16,7 @@ const upstreamSyncWorkflow = NodeFS.readFileSync(
 it("classifies Lightfast-owned paths, bridges, shared manifests, and unexpected edits", () => {
   const report = auditUpstreamDiff(
     [
-      "apps/web/src/components/ChatView.tsx",
+      "apps/web/src/components/SettingsView.tsx",
       "packages/lightfast-capability-core/src/registry.ts",
       "apps/web/src/lightfast/register.tsx",
       "apps/server/package.json",
@@ -33,7 +33,7 @@ it("classifies Lightfast-owned paths, bridges, shared manifests, and unexpected 
     ],
     bridges: ["apps/web/src/lightfast/register.tsx"],
     sharedSurfaces: ["apps/server/package.json", "pnpm-lock.yaml"],
-    unexpected: ["apps/web/src/components/ChatView.tsx"],
+    unexpected: ["apps/web/src/components/SettingsView.tsx"],
   });
 });
 
@@ -54,6 +54,29 @@ it("normalizes, de-duplicates, and sorts paths while preserving bridge precedenc
     sharedSurfaces: [],
     unexpected: [],
   });
+});
+
+it("classifies only the named product integration groups and rejects an arbitrary upstream edit", () => {
+  const report = auditUpstreamDiff(
+    [
+      "apps/mobile/src/features/study-canvas/StudyCanvasRouteScreen.tsx",
+      "apps/server/src/notebook/NotebookRuntimeManager.ts",
+      "apps/server/src/orchestration/TurnStartAdmission.ts",
+      "apps/web/src/components/artifacts/notebook/NotebookArtifact.tsx",
+      "packages/contracts/src/notebook.ts",
+      "apps/web/src/components/SettingsView.tsx",
+    ],
+    policy,
+  );
+
+  assert.deepStrictEqual(report.bridges, [
+    "apps/mobile/src/features/study-canvas/StudyCanvasRouteScreen.tsx",
+    "apps/server/src/notebook/NotebookRuntimeManager.ts",
+    "apps/server/src/orchestration/TurnStartAdmission.ts",
+    "apps/web/src/components/artifacts/notebook/NotebookArtifact.tsx",
+    "packages/contracts/src/notebook.ts",
+  ]);
+  assert.deepStrictEqual(report.unexpected, ["apps/web/src/components/SettingsView.tsx"]);
 });
 
 it("refreshes only repository-owned integration branches without rewriting their tips", () => {
