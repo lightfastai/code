@@ -1129,14 +1129,6 @@ const make = Effect.gen(function* () {
       ).pipe(Effect.asVoid);
     });
 
-  const getExpectedProviderTurnIdForThread = Effect.fn("getExpectedProviderTurnIdForThread")(
-    function* (threadId: ThreadId) {
-      const sessions = yield* providerService.listSessions();
-      const session = sessions.find((entry) => entry.threadId === threadId);
-      return session?.activeTurnId;
-    },
-  );
-
   const markSourceProposedPlanImplemented = Effect.fn("markSourceProposedPlanImplemented")(
     function* (
       sourceThreadId: ThreadId,
@@ -1185,10 +1177,16 @@ const make = Effect.gen(function* () {
 
       const now = event.createdAt;
       const eventTurnId = toTurnId(event.turnId);
-      const expectedProviderTurnId =
+      const acceptedTurnStartForEvent =
         event.type === "turn.started" && eventTurnId !== undefined
-          ? yield* getExpectedProviderTurnIdForThread(thread.id)
-          : undefined;
+          ? yield* projectionTurnRepository.getAcceptedTurnStartByThreadId({
+              threadId: thread.id,
+            })
+          : Option.none();
+      const acceptedGenerationMatches =
+        Option.isSome(acceptedTurnStartForEvent) &&
+        acceptedTurnStartForEvent.value.providerTurnId !== null &&
+        sameId(acceptedTurnStartForEvent.value.providerTurnId, eventTurnId);
       const cancelledTurnStart =
         event.type === "turn.started" && eventTurnId !== undefined
           ? yield* projectionTurnRepository.getCancelledTurnStartByProviderTurn({
@@ -1240,12 +1238,7 @@ const make = Effect.gen(function* () {
       // turn.started for some other turn id still gets rejected.
       const conflictingTurnStartIsAcceptedTurnStart =
         event.type === "turn.started" && conflictsWithActiveTurn
-          ? sameId(expectedProviderTurnId, eventTurnId) &&
-            Option.isSome(
-              yield* projectionTurnRepository.getAcceptedTurnStartByThreadId({
-                threadId: thread.id,
-              }),
-            )
+          ? acceptedGenerationMatches
           : false;
 
       const shouldApplyThreadLifecycle = (() => {
@@ -1259,7 +1252,10 @@ const make = Effect.gen(function* () {
           case "thread.started":
             return true;
           case "turn.started":
-            return !conflictsWithActiveTurn || conflictingTurnStartIsAcceptedTurnStart;
+            return (
+              (!conflictsWithActiveTurn || conflictingTurnStartIsAcceptedTurnStart) &&
+              (Option.isNone(acceptedTurnStartForEvent) || acceptedGenerationMatches)
+            );
           case "turn.completed":
             if (conflictsWithActiveTurn || missingTurnForActiveTurn) {
               return false;
@@ -1275,12 +1271,8 @@ const make = Effect.gen(function* () {
         }
       })();
       const acceptedTurnStart =
-        event.type === "turn.started" &&
-        shouldApplyThreadLifecycle &&
-        sameId(expectedProviderTurnId, eventTurnId)
-          ? yield* projectionTurnRepository.getAcceptedTurnStartByThreadId({
-              threadId: thread.id,
-            })
+        event.type === "turn.started" && shouldApplyThreadLifecycle && acceptedGenerationMatches
+          ? acceptedTurnStartForEvent
           : Option.none();
       const acceptedTurnStartedSourcePlan = Option.isSome(acceptedTurnStart)
         ? acceptedTurnStart.value.sourceProposedPlanThreadId !== null &&

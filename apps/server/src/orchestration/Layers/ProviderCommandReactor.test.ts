@@ -231,7 +231,7 @@ describe("ProviderCommandReactor", () => {
       runtimeSessions.push(session);
       return Effect.succeed(session);
     });
-    const sendTurn = vi.fn((_: unknown) =>
+    const sendTurn = vi.fn<ProviderServiceShape["sendTurn"]>((_) =>
       Effect.succeed({
         threadId: ThreadId.make("thread-1"),
         turnId: asTurnId("turn-1"),
@@ -991,8 +991,9 @@ describe("ProviderCommandReactor", () => {
       throw new Error("Expected source plan A to be projected.");
     }
 
-    harness.sendTurn.mockImplementationOnce(() =>
-      Deferred.succeed(sendEntered, undefined).pipe(
+    harness.sendTurn.mockImplementationOnce((_input, onAccepted) =>
+      (onAccepted?.({ threadId, turnId: turnA }) ?? Effect.void).pipe(
+        Effect.andThen(Deferred.succeed(sendEntered, undefined)),
         Effect.andThen(Deferred.await(releaseSend)),
         Effect.as({ threadId, turnId: turnA }),
       ),
@@ -1020,10 +1021,11 @@ describe("ProviderCommandReactor", () => {
     );
     await Effect.runPromise(Deferred.await(sendEntered));
 
-    harness.listSessions.mockImplementationOnce(() =>
+    const getAcceptedTurnStart = harness.turns.getAcceptedTurnStartByThreadId.bind(harness.turns);
+    vi.spyOn(harness.turns, "getAcceptedTurnStartByThreadId").mockImplementationOnce((input) =>
       Deferred.succeed(ingestionHeld, undefined).pipe(
         Effect.andThen(Deferred.await(releaseIngestion)),
-        Effect.as(harness.runtimeSessions),
+        Effect.andThen(getAcceptedTurnStart(input)),
       ),
     );
     const runtimeSession = harness.runtimeSessions.find((session) => session.threadId === threadId);
@@ -1503,9 +1505,21 @@ describe("ProviderCommandReactor", () => {
     if (!sourcePlan) throw new Error("Expected the late-cancelled source plan.");
 
     harness.sendTurn.mockImplementationOnce(
-      () =>
-        Deferred.succeed(sendEntered, undefined).pipe(
+      (_input, onAccepted) =>
+        (onAccepted?.({ threadId, turnId: turnA }) ?? Effect.void).pipe(
+          Effect.andThen(Deferred.succeed(sendEntered, undefined)),
           Effect.andThen(Deferred.await(releaseSend)),
+          Effect.andThen(
+            Effect.sync(() => {
+              const failedSession = harness.runtimeSessions.find(
+                (session) => session.threadId === threadId,
+              );
+              if (failedSession !== undefined) {
+                Object.assign(failedSession, { status: "ready" as const });
+                delete (failedSession as { activeTurnId?: TurnId }).activeTurnId;
+              }
+            }),
+          ),
           Effect.andThen(
             Effect.fail(
               new ProviderAdapterRequestError({
@@ -1549,10 +1563,11 @@ describe("ProviderCommandReactor", () => {
       activeTurnId: turnA,
       updatedAt: "2026-01-01T00:00:02.000Z",
     });
-    harness.listSessions.mockImplementationOnce(() =>
+    const getAcceptedTurnStart = harness.turns.getAcceptedTurnStartByThreadId.bind(harness.turns);
+    vi.spyOn(harness.turns, "getAcceptedTurnStartByThreadId").mockImplementationOnce((input) =>
       Deferred.succeed(ingestionHeld, undefined).pipe(
         Effect.andThen(Deferred.await(releaseIngestion)),
-        Effect.as(harness.runtimeSessions),
+        Effect.andThen(getAcceptedTurnStart(input)),
       ),
     );
     harness.emitRuntimeEvent({

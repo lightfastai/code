@@ -17,6 +17,7 @@ import {
   GetProjectionTurnByTurnIdInput,
   ListProjectionTurnsByThreadInput,
   ProjectionAcceptedTurnStart,
+  ProjectionAcceptedTurnStartCorrelation,
   ProjectionAcceptedTurnStartState,
   ProjectionCancelledTurnStart,
   ProjectionPendingTurnStart,
@@ -220,6 +221,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
         SELECT
           thread_id AS "threadId",
           message_id AS "messageId",
+          provider_turn_id AS "providerTurnId",
           source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
           source_proposed_plan_id AS "sourceProposedPlanId",
           requested_at AS "requestedAt",
@@ -228,6 +230,22 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
         FROM projection_turn_start_admissions
         WHERE thread_id = ${threadId}
         LIMIT 1
+      `,
+  });
+
+  const correlateAcceptedProjectionTurnStart = SqlSchema.findOneOption({
+    Request: ProjectionAcceptedTurnStartCorrelation,
+    Result: ProjectionTurnStartKey,
+    execute: ({ threadId, messageId, providerTurnId }) =>
+      sql`
+        UPDATE projection_turn_start_admissions
+        SET provider_turn_id = ${providerTurnId}
+        WHERE thread_id = ${threadId}
+          AND message_id = ${messageId}
+          AND (provider_turn_id IS NULL OR provider_turn_id = ${providerTurnId})
+        RETURNING
+          thread_id AS "threadId",
+          message_id AS "messageId"
       `,
   });
 
@@ -251,6 +269,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
         RETURNING
           thread_id AS "threadId",
           message_id AS "messageId",
+          provider_turn_id AS "providerTurnId",
           source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
           source_proposed_plan_id AS "sourceProposedPlanId",
           requested_at AS "requestedAt",
@@ -518,6 +537,19 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
         ),
       );
 
+  const correlateAcceptedTurnStart: ProjectionTurnRepositoryShape["correlateAcceptedTurnStart"] = (
+    input,
+  ) =>
+    correlateAcceptedProjectionTurnStart(input).pipe(
+      Effect.map(Option.isSome),
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionTurnRepository.correlateAcceptedTurnStart:query",
+          "ProjectionTurnRepository.correlateAcceptedTurnStart:decodeRow",
+        ),
+      ),
+    );
+
   const completeAcceptedTurnStartPhase: ProjectionTurnRepositoryShape["completeAcceptedTurnStartPhase"] =
     (input) =>
       sql
@@ -673,6 +705,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
     getPendingTurnStartByThreadId,
     stageAcceptedTurnStart,
     getAcceptedTurnStartByThreadId,
+    correlateAcceptedTurnStart,
     completeAcceptedTurnStartPhase,
     cancelAcceptedTurnStart,
     getCancelledTurnStartByProviderTurn,

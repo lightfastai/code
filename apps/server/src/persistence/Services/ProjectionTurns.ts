@@ -90,6 +90,7 @@ export type ProjectionAcceptedTurnStart = typeof ProjectionAcceptedTurnStart.Typ
 export const ProjectionAcceptedTurnStartState = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,
+  providerTurnId: Schema.NullOr(TurnId),
   sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
   sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
   requestedAt: IsoDateTime,
@@ -97,6 +98,14 @@ export const ProjectionAcceptedTurnStartState = Schema.Struct({
   runtimeAdmitted: Schema.Boolean,
 });
 export type ProjectionAcceptedTurnStartState = typeof ProjectionAcceptedTurnStartState.Type;
+
+export const ProjectionAcceptedTurnStartCorrelation = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  providerTurnId: TurnId,
+});
+export type ProjectionAcceptedTurnStartCorrelation =
+  typeof ProjectionAcceptedTurnStartCorrelation.Type;
 
 export const ProjectionAcceptedTurnStartPhase = Schema.Literals([
   "provider-send-completed",
@@ -118,6 +127,7 @@ export const ProjectionAcceptedTurnStartPhaseResult = Schema.Struct({
   sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
   sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
   requestedAt: IsoDateTime,
+  providerTurnId: Schema.NullOr(TurnId),
   providerSendCompleted: Schema.Boolean,
   runtimeAdmitted: Schema.Boolean,
   finalized: Schema.Boolean,
@@ -207,6 +217,14 @@ export interface ProjectionTurnRepositoryShape {
   readonly getAcceptedTurnStartByThreadId: (
     input: GetProjectionPendingTurnStartInput,
   ) => Effect.Effect<Option.Option<ProjectionAcceptedTurnStartState>, ProjectionRepositoryError>;
+
+  /**
+   * Binds the provider generation to the exact reactor-admitted message. Replays of the same
+   * generation are idempotent; another message or generation cannot overwrite the binding.
+   */
+  readonly correlateAcceptedTurnStart: (
+    input: ProjectionAcceptedTurnStartCorrelation,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
 
   /** Records one exact completion phase and atomically finalizes the row when both phases exist. */
   readonly completeAcceptedTurnStartPhase: (

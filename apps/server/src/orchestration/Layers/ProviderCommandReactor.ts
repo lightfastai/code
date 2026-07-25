@@ -836,6 +836,7 @@ const make = Effect.gen(function* () {
       }
     });
     let providerSendAttempted = false;
+    let correlatedProviderTurnId: TurnId | undefined;
 
     const runFailureCleanupStep = <A, E, R>(operation: string, effect: Effect.Effect<A, E, R>) =>
       effect.pipe(
@@ -855,22 +856,20 @@ const make = Effect.gen(function* () {
         return;
       }
 
-      const sessions = yield* providerService.listSessions();
-      const failedSession = sessions.find((session) => session.threadId === event.payload.threadId);
-      if (failedSession?.activeTurnId === undefined) {
+      if (correlatedProviderTurnId === undefined) {
         yield* deleteAcceptedTurnStart;
         return;
       }
 
       const cancelled = yield* projectionTurnRepository.cancelAcceptedTurnStart({
         ...authorityTurn,
-        providerTurnId: failedSession.activeTurnId,
+        providerTurnId: correlatedProviderTurnId,
         cancelledAt: event.payload.createdAt,
       });
       if (!cancelled) {
         yield* Effect.logWarning("provider turn failure cancellation tombstone deferred", {
           ...authorityTurn,
-          providerTurnId: failedSession.activeTurnId,
+          providerTurnId: correlatedProviderTurnId,
         });
       }
     });
@@ -1027,7 +1026,33 @@ const make = Effect.gen(function* () {
       });
 
       providerSendAttempted = true;
-      yield* providerService.sendTurn(sendTurnRequest);
+      const correlateAcceptedProviderTurn = (accepted: {
+        readonly turnId: TurnId;
+      }): Effect.Effect<void> =>
+        projectionTurnRepository
+          .correlateAcceptedTurnStart({
+            ...authorityTurn,
+            providerTurnId: accepted.turnId,
+          })
+          .pipe(
+            Effect.flatMap((correlated) =>
+              correlated
+                ? Effect.sync(() => {
+                    correlatedProviderTurnId = accepted.turnId;
+                  })
+                : Effect.die(
+                    new Error(
+                      `Provider generation '${accepted.turnId}' did not match accepted message '${authorityTurn.messageId}'.`,
+                    ),
+                  ),
+            ),
+            Effect.orDie,
+          );
+      const acceptedProviderTurn = yield* providerService.sendTurn(
+        sendTurnRequest,
+        correlateAcceptedProviderTurn,
+      );
+      yield* correlateAcceptedProviderTurn(acceptedProviderTurn);
       yield* McpSessionRegistry.completeActiveNotebookDocumentAuthorityTurn(authorityTurn);
       yield* completeTurnStartAdmissionPhase(projectionTurnRepository, {
         ...authorityTurn,

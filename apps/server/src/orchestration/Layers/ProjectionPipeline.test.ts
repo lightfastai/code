@@ -2526,6 +2526,7 @@ acceptedTurnProjectionLayer("accepted turn-start projection", (it) => {
           sourceProposedPlanThreadId: sourceThreadA,
           sourceProposedPlanId: sourcePlanA,
           requestedAt: "2026-01-01T00:00:00.000Z",
+          providerTurnId: null,
           providerSendCompleted: false,
           runtimeAdmitted: false,
         },

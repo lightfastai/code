@@ -49,6 +49,7 @@ import Migration0033 from "./Migrations/033_NotebookRevisions.ts";
 import Migration0034 from "./Migrations/034_ProjectionTurnStartAdmissions.ts";
 import Migration0035 from "./Migrations/035_ProjectionTurnStartAdmissionPhases.ts";
 import Migration0036 from "./Migrations/036_ProjectionTurnStartCancellations.ts";
+import Migration0037 from "./Migrations/037_ProjectionTurnStartProviderGeneration.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -97,6 +98,7 @@ export const migrationEntries = [
   [34, "ProjectionTurnStartAdmissions", Migration0034],
   [35, "ProjectionTurnStartAdmissionPhases", Migration0035],
   [36, "ProjectionTurnStartCancellations", Migration0036],
+  [37, "ProjectionTurnStartProviderGeneration", Migration0037],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

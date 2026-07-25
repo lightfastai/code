@@ -154,6 +154,7 @@
         "apps/server/src/persistence/Migrations/034_ProjectionTurnStartAdmissions.ts",
         "apps/server/src/persistence/Migrations/035_ProjectionTurnStartAdmissionPhases.ts",
         "apps/server/src/persistence/Migrations/036_ProjectionTurnStartCancellations.ts",
+        "apps/server/src/persistence/Migrations/037_ProjectionTurnStartProviderGeneration.ts",
         "apps/server/src/persistence/Services/ProjectionTurns.ts"
       ],
       "prefixes": []

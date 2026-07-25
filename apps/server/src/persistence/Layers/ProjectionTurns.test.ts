@@ -38,9 +38,64 @@ layer("ProjectionTurnRepository accepted starts", (it) => {
         Option.getOrThrow(yield* repository.getAcceptedTurnStartByThreadId({ threadId })),
         {
           ...acceptedA,
+          providerTurnId: null,
           providerSendCompleted: false,
           runtimeAdmitted: false,
         },
+      );
+    }),
+  );
+
+  it.effect("binds one provider generation only to the exact accepted message", () =>
+    Effect.gen(function* () {
+      const repository = yield* ProjectionTurnRepository;
+      const threadId = ThreadId.make("thread-provider-generation");
+      const messageA = MessageId.make("message-generation-a");
+      const messageB = MessageId.make("message-generation-b");
+      const turnA = TurnId.make("provider-turn-a");
+      const turnB = TurnId.make("provider-turn-b");
+
+      assert.isTrue(
+        yield* repository.stageAcceptedTurnStart({
+          threadId,
+          messageId: messageA,
+          sourceProposedPlanThreadId: null,
+          sourceProposedPlanId: null,
+          requestedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+      assert.isFalse(
+        yield* repository.correlateAcceptedTurnStart({
+          threadId,
+          messageId: messageB,
+          providerTurnId: turnB,
+        }),
+      );
+      assert.isTrue(
+        yield* repository.correlateAcceptedTurnStart({
+          threadId,
+          messageId: messageA,
+          providerTurnId: turnA,
+        }),
+      );
+      assert.isTrue(
+        yield* repository.correlateAcceptedTurnStart({
+          threadId,
+          messageId: messageA,
+          providerTurnId: turnA,
+        }),
+      );
+      assert.isFalse(
+        yield* repository.correlateAcceptedTurnStart({
+          threadId,
+          messageId: messageA,
+          providerTurnId: turnB,
+        }),
+      );
+      assert.equal(
+        Option.getOrThrow(yield* repository.getAcceptedTurnStartByThreadId({ threadId }))
+          .providerTurnId,
+        turnA,
       );
     }),
   );
@@ -110,6 +165,7 @@ layer("ProjectionTurnRepository accepted starts", (it) => {
         ),
         {
           ...acceptedA,
+          providerTurnId: null,
           providerSendCompleted: true,
           runtimeAdmitted: false,
           finalized: false,
@@ -139,6 +195,7 @@ layer("ProjectionTurnRepository accepted starts", (it) => {
         ),
         {
           ...acceptedA,
+          providerTurnId: null,
           providerSendCompleted: true,
           runtimeAdmitted: true,
           finalized: true,
