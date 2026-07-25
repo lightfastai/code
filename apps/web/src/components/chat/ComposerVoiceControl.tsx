@@ -23,9 +23,8 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 
 type VoicePhase = "idle" | "requesting" | "connecting" | "listening" | "speaking" | "error";
 
-interface TeardownVoiceSessionOptions {
-  readonly disconnectRoom: boolean;
-}
+type VoiceTeardownOrigin = "local" | "remote";
+type VoiceRoomDisconnectState = "locally-owned" | "remotely-disconnected";
 
 const ACTIVE_PHASES = new Set<VoicePhase>(["requesting", "connecting", "listening", "speaking"]);
 
@@ -66,15 +65,24 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
   const requestVersionRef = useRef(0);
   const mountedRef = useRef(true);
   const scopeKeyRef = useRef(scopeKey);
+  const roomDisconnectStateRef = useRef(new WeakMap<Room, VoiceRoomDisconnectState>());
 
   const clearOutput = useCallback(() => {
     outputRef.current?.replaceChildren();
   }, []);
 
+  const disconnectLocallyOwnedRoom = useCallback(async (room: Room) => {
+    if (roomDisconnectStateRef.current.get(room) === "remotely-disconnected") return;
+    await room.disconnect(true);
+  }, []);
+
   const teardownVoiceSession = useCallback(
-    (room: Room | null, { disconnectRoom }: TeardownVoiceSessionOptions) => {
+    (room: Room | null, origin: VoiceTeardownOrigin) => {
       if (room !== null && roomRef.current !== room) return;
 
+      if (room !== null && origin === "remote") {
+        roomDisconnectStateRef.current.set(room, "remotely-disconnected");
+      }
       requestVersionRef.current += 1;
       roomRef.current = null;
       liveSequenceRef.current = -1;
@@ -83,14 +91,14 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
         setPhase("idle");
         setLiveArtifact(null);
       }
-      if (disconnectRoom && room) void room.disconnect(true);
+      if (origin === "local" && room) void disconnectLocallyOwnedRoom(room);
     },
-    [clearOutput],
+    [clearOutput, disconnectLocallyOwnedRoom],
   );
 
   const stop = useCallback(() => {
     const room = roomRef.current;
-    teardownVoiceSession(room, { disconnectRoom: true });
+    teardownVoiceSession(room, "local");
   }, [teardownVoiceSession]);
 
   useEffect(() => {
@@ -111,6 +119,7 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
     const requestVersion = requestVersionRef.current + 1;
     requestVersionRef.current = requestVersion;
     const room = new Room({ adaptiveStream: true, dynacast: true });
+    roomDisconnectStateRef.current.set(room, "locally-owned");
     roomRef.current = room;
     setPhase("requesting");
 
@@ -147,20 +156,23 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
       .on(RoomEvent.Reconnecting, () => updatePhase("connecting"))
       .on(RoomEvent.Reconnected, () => updatePhase("listening"))
       .on(RoomEvent.Disconnected, () => {
-        teardownVoiceSession(room, { disconnectRoom: false });
+        teardownVoiceSession(room, "remote");
       });
+
+    const startupIsCurrent = () =>
+      requestVersionRef.current === requestVersion && roomRef.current === room;
 
     const sessionResult = await createVoiceSession({
       environmentId,
       input: { documentIds },
     });
-    if (requestVersionRef.current !== requestVersion || roomRef.current !== room) {
-      await room.disconnect(true);
+    if (!startupIsCurrent()) {
+      await disconnectLocallyOwnedRoom(room);
       return;
     }
     if (sessionResult._tag === "Failure") {
       roomRef.current = null;
-      await room.disconnect(true);
+      await disconnectLocallyOwnedRoom(room);
       if (isAtomCommandInterrupted(sessionResult)) {
         if (mountedRef.current && requestVersionRef.current === requestVersion) setPhase("idle");
         return;
@@ -174,8 +186,8 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
     try {
       updatePhase("connecting");
       await room.connect(sessionResult.value.url, sessionResult.value.token);
-      if (requestVersionRef.current !== requestVersion || roomRef.current !== room) {
-        await room.disconnect(true);
+      if (!startupIsCurrent()) {
+        await disconnectLocallyOwnedRoom(room);
         return;
       }
       await room.localParticipant.setMicrophoneEnabled(true, {
@@ -183,11 +195,19 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
         noiseSuppression: true,
         autoGainControl: true,
       });
+      if (!startupIsCurrent()) {
+        await disconnectLocallyOwnedRoom(room);
+        return;
+      }
       await room.startAudio();
+      if (!startupIsCurrent()) {
+        await disconnectLocallyOwnedRoom(room);
+        return;
+      }
       updatePhase("listening");
     } catch (cause) {
       if (roomRef.current === room) roomRef.current = null;
-      await room.disconnect(true);
+      await disconnectLocallyOwnedRoom(room);
       if (requestVersionRef.current !== requestVersion) return;
       const message = errorMessage(cause);
       if (mountedRef.current) setPhase("error");
@@ -197,7 +217,13 @@ export const ComposerVoiceControl = memo(function ComposerVoiceControl({
         description: message,
       });
     }
-  }, [createVoiceSession, documentIds, environmentId, teardownVoiceSession]);
+  }, [
+    createVoiceSession,
+    disconnectLocallyOwnedRoom,
+    documentIds,
+    environmentId,
+    teardownVoiceSession,
+  ]);
 
   const active = ACTIVE_PHASES.has(phase);
   const pending = phase === "requesting" || phase === "connecting";

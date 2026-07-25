@@ -3,7 +3,10 @@ import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const voiceMocks = vi.hoisted(() => ({
+  connect: vi.fn(),
   createVoiceSession: vi.fn(),
+  setMicrophoneEnabled: vi.fn(),
+  startAudio: vi.fn(),
   rooms: [] as Array<{
     readonly disconnect: ReturnType<typeof vi.fn>;
     emit(event: string, ...args: ReadonlyArray<unknown>): void;
@@ -23,7 +26,7 @@ vi.mock("livekit-client", () => ({
     readonly disconnect = vi.fn(async () => undefined);
     readonly localParticipant = {
       identity: "local-user",
-      setMicrophoneEnabled: vi.fn(async () => undefined),
+      setMicrophoneEnabled: voiceMocks.setMicrophoneEnabled,
     };
     readonly handlers = new Map<string, (...args: ReadonlyArray<unknown>) => void>();
 
@@ -41,11 +44,11 @@ vi.mock("livekit-client", () => ({
     }
 
     startAudio() {
-      return Promise.resolve();
+      return voiceMocks.startAudio();
     }
 
     connect() {
-      return Promise.resolve();
+      return voiceMocks.connect();
     }
   },
   RoomEvent: {
@@ -142,8 +145,26 @@ function sceneMessage(sequence: number, title: string): Uint8Array {
   );
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (cause?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
+const successfulSession = {
+  _tag: "Success",
+  value: { url: "wss://voice.example.test", token: "token" },
+} as const;
+
 beforeEach(() => {
+  voiceMocks.connect.mockReset().mockResolvedValue(undefined);
   voiceMocks.createVoiceSession.mockReset();
+  voiceMocks.setMicrophoneEnabled.mockReset().mockResolvedValue(undefined);
+  voiceMocks.startAudio.mockReset().mockResolvedValue(undefined);
   voiceMocks.rooms.length = 0;
 });
 
@@ -187,10 +208,12 @@ describe("ComposerVoiceControl document scope", () => {
     });
 
     expect(voiceMocks.rooms[0]?.disconnect).toHaveBeenCalledWith(true);
-    resolveSession({
-      _tag: "Success",
-      value: { url: "wss://voice.example.test", token: "token" },
+    await act(async () => {
+      resolveSession(successfulSession);
+      await Promise.resolve();
+      await Promise.resolve();
     });
+    expect(voiceMocks.rooms[0]?.disconnect).toHaveBeenCalledTimes(2);
     await startPromise;
     await act(async () => renderer!.unmount());
   });
@@ -243,6 +266,98 @@ describe("ComposerVoiceControl live scene lifecycle", () => {
 
     expect(renderer!.root.findByProps({ "aria-label": "Live voice study scene" })).toBeDefined();
     expect(renderer!.root.findByProps({ "data-scene-title": "Room B scene" })).toBeDefined();
+    await act(async () => renderer!.unmount());
+  });
+});
+
+describe("ComposerVoiceControl startup teardown ownership", () => {
+  it("does not disconnect again when natural disconnect settles session creation", async () => {
+    const session = deferred<typeof successfulSession>();
+    voiceMocks.createVoiceSession.mockReturnValue(session.promise);
+    let renderer: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(renderControl([studyDocument("a")]));
+    });
+    await startVoice(renderer!);
+
+    const room = voiceMocks.rooms[0]!;
+    await act(async () => {
+      room.emit("Disconnected");
+      session.resolve(successfulSession);
+      await session.promise;
+      await Promise.resolve();
+    });
+
+    expect(room.disconnect).not.toHaveBeenCalled();
+    await act(async () => renderer!.unmount());
+  });
+
+  it("does not disconnect again when natural disconnect settles room connection", async () => {
+    const connection = deferred<void>();
+    voiceMocks.createVoiceSession.mockResolvedValue(successfulSession);
+    voiceMocks.connect.mockReturnValue(connection.promise);
+    let renderer: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(renderControl([studyDocument("a")]));
+    });
+    await startVoice(renderer!);
+    expect(voiceMocks.connect).toHaveBeenCalledOnce();
+
+    const room = voiceMocks.rooms[0]!;
+    await act(async () => {
+      room.emit("Disconnected");
+      connection.resolve();
+      await connection.promise;
+      await Promise.resolve();
+    });
+
+    expect(room.disconnect).not.toHaveBeenCalled();
+    await act(async () => renderer!.unmount());
+  });
+
+  it("does not disconnect again when microphone startup rejects after natural disconnect", async () => {
+    const microphone = deferred<void>();
+    voiceMocks.createVoiceSession.mockResolvedValue(successfulSession);
+    voiceMocks.setMicrophoneEnabled.mockReturnValue(microphone.promise);
+    let renderer: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(renderControl([studyDocument("a")]));
+    });
+    await startVoice(renderer!);
+    expect(voiceMocks.setMicrophoneEnabled).toHaveBeenCalledOnce();
+
+    const room = voiceMocks.rooms[0]!;
+    await act(async () => {
+      room.emit("Disconnected");
+      microphone.reject(new Error("room closed"));
+      await microphone.promise.catch(() => undefined);
+      await Promise.resolve();
+    });
+
+    expect(room.disconnect).not.toHaveBeenCalled();
+    await act(async () => renderer!.unmount());
+  });
+
+  it("does not disconnect again when final audio startup rejects after natural disconnect", async () => {
+    const audio = deferred<void>();
+    voiceMocks.createVoiceSession.mockResolvedValue(successfulSession);
+    voiceMocks.startAudio.mockResolvedValueOnce(undefined).mockReturnValueOnce(audio.promise);
+    let renderer: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(renderControl([studyDocument("a")]));
+    });
+    await startVoice(renderer!);
+    expect(voiceMocks.startAudio).toHaveBeenCalledTimes(2);
+
+    const room = voiceMocks.rooms[0]!;
+    await act(async () => {
+      room.emit("Disconnected");
+      audio.reject(new Error("room closed"));
+      await audio.promise.catch(() => undefined);
+      await Promise.resolve();
+    });
+
+    expect(room.disconnect).not.toHaveBeenCalled();
     await act(async () => renderer!.unmount());
   });
 });
