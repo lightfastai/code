@@ -906,7 +906,7 @@ export function makeCursorAdapter(
         }).pipe(Effect.scoped),
       );
 
-    const sendTurn: CursorAdapterShape["sendTurn"] = (input) =>
+    const sendTurn: CursorAdapterShape["sendTurn"] = (input, onAccepted) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
         // A sendTurn while a prompt is in flight is a steer: the agent folds
@@ -948,6 +948,9 @@ export function makeCursorAdapter(
             updatedAt: yield* nowIso,
           };
 
+          if (onAccepted !== undefined) {
+            yield* onAccepted({ threadId: input.threadId, turnId });
+          }
           if (steeringTurnId === undefined) {
             yield* offerRuntimeEvent({
               type: "turn.started",

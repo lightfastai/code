@@ -1,7 +1,16 @@
 import * as Haptics from "expo-haptics";
 import { KeyboardAwareLegendList } from "@legendapp/list/keyboard";
 import { type LegendListRef } from "@legendapp/list/react-native";
-import type { EnvironmentId, MessageId, ThreadId, TurnId } from "@t3tools/contracts";
+import type {
+  ChatArtifactAttachment,
+  EnvironmentId,
+  MessageId,
+  ProjectId,
+  StudyDocument,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
+import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
 import { CHAT_LIST_ANCHOR_OFFSET, resolveChatListAnchoredEndSpace } from "@t3tools/shared/chatList";
 import { SymbolView } from "../../components/AppSymbol";
 import { HeaderHeightContext } from "@react-navigation/elements";
@@ -92,8 +101,13 @@ import {
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 import { ThreadWorkGroupToggle, ThreadWorkLog } from "./thread-work-log";
 import { useMarkdownCodeHighlight } from "./markdownCodeHighlightState";
+import {
+  describeMobileArtifact,
+  resolveMobileArtifactNativeRenderer,
+} from "../../lightfast/register";
 import { useAssetUrl } from "../../state/assets";
 import { resolveWorkspaceRelativeFilePath } from "../files/filePath";
+import { NotebookArtifactCard } from "./notebook/NotebookArtifactCard";
 
 const MESSAGE_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
   hour: "numeric",
@@ -122,7 +136,10 @@ function isFreshTimestamp(input: string): boolean {
 
 export interface ThreadFeedProps {
   readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId;
   readonly threadId: ThreadId;
+  readonly connectionPhase: EnvironmentConnectionPhase;
+  readonly studyDocuments: ReadonlyArray<StudyDocument>;
   readonly workspaceRoot?: string | null;
   readonly feed: ReadonlyArray<ThreadFeedEntry>;
   readonly contentPresentation: ThreadContentPresentation;
@@ -794,7 +811,10 @@ function useMarkdownStyles(onLinkPress: (href: string) => void): MarkdownStyleSe
 
 function renderFeedEntry(
   info: { item: ThreadFeedEntry; index: number },
-  props: Pick<ThreadFeedProps, "environmentId" | "skills"> & {
+  props: Pick<
+    ThreadFeedProps,
+    "connectionPhase" | "environmentId" | "projectId" | "skills" | "studyDocuments" | "threadId"
+  > & {
     readonly copiedRowId: string | null;
     readonly expandedWorkRows: Record<string, boolean>;
     readonly terminalAssistantMessageIds: ReadonlySet<string>;
@@ -892,13 +912,23 @@ function renderFeedEntry(
               />
             ) : null}
             {attachments.map((attachment) => {
-              return (
+              return attachment.type === "image" ? (
                 <MessageAttachmentImage
                   key={attachment.id}
                   environmentId={props.environmentId}
                   attachmentId={attachment.id}
                   className="aspect-[1.3] w-full rounded-[14px] bg-white/15"
                   onPressImage={props.onPressImage}
+                />
+              ) : (
+                <MessageArtifactCard
+                  key={attachment.id}
+                  artifact={attachment}
+                  environmentId={props.environmentId}
+                  projectId={props.projectId}
+                  threadId={props.threadId}
+                  connectionPhase={props.connectionPhase}
+                  studyDocuments={props.studyDocuments}
                 />
               );
             })}
@@ -953,13 +983,23 @@ function renderFeedEntry(
           )
         ) : null}
         {attachments.map((attachment) => {
-          return (
+          return attachment.type === "image" ? (
             <MessageAttachmentImage
               key={attachment.id}
               environmentId={props.environmentId}
               attachmentId={attachment.id}
               className="mt-1.5 aspect-[1.3] w-full rounded-[18px] bg-neutral-200 dark:bg-neutral-800"
               onPressImage={props.onPressImage}
+            />
+          ) : (
+            <MessageArtifactCard
+              key={attachment.id}
+              artifact={attachment}
+              environmentId={props.environmentId}
+              projectId={props.projectId}
+              threadId={props.threadId}
+              connectionPhase={props.connectionPhase}
+              studyDocuments={props.studyDocuments}
             />
           );
         })}
@@ -990,6 +1030,46 @@ function renderFeedEntry(
       onCopyRow={props.onCopyWorkRow}
       onToggleRow={props.onToggleWorkRow}
     />
+  );
+}
+
+function MessageArtifactCard({
+  artifact,
+  environmentId,
+  projectId,
+  threadId,
+  connectionPhase,
+  studyDocuments,
+}: {
+  readonly artifact: ChatArtifactAttachment;
+  readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId;
+  readonly threadId: ThreadId;
+  readonly connectionPhase: EnvironmentConnectionPhase;
+  readonly studyDocuments: ReadonlyArray<StudyDocument>;
+}) {
+  if (resolveMobileArtifactNativeRenderer(artifact) === "lightfast.notebook") {
+    return (
+      <NotebookArtifactCard
+        artifact={artifact}
+        environmentId={environmentId}
+        projectId={projectId}
+        threadId={threadId}
+        connectionPhase={connectionPhase}
+        studyDocuments={studyDocuments}
+      />
+    );
+  }
+  return (
+    <View className="mt-1.5 gap-1 rounded-[18px] border border-neutral-200 bg-neutral-100 px-4 py-3 dark:border-neutral-700 dark:bg-neutral-900">
+      <View className="flex-row items-center gap-2">
+        <View className="size-2 rounded-full bg-sky-500" />
+        <Text className="font-t3-medium flex-1 text-sm text-foreground" numberOfLines={1}>
+          {artifact.title}
+        </Text>
+      </View>
+      <Text className="text-xs text-foreground-muted">{describeMobileArtifact(artifact)}</Text>
+    </View>
   );
 }
 
@@ -1601,6 +1681,10 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
     (info: { item: ThreadFeedEntry; index: number }) =>
       renderFeedEntry(info, {
         environmentId: props.environmentId,
+        projectId: props.projectId,
+        threadId: props.threadId,
+        connectionPhase: props.connectionPhase,
+        studyDocuments: props.studyDocuments,
         copiedRowId,
         expandedWorkRows,
         terminalAssistantMessageIds,
@@ -1637,6 +1721,10 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       onToggleWorkGroup,
       onToggleWorkRow,
       props.environmentId,
+      props.projectId,
+      props.threadId,
+      props.connectionPhase,
+      props.studyDocuments,
       props.skills,
     ],
   );

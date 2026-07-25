@@ -2,7 +2,7 @@
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 
-import type { ChatAttachment } from "@t3tools/contracts";
+import type { ChatImageAttachment } from "@t3tools/contracts";
 
 import {
   normalizeAttachmentRelativePath,
@@ -54,21 +54,17 @@ export function parseThreadSegmentFromAttachmentId(attachmentId: string): string
   return match[1]?.toLowerCase() ?? null;
 }
 
-export function attachmentRelativePath(attachment: ChatAttachment): string {
-  switch (attachment.type) {
-    case "image": {
-      const extension = inferImageExtension({
-        mimeType: attachment.mimeType,
-        fileName: attachment.name,
-      });
-      return `${attachment.id}${extension}`;
-    }
-  }
+export function attachmentRelativePath(attachment: ChatImageAttachment): string {
+  const extension = inferImageExtension({
+    mimeType: attachment.mimeType,
+    fileName: attachment.name,
+  });
+  return `${attachment.id}${extension}`;
 }
 
 export function resolveAttachmentPath(input: {
   readonly attachmentsDir: string;
-  readonly attachment: ChatAttachment;
+  readonly attachment: ChatImageAttachment;
 }): string | null {
   return resolveAttachmentRelativePath({
     attachmentsDir: input.attachmentsDir,

@@ -1,6 +1,7 @@
 import {
   type EnvironmentId,
   type MessageId,
+  type ScopedProjectRef,
   type ScopedThreadRef,
   type ServerProviderSkill,
   type TurnId,
@@ -98,6 +99,9 @@ import { cn } from "~/lib/utils";
 import { useUiStateStore } from "~/uiStateStore";
 import { type TimestampFormat } from "@t3tools/contracts/settings";
 import { formatChatTimestampTooltip, formatShortTimestamp } from "../../timestampFormat";
+import { ArtifactRenderer } from "../artifacts/ArtifactRenderer";
+import { NotebookArtifactProvider } from "../artifacts/notebook/NotebookArtifact";
+import type { NotebookAgentExecutionPermission } from "@t3tools/lightfast-artifact-notebook/web";
 
 import {
   buildInlineTerminalContextText,
@@ -124,6 +128,8 @@ interface TimelineRowSharedState {
   timestampFormat: TimestampFormat;
   routeThreadKey: string;
   threadRef: ScopedThreadRef | null;
+  projectRef: ScopedProjectRef | null;
+  notebookAgentExecutionPermission: NotebookAgentExecutionPermission | undefined;
   markdownCwd: string | undefined;
   resolvedTheme: "light" | "dark";
   workspaceRoot: string | undefined;
@@ -162,6 +168,8 @@ interface MessagesTimelineProps {
   runningTurnId: TurnId | null;
   turnDiffSummaryByAssistantMessageId: Map<MessageId, TurnDiffSummary>;
   routeThreadKey: string;
+  projectRef?: ScopedProjectRef | null;
+  notebookAgentExecutionPermission?: NotebookAgentExecutionPermission;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   revertTurnCountByUserMessageId: Map<MessageId, number>;
   onRevertUserMessage: (messageId: MessageId) => void;
@@ -195,6 +203,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   runningTurnId,
   turnDiffSummaryByAssistantMessageId,
   routeThreadKey,
+  projectRef = null,
+  notebookAgentExecutionPermission,
   onOpenTurnDiff,
   revertTurnCountByUserMessageId,
   onRevertUserMessage,
@@ -411,6 +421,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       timestampFormat,
       routeThreadKey,
       threadRef: parseScopedThreadKey(routeThreadKey),
+      projectRef,
+      notebookAgentExecutionPermission,
       markdownCwd,
       resolvedTheme,
       workspaceRoot,
@@ -425,6 +437,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     [
       timestampFormat,
       routeThreadKey,
+      projectRef,
+      notebookAgentExecutionPermission,
       markdownCwd,
       resolvedTheme,
       workspaceRoot,
@@ -791,6 +805,10 @@ function TimelineMinimap({
 
 type TimelineEntry = ReturnType<typeof deriveTimelineEntries>[number];
 type TimelineMessage = Extract<TimelineEntry, { kind: "message" }>["message"];
+type TimelineImageAttachment = Extract<
+  NonNullable<TimelineMessage["attachments"]>[number],
+  { type: "image" }
+>;
 type TimelineWorkEntry = Extract<MessagesTimelineRow, { kind: "work" }>["groupedEntries"][number];
 type TimelineRow = MessagesTimelineRow;
 
@@ -827,7 +845,9 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
 
 function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
   const ctx = use(TimelineRowCtx);
-  const userImages = row.message.attachments ?? [];
+  const userImages = (row.message.attachments ?? []).filter(
+    (attachment) => attachment.type === "image",
+  );
   const displayedUserMessage = deriveDisplayedUserMessageState(row.message.text);
   const terminalContexts = displayedUserMessage.contexts;
   const previewAnnotations: ParsedPreviewAnnotation[] = [];
@@ -852,7 +872,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
       <div className="relative max-w-[80%] rounded-2xl border border-border bg-secondary p-3">
         {regularImages.length > 0 && (
           <div className="mb-2 grid max-w-[420px] grid-cols-2 gap-2">
-            {regularImages.map((image: NonNullable<TimelineMessage["attachments"]>[number]) => (
+            {regularImages.map((image) => (
               <div
                 key={image.id}
                 className="overflow-hidden rounded-lg border border-border/80 bg-background/70"
@@ -976,7 +996,11 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
 
 function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
   const ctx = use(TimelineRowCtx);
-  const messageText = row.message.text || (row.message.streaming ? "" : "(empty response)");
+  const artifacts = (row.message.attachments ?? []).filter(
+    (attachment) => attachment.type === "artifact",
+  );
+  const messageText =
+    row.message.text || (row.message.streaming || artifacts.length > 0 ? "" : "(empty response)");
 
   return (
     <>
@@ -988,6 +1012,19 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
           isStreaming={Boolean(row.message.streaming)}
           skills={ctx.skills}
         />
+        {artifacts.length > 0 ? (
+          <NotebookArtifactProvider
+            projectRef={ctx.projectRef}
+            threadRef={ctx.threadRef}
+            {...(ctx.notebookAgentExecutionPermission === undefined
+              ? {}
+              : { agentExecutionPermission: ctx.notebookAgentExecutionPermission })}
+          >
+            {artifacts.map((artifact) => (
+              <ArtifactRenderer key={artifact.id} artifact={artifact} />
+            ))}
+          </NotebookArtifactProvider>
+        ) : null}
         <AssistantChangedFilesSection
           turnSummary={row.assistantTurnDiffSummary}
           routeThreadKey={ctx.routeThreadKey}
@@ -1321,7 +1358,7 @@ const UserMessageElementContextChip = memo(function UserMessageElementContextChi
 
 function UserMessagePreviewAnnotationCard(props: {
   annotation: ParsedPreviewAnnotation;
-  image: NonNullable<TimelineMessage["attachments"]>[number] | null;
+  image: TimelineImageAttachment | null;
 }) {
   const ctx = use(TimelineRowCtx);
   return (

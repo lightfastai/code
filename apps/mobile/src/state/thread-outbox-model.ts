@@ -9,11 +9,13 @@ import {
   ProjectId,
   ProviderInteractionMode,
   RuntimeMode,
+  SelectedStudyDocumentIds,
   ThreadId,
   type ModelSelection as ModelSelectionType,
   type ProjectId as ProjectIdType,
   type ProviderInteractionMode as ProviderInteractionModeType,
   type RuntimeMode as RuntimeModeType,
+  type SelectedStudyDocumentIds as SelectedStudyDocumentIdsType,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
@@ -21,7 +23,7 @@ import { DraftComposerImageAttachmentSchema } from "../lib/composer-image-schema
 import type { DraftComposerImageAttachment } from "../lib/composerImages";
 import { scopedThreadKey } from "../lib/scopedEntities";
 
-const THREAD_OUTBOX_SCHEMA_VERSION = 3;
+const THREAD_OUTBOX_SCHEMA_VERSION = 4;
 const THREAD_OUTBOX_MAX_RETRY_DELAY_MS = 16_000;
 
 const QueuedThreadCreationSchema = Schema.Struct({
@@ -37,13 +39,14 @@ const QueuedThreadCreationSchema = Schema.Struct({
 });
 
 export const QueuedThreadMessageSchema = Schema.Struct({
-  schemaVersion: Schema.Literals([1, 2, THREAD_OUTBOX_SCHEMA_VERSION]),
+  schemaVersion: Schema.Literals([1, 2, 3, THREAD_OUTBOX_SCHEMA_VERSION]),
   environmentId: EnvironmentId,
   threadId: ThreadId,
   messageId: MessageId,
   commandId: CommandId,
   text: Schema.String,
   attachments: Schema.Array(DraftComposerImageAttachmentSchema),
+  documentIds: Schema.optional(SelectedStudyDocumentIds),
   modelSelection: Schema.optional(ModelSelection),
   runtimeMode: Schema.optional(RuntimeMode),
   interactionMode: Schema.optional(ProviderInteractionMode),
@@ -73,6 +76,7 @@ export interface QueuedThreadMessage {
   readonly commandId: CommandId;
   readonly text: string;
   readonly attachments: ReadonlyArray<DraftComposerImageAttachment>;
+  readonly documentIds: SelectedStudyDocumentIdsType;
   readonly modelSelection?: ModelSelectionType;
   readonly runtimeMode?: RuntimeModeType;
   readonly interactionMode?: ProviderInteractionModeType;
@@ -113,8 +117,8 @@ export function encodeQueuedThreadMessage(message: QueuedThreadMessage): unknown
 }
 
 export function decodeQueuedThreadMessage(value: unknown): QueuedThreadMessage {
-  const { schemaVersion: _, ...message } = decodeStoredQueuedThreadMessage(value);
-  return message;
+  const { schemaVersion: _, documentIds = [], ...message } = decodeStoredQueuedThreadMessage(value);
+  return { ...message, documentIds };
 }
 
 export function groupQueuedThreadMessages(

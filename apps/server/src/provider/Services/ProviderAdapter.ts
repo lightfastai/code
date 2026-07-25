@@ -42,6 +42,8 @@ export interface ProviderThreadSnapshot {
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
 }
 
+export type ProviderTurnAcceptedObserver = (turn: ProviderTurnStartResult) => Effect.Effect<void>;
+
 export interface ProviderAdapterShape<TError> {
   /**
    * Provider kind implemented by this adapter.
@@ -61,6 +63,7 @@ export interface ProviderAdapterShape<TError> {
    */
   readonly sendTurn: (
     input: ProviderSendTurnInput,
+    onAccepted?: ProviderTurnAcceptedObserver,
   ) => Effect.Effect<ProviderTurnStartResult, TError>;
 
   /**

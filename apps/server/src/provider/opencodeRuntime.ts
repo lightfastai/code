@@ -1,6 +1,10 @@
 import * as NodeURL from "node:url";
 
-import type { ChatAttachment, ProviderApprovalDecision, RuntimeMode } from "@t3tools/contracts";
+import type {
+  ChatImageAttachment,
+  ProviderApprovalDecision,
+  RuntimeMode,
+} from "@t3tools/contracts";
 import {
   createOpencodeClient,
   type Agent,
@@ -191,8 +195,8 @@ export function openCodeQuestionId(
 }
 
 export function toOpenCodeFileParts(input: {
-  readonly attachments: ReadonlyArray<ChatAttachment> | undefined;
-  readonly resolveAttachmentPath: (attachment: ChatAttachment) => string | null;
+  readonly attachments: ReadonlyArray<ChatImageAttachment> | undefined;
+  readonly resolveAttachmentPath: (attachment: ChatImageAttachment) => string | null;
 }): Array<FilePartInput> {
   const parts: Array<FilePartInput> = [];
 

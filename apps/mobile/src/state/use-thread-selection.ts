@@ -1,9 +1,8 @@
 import { useRoute, type RouteProp } from "@react-navigation/native";
 import { useMemo, useRef } from "react";
 import {
-  EnvironmentId,
+  type EnvironmentId,
   type OrchestrationThread,
-  ThreadId,
   type ScopedProjectRef,
   type ScopedThreadRef,
 } from "@t3tools/contracts";
@@ -16,18 +15,11 @@ import {
   useRemoteEnvironmentRuntime,
   useSavedRemoteConnection,
 } from "./use-remote-environment-registry";
+import { resolveThreadRouteTarget } from "./thread-route-target";
 type ThreadSelectionRouteParams = {
   readonly environmentId?: string | string[];
   readonly threadId?: string | string[];
 };
-
-function firstRouteParam(value: string | string[] | undefined): string | null {
-  if (Array.isArray(value)) {
-    return value[0] ?? null;
-  }
-
-  return value ?? null;
-}
 
 function latestUserMessageAt(thread: OrchestrationThread): OrchestrationThread["updatedAt"] | null {
   for (let index = thread.messages.length - 1; index >= 0; index -= 1) {
@@ -67,19 +59,10 @@ function threadDetailToShell(
 }
 
 function useResolvedThreadSelection(params: ThreadSelectionRouteParams | undefined) {
-  const routeParams = params ?? {};
-  const routeThreadRef = useMemo<ScopedThreadRef | null>(() => {
-    const environmentId = firstRouteParam(routeParams.environmentId);
-    const threadId = firstRouteParam(routeParams.threadId);
-    if (!environmentId || !threadId) {
-      return null;
-    }
-
-    return {
-      environmentId: EnvironmentId.make(environmentId),
-      threadId: ThreadId.make(threadId),
-    };
-  }, [routeParams.environmentId, routeParams.threadId]);
+  const routeThreadRef = useMemo<ScopedThreadRef | null>(
+    () => resolveThreadRouteTarget(params, null),
+    [params?.environmentId, params?.threadId],
+  );
   const lastRouteThreadRef = useRef<ScopedThreadRef | null>(null);
   if (routeThreadRef !== null) {
     lastRouteThreadRef.current = routeThreadRef;

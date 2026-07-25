@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "id": "grounded-voice-v1",
+  "title": "Grounded voice study behavior",
+  "cases": [
+    {
+      "id": "completes-a-spoken-turn",
+      "title": "User and assistant both complete a spoken turn",
+      "split": "train",
+      "assertions": [
+        {
+          "type": "event_count",
+          "matcher": { "eventType": "user_message" },
+          "min": 1
+        },
+        {
+          "type": "event_count",
+          "matcher": { "eventType": "assistant_message" },
+          "min": 1
+        },
+        {
+          "type": "max_latency",
+          "from": { "eventType": "user_message" },
+          "to": { "eventType": "assistant_message" },
+          "maxMs": 5000
+        }
+      ]
+    },
+    {
+      "id": "searches-before-book-answer",
+      "title": "Selected-book claims are grounded before the answer",
+      "split": "holdout",
+      "assertions": [
+        {
+          "type": "event_count",
+          "matcher": {
+            "eventType": "tool_call",
+            "toolName": "search_study_library"
+          },
+          "min": 1
+        },
+        {
+          "type": "event_order",
+          "before": {
+            "eventType": "tool_call",
+            "toolName": "search_study_library"
+          },
+          "after": { "eventType": "assistant_message" }
+        }
+      ]
+    }
+  ]
+}

@@ -3,8 +3,10 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -56,6 +58,8 @@ import {
   type TerminalError,
   type TerminalEvent,
   type TerminalMetadataStreamEvent,
+  StudyLibraryRequestError,
+  StudyVoiceSessionError,
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
@@ -114,7 +118,20 @@ import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
+import {
+  readStudyLibraryIndex,
+  resolveStudyDocumentMountPaths,
+  resolveStudyLibraryPaths,
+} from "./study/StudyLibrary.ts";
+import { searchStudyLibrary } from "./study/StudySearch.ts";
+import { createStudyVoiceSession } from "./study/StudyVoiceSession.ts";
+import * as NotebookRevisionStore from "./notebook/NotebookRevisionStore.ts";
+import { makeNotebookRevisionRpcHandlers } from "./notebook/NotebookRevisionRpc.ts";
+import * as NotebookRuntimeManager from "./notebook/NotebookRuntimeManager.ts";
+import { makeNotebookRuntimeRpcHandlers } from "./notebook/NotebookRuntimeRpc.ts";
+import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
+const isStudyVoiceSessionError = Schema.is(StudyVoiceSessionError);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -308,6 +325,17 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.shellOpenInEditor, AuthOrchestrationOperateScope],
   [WS_METHODS.filesystemBrowse, AuthOrchestrationReadScope],
   [WS_METHODS.assetsCreateUrl, AuthOrchestrationReadScope],
+  [WS_METHODS.studyLibraryList, AuthOrchestrationReadScope],
+  [WS_METHODS.studyLibrarySearch, AuthOrchestrationReadScope],
+  [WS_METHODS.studyVoiceSessionCreate, AuthOrchestrationOperateScope],
+  [WS_METHODS.notebookSessionOpen, AuthOrchestrationOperateScope],
+  [WS_METHODS.notebookCellExecute, AuthOrchestrationOperateScope],
+  [WS_METHODS.notebookExecutionInterrupt, AuthOrchestrationOperateScope],
+  [WS_METHODS.notebookKernelRestart, AuthOrchestrationOperateScope],
+  [WS_METHODS.notebookSessionDispose, AuthOrchestrationOperateScope],
+  [WS_METHODS.notebookSessionEvents, AuthOrchestrationReadScope],
+  [WS_METHODS.notebookAgentExecutionPermissionGet, AuthOrchestrationReadScope],
+  [WS_METHODS.notebookAgentExecutionPermissionSet, AuthOrchestrationOperateScope],
   [WS_METHODS.subscribeVcsStatus, AuthOrchestrationReadScope],
   [WS_METHODS.vcsRefreshStatus, AuthOrchestrationReadScope],
   [WS_METHODS.vcsPull, AuthOrchestrationOperateScope],
@@ -390,6 +418,8 @@ function toAuthAccessStreamEvent(
 const makeWsRpcLayer = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
+  notebookRevisionStore: NotebookRevisionStore.NotebookRevisionStore["Service"],
+  notebookRuntimeManager: NotebookRuntimeManager.NotebookRuntimeManager,
 ) =>
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
@@ -410,6 +440,8 @@ const makeWsRpcLayer = (
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
       const config = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
       const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
@@ -942,6 +974,32 @@ const makeWsRpcLayer = (
         vcsStatusBroadcaster
           .refreshStatus(cwd)
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
+
+      const notebookRevisionRpcHandlers = makeNotebookRevisionRpcHandlers({
+        scopes: currentSession.scopes,
+        environmentId: serverEnvironment.getEnvironmentId,
+        projectExists: (projectId) =>
+          projectionSnapshotQuery.getProjectShellById(projectId).pipe(Effect.map(Option.isSome)),
+        randomUUID: crypto.randomUUIDv4,
+        store: notebookRevisionStore,
+        observe: (method, effect) =>
+          instrumentRpcEffect(method, effect, { "rpc.aggregate": "notebook" }),
+      });
+      const notebookRuntimeRpcHandlers = makeNotebookRuntimeRpcHandlers({
+        scopes: currentSession.scopes,
+        environmentId: serverEnvironment.getEnvironmentId,
+        projectExists: (projectId) =>
+          projectionSnapshotQuery.getProjectShellById(projectId).pipe(Effect.map(Option.isSome)),
+        resolveBookPaths: (documentIds) =>
+          Effect.gen(function* () {
+            const paths = yield* resolveStudyLibraryPaths(config.studyLibraryDir);
+            return yield* resolveStudyDocumentMountPaths(paths, documentIds);
+          }).pipe(
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
+          ),
+        manager: notebookRuntimeManager,
+      });
 
       return WsRpcGroup.of({
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
@@ -1519,6 +1577,76 @@ const makeWsRpcLayer = (
             }),
             { "rpc.aggregate": "workspace" },
           ),
+        [WS_METHODS.studyLibraryList]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.studyLibraryList,
+            Effect.gen(function* () {
+              const paths = yield* resolveStudyLibraryPaths(config.studyLibraryDir);
+              const index = yield* readStudyLibraryIndex(paths);
+              const tags = input.tags?.map((tag) => tag.trim().toLocaleLowerCase()) ?? [];
+              return index.documents.filter((document) =>
+                tags.every((tag) => document.tags.includes(tag)),
+              );
+            }).pipe(
+              Effect.mapError(
+                () =>
+                  new StudyLibraryRequestError({
+                    operation: "list",
+                    message: "Could not list the local study library.",
+                  }),
+              ),
+            ),
+            { "rpc.aggregate": "study" },
+          ),
+        [WS_METHODS.studyLibrarySearch]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.studyLibrarySearch,
+            Effect.gen(function* () {
+              const paths = yield* resolveStudyLibraryPaths(config.studyLibraryDir);
+              return yield* searchStudyLibrary(paths, input);
+            }).pipe(
+              Effect.mapError(
+                () =>
+                  new StudyLibraryRequestError({
+                    operation: "search",
+                    message: "Could not search the local study library.",
+                  }),
+              ),
+            ),
+            { "rpc.aggregate": "study" },
+          ),
+        [WS_METHODS.studyVoiceSessionCreate]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.studyVoiceSessionCreate,
+            Effect.gen(function* () {
+              const paths = yield* resolveStudyLibraryPaths(config.studyLibraryDir);
+              return yield* createStudyVoiceSession({ paths, request: input });
+            }).pipe(
+              Effect.mapError((error) =>
+                isStudyVoiceSessionError(error)
+                  ? error
+                  : new StudyVoiceSessionError({
+                      reason: "token",
+                      message: "Could not create a voice study session.",
+                    }),
+              ),
+            ),
+            { "rpc.aggregate": "study" },
+          ),
+        ...notebookRevisionRpcHandlers,
+        ...notebookRuntimeRpcHandlers,
+        [WS_METHODS.notebookAgentExecutionPermissionGet]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.notebookAgentExecutionPermissionGet,
+            McpSessionRegistry.getActiveNotebookExecutionPermission(input.threadId),
+            { "rpc.aggregate": "notebook" },
+          ),
+        [WS_METHODS.notebookAgentExecutionPermissionSet]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.notebookAgentExecutionPermissionSet,
+            McpSessionRegistry.setActiveNotebookExecutionPermission(input),
+            { "rpc.aggregate": "notebook" },
+          ),
         [WS_METHODS.subscribeVcsStatus]: (input) =>
           observeRpcStream(
             WS_METHODS.subscribeVcsStatus,
@@ -1862,6 +1990,8 @@ const makeWsRpcLayer = (
 export const websocketRpcRouteLayer = Layer.unwrap(
   Effect.gen(function* () {
     const previewAutomationBroker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
+    const notebookRevisionStore = yield* NotebookRevisionStore.NotebookRevisionStore;
+    const notebookRuntimeManager = yield* NotebookRuntimeManager.NotebookRuntimeManagerService;
     return HttpRouter.add(
       "GET",
       "/ws",
@@ -1881,7 +2011,12 @@ export const websocketRpcRouteLayer = Layer.unwrap(
           disableTracing: true,
         }).pipe(
           Effect.provide(
-            makeWsRpcLayer(session, previewAutomationBroker).pipe(
+            makeWsRpcLayer(
+              session,
+              previewAutomationBroker,
+              notebookRevisionStore,
+              notebookRuntimeManager,
+            ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(ProviderMaintenanceRunner.layer),
               Layer.provide(

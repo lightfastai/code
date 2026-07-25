@@ -143,6 +143,38 @@ import {
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
+import {
+  NotebookCellExecuteInput,
+  NotebookAgentExecutionPermission,
+  NotebookAgentExecutionPermissionGetInput,
+  NotebookAgentExecutionPermissionSetInput,
+  NotebookExecutionControlInput,
+  NotebookExecutionEvent,
+  NotebookExecutionEvents,
+  NotebookExecutionReplay,
+  NotebookRevisionCreateInput,
+  NotebookRevisionExportResult,
+  NotebookRevisionImportInput,
+  NotebookRevisionRef,
+  NotebookRevisionSaveInput,
+  NotebookRuntimeError,
+  NotebookSessionEventsInput,
+  NotebookSessionOpenInput,
+} from "./notebook.ts";
+import {
+  NotebookRevision,
+  NotebookRevisionError,
+} from "@t3tools/lightfast-artifact-notebook/contracts";
+import {
+  StudyLibraryListInput,
+  StudyLibraryListResult,
+  StudyLibraryRequestError,
+  StudySearchInput,
+  StudySearchResult,
+  StudyVoiceSessionError,
+  StudyVoiceSessionInput,
+  StudyVoiceSessionResult,
+} from "./study.ts";
 
 export const WS_METHODS = {
   // Project registry methods
@@ -160,6 +192,26 @@ export const WS_METHODS = {
   // Filesystem methods
   filesystemBrowse: "filesystem.browse",
   assetsCreateUrl: "assets.createUrl",
+
+  // Local-first study library methods
+  studyLibraryList: "study.library.list",
+  studyLibrarySearch: "study.library.search",
+  studyVoiceSessionCreate: "study.voice.session.create",
+
+  // Immutable notebook revision methods
+  notebookRevisionCreate: "notebook.revision.create",
+  notebookRevisionRead: "notebook.revision.read",
+  notebookRevisionSave: "notebook.revision.save",
+  notebookRevisionImport: "notebook.revision.import",
+  notebookRevisionExport: "notebook.revision.export",
+  notebookSessionOpen: "notebook.session.open",
+  notebookCellExecute: "notebook.cell.execute",
+  notebookExecutionInterrupt: "notebook.execution.interrupt",
+  notebookKernelRestart: "notebook.kernel.restart",
+  notebookSessionDispose: "notebook.session.dispose",
+  notebookSessionEvents: "notebook.session.events",
+  notebookAgentExecutionPermissionGet: "notebook.agentExecutionPermission.get",
+  notebookAgentExecutionPermissionSet: "notebook.agentExecutionPermission.set",
 
   // VCS methods
   vcsPull: "vcs.pull",
@@ -394,6 +446,109 @@ export const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
   success: AssetCreateUrlResult,
   error: Schema.Union([AssetAccessError, EnvironmentAuthorizationError]),
 });
+
+export const WsStudyLibraryListRpc = Rpc.make(WS_METHODS.studyLibraryList, {
+  payload: StudyLibraryListInput,
+  success: StudyLibraryListResult,
+  error: Schema.Union([StudyLibraryRequestError, EnvironmentAuthorizationError]),
+});
+
+export const WsStudyLibrarySearchRpc = Rpc.make(WS_METHODS.studyLibrarySearch, {
+  payload: StudySearchInput,
+  success: StudySearchResult,
+  error: Schema.Union([StudyLibraryRequestError, EnvironmentAuthorizationError]),
+});
+
+export const WsStudyVoiceSessionCreateRpc = Rpc.make(WS_METHODS.studyVoiceSessionCreate, {
+  payload: StudyVoiceSessionInput,
+  success: StudyVoiceSessionResult,
+  error: Schema.Union([StudyVoiceSessionError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookRevisionCreateRpc = Rpc.make(WS_METHODS.notebookRevisionCreate, {
+  payload: NotebookRevisionCreateInput,
+  success: NotebookRevision,
+  error: Schema.Union([NotebookRevisionError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookRevisionReadRpc = Rpc.make(WS_METHODS.notebookRevisionRead, {
+  payload: NotebookRevisionRef,
+  success: NotebookRevision,
+  error: Schema.Union([NotebookRevisionError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookRevisionSaveRpc = Rpc.make(WS_METHODS.notebookRevisionSave, {
+  payload: NotebookRevisionSaveInput,
+  success: NotebookRevision,
+  error: Schema.Union([NotebookRevisionError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookRevisionImportRpc = Rpc.make(WS_METHODS.notebookRevisionImport, {
+  payload: NotebookRevisionImportInput,
+  success: NotebookRevision,
+  error: Schema.Union([NotebookRevisionError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookRevisionExportRpc = Rpc.make(WS_METHODS.notebookRevisionExport, {
+  payload: NotebookRevisionRef,
+  success: NotebookRevisionExportResult,
+  error: Schema.Union([NotebookRevisionError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookSessionOpenRpc = Rpc.make(WS_METHODS.notebookSessionOpen, {
+  payload: NotebookSessionOpenInput,
+  success: NotebookExecutionEvents,
+  error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookCellExecuteRpc = Rpc.make(WS_METHODS.notebookCellExecute, {
+  payload: NotebookCellExecuteInput,
+  success: NotebookExecutionEvent,
+  error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
+export const WsNotebookExecutionInterruptRpc = Rpc.make(WS_METHODS.notebookExecutionInterrupt, {
+  payload: NotebookExecutionControlInput,
+  success: NotebookExecutionEvents,
+  error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookKernelRestartRpc = Rpc.make(WS_METHODS.notebookKernelRestart, {
+  payload: NotebookExecutionControlInput,
+  success: NotebookExecutionEvents,
+  error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookSessionDisposeRpc = Rpc.make(WS_METHODS.notebookSessionDispose, {
+  payload: NotebookExecutionControlInput,
+  success: NotebookExecutionEvents,
+  error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookSessionEventsRpc = Rpc.make(WS_METHODS.notebookSessionEvents, {
+  payload: NotebookSessionEventsInput,
+  success: NotebookExecutionReplay,
+  error: Schema.Union([NotebookRuntimeError, EnvironmentAuthorizationError]),
+});
+
+export const WsNotebookAgentExecutionPermissionGetRpc = Rpc.make(
+  WS_METHODS.notebookAgentExecutionPermissionGet,
+  {
+    payload: NotebookAgentExecutionPermissionGetInput,
+    success: NotebookAgentExecutionPermission,
+    error: EnvironmentAuthorizationError,
+  },
+);
+
+export const WsNotebookAgentExecutionPermissionSetRpc = Rpc.make(
+  WS_METHODS.notebookAgentExecutionPermissionSet,
+  {
+    payload: NotebookAgentExecutionPermissionSetInput,
+    success: NotebookAgentExecutionPermission,
+    error: EnvironmentAuthorizationError,
+  },
+);
 
 export const WsSubscribeVcsStatusRpc = Rpc.make(WS_METHODS.subscribeVcsStatus, {
   payload: VcsStatusInput,
@@ -706,6 +861,22 @@ export const WsRpcGroup = RpcGroup.make(
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsAssetsCreateUrlRpc,
+  WsStudyLibraryListRpc,
+  WsStudyLibrarySearchRpc,
+  WsStudyVoiceSessionCreateRpc,
+  WsNotebookRevisionCreateRpc,
+  WsNotebookRevisionReadRpc,
+  WsNotebookRevisionSaveRpc,
+  WsNotebookRevisionImportRpc,
+  WsNotebookRevisionExportRpc,
+  WsNotebookSessionOpenRpc,
+  WsNotebookCellExecuteRpc,
+  WsNotebookExecutionInterruptRpc,
+  WsNotebookKernelRestartRpc,
+  WsNotebookSessionDisposeRpc,
+  WsNotebookSessionEventsRpc,
+  WsNotebookAgentExecutionPermissionGetRpc,
+  WsNotebookAgentExecutionPermissionSetRpc,
   WsSubscribeVcsStatusRpc,
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,

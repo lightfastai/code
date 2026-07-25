@@ -1080,7 +1080,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             threadId: event.payload.threadId,
             turnId,
           });
-          const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
+          const acceptedTurnStart = yield* projectionTurnRepository.getAcceptedTurnStartByThreadId({
             threadId: event.payload.threadId,
           });
           if (Option.isSome(existingTurn)) {
@@ -1093,48 +1093,48 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               state: nextState,
               pendingMessageId:
                 existingTurn.value.pendingMessageId ??
-                (Option.isSome(pendingTurnStart) ? pendingTurnStart.value.messageId : null),
+                (Option.isSome(acceptedTurnStart) ? acceptedTurnStart.value.messageId : null),
               sourceProposedPlanThreadId:
                 existingTurn.value.sourceProposedPlanThreadId ??
-                (Option.isSome(pendingTurnStart)
-                  ? pendingTurnStart.value.sourceProposedPlanThreadId
+                (Option.isSome(acceptedTurnStart)
+                  ? acceptedTurnStart.value.sourceProposedPlanThreadId
                   : null),
               sourceProposedPlanId:
                 existingTurn.value.sourceProposedPlanId ??
-                (Option.isSome(pendingTurnStart)
-                  ? pendingTurnStart.value.sourceProposedPlanId
+                (Option.isSome(acceptedTurnStart)
+                  ? acceptedTurnStart.value.sourceProposedPlanId
                   : null),
               startedAt:
                 existingTurn.value.startedAt ??
-                (Option.isSome(pendingTurnStart)
-                  ? pendingTurnStart.value.requestedAt
+                (Option.isSome(acceptedTurnStart)
+                  ? acceptedTurnStart.value.requestedAt
                   : event.occurredAt),
               requestedAt:
                 existingTurn.value.requestedAt ??
-                (Option.isSome(pendingTurnStart)
-                  ? pendingTurnStart.value.requestedAt
+                (Option.isSome(acceptedTurnStart)
+                  ? acceptedTurnStart.value.requestedAt
                   : event.occurredAt),
             });
           } else {
             yield* projectionTurnRepository.upsertByTurnId({
               turnId,
               threadId: event.payload.threadId,
-              pendingMessageId: Option.isSome(pendingTurnStart)
-                ? pendingTurnStart.value.messageId
+              pendingMessageId: Option.isSome(acceptedTurnStart)
+                ? acceptedTurnStart.value.messageId
                 : null,
-              sourceProposedPlanThreadId: Option.isSome(pendingTurnStart)
-                ? pendingTurnStart.value.sourceProposedPlanThreadId
+              sourceProposedPlanThreadId: Option.isSome(acceptedTurnStart)
+                ? acceptedTurnStart.value.sourceProposedPlanThreadId
                 : null,
-              sourceProposedPlanId: Option.isSome(pendingTurnStart)
-                ? pendingTurnStart.value.sourceProposedPlanId
+              sourceProposedPlanId: Option.isSome(acceptedTurnStart)
+                ? acceptedTurnStart.value.sourceProposedPlanId
                 : null,
               assistantMessageId: null,
               state: "running",
-              requestedAt: Option.isSome(pendingTurnStart)
-                ? pendingTurnStart.value.requestedAt
+              requestedAt: Option.isSome(acceptedTurnStart)
+                ? acceptedTurnStart.value.requestedAt
                 : event.occurredAt,
-              startedAt: Option.isSome(pendingTurnStart)
-                ? pendingTurnStart.value.requestedAt
+              startedAt: Option.isSome(acceptedTurnStart)
+                ? acceptedTurnStart.value.requestedAt
                 : event.occurredAt,
               completedAt: null,
               checkpointTurnCount: null,
@@ -1144,9 +1144,6 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             });
           }
 
-          yield* projectionTurnRepository.deletePendingTurnStartByThreadId({
-            threadId: event.payload.threadId,
-          });
           return;
         }
 

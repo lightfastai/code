@@ -38,6 +38,8 @@ import {
   type ProviderRuntimeIngestionShape,
 } from "../Services/ProviderRuntimeIngestion.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import { completeTurnStartAdmissionPhase } from "../TurnStartAdmission.ts";
 
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 
@@ -1127,51 +1129,6 @@ const make = Effect.gen(function* () {
       ).pipe(Effect.asVoid);
     });
 
-  const getSourceProposedPlanReferenceForPendingTurnStart = Effect.fn(
-    "getSourceProposedPlanReferenceForPendingTurnStart",
-  )(function* (threadId: ThreadId) {
-    const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
-      threadId,
-    });
-    if (Option.isNone(pendingTurnStart)) {
-      return null;
-    }
-
-    const sourceThreadId = pendingTurnStart.value.sourceProposedPlanThreadId;
-    const sourcePlanId = pendingTurnStart.value.sourceProposedPlanId;
-    if (sourceThreadId === null || sourcePlanId === null) {
-      return null;
-    }
-
-    return {
-      sourceThreadId,
-      sourcePlanId,
-    } as const;
-  });
-
-  const getExpectedProviderTurnIdForThread = Effect.fn("getExpectedProviderTurnIdForThread")(
-    function* (threadId: ThreadId) {
-      const sessions = yield* providerService.listSessions();
-      const session = sessions.find((entry) => entry.threadId === threadId);
-      return session?.activeTurnId;
-    },
-  );
-
-  const getSourceProposedPlanReferenceForAcceptedTurnStart = Effect.fn(
-    "getSourceProposedPlanReferenceForAcceptedTurnStart",
-  )(function* (threadId: ThreadId, eventTurnId: TurnId | undefined) {
-    if (eventTurnId === undefined) {
-      return null;
-    }
-
-    const expectedTurnId = yield* getExpectedProviderTurnIdForThread(threadId);
-    if (!sameId(expectedTurnId, eventTurnId)) {
-      return null;
-    }
-
-    return yield* getSourceProposedPlanReferenceForPendingTurnStart(threadId);
-  });
-
   const markSourceProposedPlanImplemented = Effect.fn("markSourceProposedPlanImplemented")(
     function* (
       sourceThreadId: ThreadId,
@@ -1220,6 +1177,53 @@ const make = Effect.gen(function* () {
 
       const now = event.createdAt;
       const eventTurnId = toTurnId(event.turnId);
+      const acceptedTurnStartForEvent =
+        event.type === "turn.started" && eventTurnId !== undefined
+          ? yield* projectionTurnRepository.getAcceptedTurnStartByThreadId({
+              threadId: thread.id,
+            })
+          : Option.none();
+      const acceptedGenerationMatches =
+        Option.isSome(acceptedTurnStartForEvent) &&
+        acceptedTurnStartForEvent.value.providerTurnId !== null &&
+        sameId(acceptedTurnStartForEvent.value.providerTurnId, eventTurnId);
+      const cancelledTurnStart =
+        event.type === "turn.started" && eventTurnId !== undefined
+          ? yield* projectionTurnRepository.getCancelledTurnStartByProviderTurn({
+              threadId: thread.id,
+              providerTurnId: eventTurnId,
+            })
+          : Option.none();
+      if (Option.isSome(cancelledTurnStart)) {
+        const cancelledKey = {
+          threadId: thread.id,
+          messageId: cancelledTurnStart.value.messageId,
+        } as const;
+        yield* projectionTurnRepository.deleteAcceptedTurnStart(cancelledKey).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("cancelled provider turn accepted cleanup deferred", {
+              ...cancelledKey,
+              providerTurnId: eventTurnId,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        );
+        yield* projectionTurnRepository.deletePendingTurnStart(cancelledKey).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("cancelled provider turn pending cleanup deferred", {
+              ...cancelledKey,
+              providerTurnId: eventTurnId,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        );
+        yield* McpSessionRegistry.rollbackActiveNotebookDocumentAuthorityTurn(cancelledKey);
+        yield* Effect.logWarning("provider runtime ingestion ignored cancelled turn start", {
+          ...cancelledKey,
+          providerTurnId: eventTurnId,
+        });
+        return;
+      }
       const activeTurnId = thread.session?.activeTurnId ?? null;
 
       const conflictsWithActiveTurn =
@@ -1232,14 +1236,9 @@ const make = Effect.gen(function* () {
       // steering a running turn makes some providers (e.g. opencode) open a
       // new turn without ever completing the superseded one. A stale
       // turn.started for some other turn id still gets rejected.
-      const conflictingTurnStartIsPendingTurnStart =
+      const conflictingTurnStartIsAcceptedTurnStart =
         event.type === "turn.started" && conflictsWithActiveTurn
-          ? sameId(yield* getExpectedProviderTurnIdForThread(thread.id), eventTurnId) &&
-            Option.isSome(
-              yield* projectionTurnRepository.getPendingTurnStartByThreadId({
-                threadId: thread.id,
-              }),
-            )
+          ? acceptedGenerationMatches
           : false;
 
       const shouldApplyThreadLifecycle = (() => {
@@ -1253,7 +1252,10 @@ const make = Effect.gen(function* () {
           case "thread.started":
             return true;
           case "turn.started":
-            return !conflictsWithActiveTurn || conflictingTurnStartIsPendingTurnStart;
+            return (
+              (!conflictsWithActiveTurn || conflictingTurnStartIsAcceptedTurnStart) &&
+              (Option.isNone(acceptedTurnStartForEvent) || acceptedGenerationMatches)
+            );
           case "turn.completed":
             if (conflictsWithActiveTurn || missingTurnForActiveTurn) {
               return false;
@@ -1268,10 +1270,19 @@ const make = Effect.gen(function* () {
             return true;
         }
       })();
-      const acceptedTurnStartedSourcePlan =
-        event.type === "turn.started" && shouldApplyThreadLifecycle
-          ? yield* getSourceProposedPlanReferenceForAcceptedTurnStart(thread.id, eventTurnId)
-          : null;
+      const acceptedTurnStart =
+        event.type === "turn.started" && shouldApplyThreadLifecycle && acceptedGenerationMatches
+          ? acceptedTurnStartForEvent
+          : Option.none();
+      const acceptedTurnStartedSourcePlan = Option.isSome(acceptedTurnStart)
+        ? acceptedTurnStart.value.sourceProposedPlanThreadId !== null &&
+          acceptedTurnStart.value.sourceProposedPlanId !== null
+          ? {
+              sourceThreadId: acceptedTurnStart.value.sourceProposedPlanThreadId,
+              sourcePlanId: acceptedTurnStart.value.sourceProposedPlanId,
+            }
+          : null
+        : null;
 
       if (
         event.type === "session.started" ||
@@ -1317,6 +1328,24 @@ const make = Effect.gen(function* () {
                 : (thread.session?.lastError ?? null);
 
         if (shouldApplyThreadLifecycle) {
+          if (event.type === "turn.started" && Option.isSome(acceptedTurnStart)) {
+            const admittedAuthority =
+              yield* McpSessionRegistry.admitActiveNotebookDocumentAuthorityTurn({
+                threadId: thread.id,
+                messageId: acceptedTurnStart.value.messageId,
+              });
+            if (!admittedAuthority) {
+              yield* Effect.logError(
+                "provider runtime ingestion rejected mismatched turn authority admission",
+                {
+                  threadId: thread.id,
+                  turnId: eventTurnId,
+                  acceptedMessageId: acceptedTurnStart.value.messageId,
+                },
+              );
+              return;
+            }
+          }
           if (event.type === "turn.started" && acceptedTurnStartedSourcePlan !== null) {
             yield* markSourceProposedPlanImplemented(
               acceptedTurnStartedSourcePlan.sourceThreadId,
@@ -1355,6 +1384,22 @@ const make = Effect.gen(function* () {
             },
             createdAt: now,
           });
+          if (event.type === "turn.started" && Option.isSome(acceptedTurnStart)) {
+            yield* completeTurnStartAdmissionPhase(projectionTurnRepository, {
+              threadId: thread.id,
+              messageId: acceptedTurnStart.value.messageId,
+              phase: "runtime-admitted",
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("runtime turn-start admission phase persistence deferred", {
+                  threadId: thread.id,
+                  turnId: eventTurnId,
+                  messageId: acceptedTurnStart.value.messageId,
+                  cause: Cause.pretty(cause),
+                }),
+              ),
+            );
+          }
         }
       }
 

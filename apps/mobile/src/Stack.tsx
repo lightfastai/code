@@ -25,6 +25,7 @@ import { HardwareKeyboardCommandProvider } from "./features/keyboard/HardwareKey
 import { ReviewCommentComposerSheet } from "./features/review/ReviewCommentComposerSheet";
 import { ReviewSheet } from "./features/review/ReviewSheet";
 import { ThreadTerminalRouteScreen } from "./features/terminal/ThreadTerminalRouteScreen";
+import { StudyCanvasRouteScreen } from "./features/study-canvas/StudyCanvasRouteScreen";
 import { GitBranchesSheet } from "./features/threads/git/GitBranchesSheet";
 import { GitCommitSheet } from "./features/threads/git/GitCommitSheet";
 import { GitConfirmSheet } from "./features/threads/git/GitConfirmSheet";
@@ -254,6 +255,7 @@ const WORKSPACE_OVERLAY_ROUTES = new Set([
   "NewTaskSheet",
   "SettingsLegal",
   "SettingsSheet",
+  "StudyCanvas",
   "ThreadReviewComment",
 ]);
 
@@ -358,6 +360,16 @@ export const RootStack = createNativeStackNavigator({
       screen: ThreadRouteScreen,
       linking: THREAD_LINKING_PREFIX,
       options: GLASS_HEADER_OPTIONS,
+    }),
+    StudyCanvas: createNativeStackScreen({
+      screen: StudyCanvasRouteScreen,
+      linking: "study/canvas/:environmentId/:threadId/:canvasId",
+      options: {
+        ...SOLID_HEADER_OPTIONS,
+        gestureEnabled: true,
+        presentation: "fullScreenModal",
+        title: "Study Canvas",
+      },
     }),
     ThreadTerminal: createNativeStackScreen({
       screen: ThreadTerminalRouteScreen,

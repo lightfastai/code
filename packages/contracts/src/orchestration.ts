@@ -21,6 +21,8 @@ import {
   TurnId,
 } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import { ChatArtifactAttachment } from "./artifacts.ts";
+import { SelectedStudyDocumentIds } from "./study.ts";
 
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
@@ -173,7 +175,7 @@ const UploadChatImageAttachment = Schema.Struct({
 });
 export type UploadChatImageAttachment = typeof UploadChatImageAttachment.Type;
 
-export const ChatAttachment = Schema.Union([ChatImageAttachment]);
+export const ChatAttachment = Schema.Union([ChatImageAttachment, ChatArtifactAttachment]);
 export type ChatAttachment = typeof ChatAttachment.Type;
 const UploadChatAttachment = Schema.Union([UploadChatImageAttachment]);
 export type UploadChatAttachment = typeof UploadChatAttachment.Type;
@@ -606,9 +608,12 @@ export const ThreadTurnStartCommand = Schema.Struct({
     messageId: MessageId,
     role: Schema.Literal("user"),
     text: Schema.String,
-    attachments: Schema.Array(ChatAttachment),
+    attachments: Schema.Array(ChatImageAttachment),
   }),
   modelSelection: Schema.optional(ModelSelection),
+  documentIds: Schema.optional(SelectedStudyDocumentIds).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   titleSeed: Schema.optional(TrimmedNonEmptyString),
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
   interactionMode: ProviderInteractionMode.pipe(
@@ -630,6 +635,9 @@ const ClientThreadTurnStartCommand = Schema.Struct({
     attachments: Schema.Array(UploadChatAttachment),
   }),
   modelSelection: Schema.optional(ModelSelection),
+  documentIds: Schema.optional(SelectedStudyDocumentIds).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   titleSeed: Schema.optional(TrimmedNonEmptyString),
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
@@ -747,6 +755,15 @@ const ThreadMessageAssistantCompleteCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+const ThreadMessageArtifactPublishCommand = Schema.Struct({
+  type: Schema.Literal("thread.message.artifact.publish"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  messageId: MessageId,
+  artifact: ChatArtifactAttachment,
+  createdAt: IsoDateTime,
+});
+
 const ThreadProposedPlanUpsertCommand = Schema.Struct({
   type: Schema.Literal("thread.proposed-plan.upsert"),
   commandId: CommandId,
@@ -789,6 +806,7 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadSessionSetCommand,
   ThreadMessageAssistantDeltaCommand,
   ThreadMessageAssistantCompleteCommand,
+  ThreadMessageArtifactPublishCommand,
   ThreadProposedPlanUpsertCommand,
   ThreadTurnDiffCompleteCommand,
   ThreadActivityAppendCommand,
@@ -928,6 +946,9 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,
   modelSelection: Schema.optional(ModelSelection),
+  documentIds: Schema.optional(SelectedStudyDocumentIds).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   titleSeed: Schema.optional(TrimmedNonEmptyString),
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
   interactionMode: ProviderInteractionMode.pipe(

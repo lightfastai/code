@@ -26,9 +26,17 @@ squashfs-root/
 .vercel
 .gstack/
 dist-electron/
+dist/
 .electron-runtime/
 node_modules/
 .alchemy/
 *.log
 .env*
 !.env.example
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/

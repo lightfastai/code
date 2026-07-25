@@ -313,7 +313,10 @@ function deriveTurnFolds(input: {
     }
     const hiddenEntryIds = new Set<string>();
     for (const entry of group.entries) {
-      if (entry.id !== group.terminalEntry?.id) {
+      const carriesArtifact =
+        entry.kind === "message" &&
+        entry.message.attachments?.some((attachment) => attachment.type === "artifact") === true;
+      if (entry.id !== group.terminalEntry?.id && !carriesArtifact) {
         hiddenEntryIds.add(entry.id);
       }
     }

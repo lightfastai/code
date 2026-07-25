@@ -10,14 +10,21 @@ import * as Struct from "effect/Struct";
 import { toPersistenceDecodeError, toPersistenceSqlError } from "../Errors.ts";
 import {
   ClearCheckpointTurnConflictInput,
+  CompleteProjectionAcceptedTurnStartPhaseInput,
   DeleteProjectionTurnsByThreadInput,
+  GetProjectionCancelledTurnStartInput,
   GetProjectionPendingTurnStartInput,
   GetProjectionTurnByTurnIdInput,
   ListProjectionTurnsByThreadInput,
+  ProjectionAcceptedTurnStart,
+  ProjectionAcceptedTurnStartCorrelation,
+  ProjectionAcceptedTurnStartState,
+  ProjectionCancelledTurnStart,
   ProjectionPendingTurnStart,
   ProjectionTurn,
   ProjectionTurnById,
   ProjectionTurnRepository,
+  ProjectionTurnStartKey,
   type ProjectionTurnRepositoryShape,
 } from "../Services/ProjectionTurns.ts";
 
@@ -32,6 +39,21 @@ const ProjectionTurnByIdDbRowSchema = ProjectionTurnById.mapFields(
     checkpointFiles: Schema.fromJsonString(Schema.Array(OrchestrationCheckpointFile)),
   }),
 );
+
+const ProjectionAcceptedTurnStartDbRowSchema = ProjectionAcceptedTurnStartState.mapFields(
+  Struct.assign({
+    providerSendCompleted: Schema.Int,
+    runtimeAdmitted: Schema.Int,
+  }),
+);
+
+const decodeAcceptedTurnStart = (
+  row: typeof ProjectionAcceptedTurnStartDbRowSchema.Type,
+): ProjectionAcceptedTurnStartState => ({
+  ...row,
+  providerSendCompleted: row.providerSendCompleted === 1,
+  runtimeAdmitted: row.runtimeAdmitted === 1,
+});
 
 function toPersistenceSqlOrDecodeError(sqlOperation: string, decodeOperation: string) {
   return (cause: unknown) =>
@@ -169,6 +191,181 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
       `,
   });
 
+  const insertAcceptedProjectionTurnStart = SqlSchema.void({
+    Request: ProjectionAcceptedTurnStart,
+    execute: (row) =>
+      sql`
+        INSERT INTO projection_turn_start_admissions (
+          thread_id,
+          message_id,
+          source_proposed_plan_thread_id,
+          source_proposed_plan_id,
+          requested_at
+        )
+        VALUES (
+          ${row.threadId},
+          ${row.messageId},
+          ${row.sourceProposedPlanThreadId},
+          ${row.sourceProposedPlanId},
+          ${row.requestedAt}
+        )
+        ON CONFLICT (thread_id) DO NOTHING
+      `,
+  });
+
+  const getAcceptedProjectionTurnStart = SqlSchema.findOneOption({
+    Request: GetProjectionPendingTurnStartInput,
+    Result: ProjectionAcceptedTurnStartDbRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT
+          thread_id AS "threadId",
+          message_id AS "messageId",
+          provider_turn_id AS "providerTurnId",
+          source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
+          source_proposed_plan_id AS "sourceProposedPlanId",
+          requested_at AS "requestedAt",
+          provider_send_completed AS "providerSendCompleted",
+          runtime_admitted AS "runtimeAdmitted"
+        FROM projection_turn_start_admissions
+        WHERE thread_id = ${threadId}
+        LIMIT 1
+      `,
+  });
+
+  const correlateAcceptedProjectionTurnStart = SqlSchema.findOneOption({
+    Request: ProjectionAcceptedTurnStartCorrelation,
+    Result: ProjectionTurnStartKey,
+    execute: ({ threadId, messageId, providerTurnId }) =>
+      sql`
+        UPDATE projection_turn_start_admissions
+        SET provider_turn_id = ${providerTurnId}
+        WHERE thread_id = ${threadId}
+          AND message_id = ${messageId}
+          AND (provider_turn_id IS NULL OR provider_turn_id = ${providerTurnId})
+        RETURNING
+          thread_id AS "threadId",
+          message_id AS "messageId"
+      `,
+  });
+
+  const completeAcceptedProjectionTurnStartPhase = SqlSchema.findOneOption({
+    Request: CompleteProjectionAcceptedTurnStartPhaseInput,
+    Result: ProjectionAcceptedTurnStartDbRowSchema,
+    execute: ({ threadId, messageId, phase }) =>
+      sql`
+        UPDATE projection_turn_start_admissions
+        SET
+          provider_send_completed = CASE
+            WHEN ${phase} = 'provider-send-completed' THEN 1
+            ELSE provider_send_completed
+          END,
+          runtime_admitted = CASE
+            WHEN ${phase} = 'runtime-admitted' THEN 1
+            ELSE runtime_admitted
+          END
+        WHERE thread_id = ${threadId}
+          AND message_id = ${messageId}
+        RETURNING
+          thread_id AS "threadId",
+          message_id AS "messageId",
+          provider_turn_id AS "providerTurnId",
+          source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
+          source_proposed_plan_id AS "sourceProposedPlanId",
+          requested_at AS "requestedAt",
+          provider_send_completed AS "providerSendCompleted",
+          runtime_admitted AS "runtimeAdmitted"
+      `,
+  });
+
+  const deleteAcceptedProjectionTurnStart = SqlSchema.findOneOption({
+    Request: ProjectionTurnStartKey,
+    Result: ProjectionTurnStartKey,
+    execute: ({ threadId, messageId }) =>
+      sql`
+        DELETE FROM projection_turn_start_admissions
+        WHERE thread_id = ${threadId}
+          AND message_id = ${messageId}
+        RETURNING
+          thread_id AS "threadId",
+          message_id AS "messageId"
+      `,
+  });
+
+  const upsertCancelledProjectionTurnStart = SqlSchema.findOneOption({
+    Request: ProjectionCancelledTurnStart,
+    Result: ProjectionCancelledTurnStart,
+    execute: ({ threadId, messageId, providerTurnId, cancelledAt }) =>
+      sql`
+        INSERT INTO projection_turn_start_cancellations (
+          thread_id,
+          message_id,
+          provider_turn_id,
+          cancelled_at
+        )
+        SELECT
+          ${threadId},
+          ${messageId},
+          ${providerTurnId},
+          ${cancelledAt}
+        WHERE EXISTS (
+          SELECT 1
+          FROM projection_turn_start_admissions
+          WHERE thread_id = ${threadId}
+            AND message_id = ${messageId}
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM projection_turn_start_cancellations
+          WHERE thread_id = ${threadId}
+            AND provider_turn_id = ${providerTurnId}
+            AND message_id = ${messageId}
+        )
+        ON CONFLICT (thread_id, provider_turn_id) DO UPDATE SET
+          cancelled_at = excluded.cancelled_at
+        WHERE projection_turn_start_cancellations.message_id = excluded.message_id
+        RETURNING
+          thread_id AS "threadId",
+          message_id AS "messageId",
+          provider_turn_id AS "providerTurnId",
+          cancelled_at AS "cancelledAt"
+      `,
+  });
+
+  const getCancelledProjectionTurnStart = SqlSchema.findOneOption({
+    Request: GetProjectionCancelledTurnStartInput,
+    Result: ProjectionCancelledTurnStart,
+    execute: ({ threadId, providerTurnId }) =>
+      sql`
+        SELECT
+          thread_id AS "threadId",
+          message_id AS "messageId",
+          provider_turn_id AS "providerTurnId",
+          cancelled_at AS "cancelledAt"
+        FROM projection_turn_start_cancellations
+        WHERE thread_id = ${threadId}
+          AND provider_turn_id = ${providerTurnId}
+        LIMIT 1
+      `,
+  });
+
+  const deletePendingProjectionTurnStart = SqlSchema.findOneOption({
+    Request: ProjectionTurnStartKey,
+    Result: ProjectionTurnStartKey,
+    execute: ({ threadId, messageId }) =>
+      sql`
+        DELETE FROM projection_turns
+        WHERE thread_id = ${threadId}
+          AND turn_id IS NULL
+          AND state = 'pending'
+          AND pending_message_id = ${messageId}
+          AND checkpoint_turn_count IS NULL
+        RETURNING
+          thread_id AS "threadId",
+          pending_message_id AS "messageId"
+      `,
+  });
+
   const listProjectionTurnsByThread = SqlSchema.findAll({
     Request: ListProjectionTurnsByThreadInput,
     Result: ProjectionTurnDbRowSchema,
@@ -254,6 +451,24 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
       `,
   });
 
+  const deleteAcceptedProjectionTurnStartsByThread = SqlSchema.void({
+    Request: DeleteProjectionTurnsByThreadInput,
+    execute: ({ threadId }) =>
+      sql`
+        DELETE FROM projection_turn_start_admissions
+        WHERE thread_id = ${threadId}
+      `,
+  });
+
+  const deleteCancelledProjectionTurnStartsByThread = SqlSchema.void({
+    Request: DeleteProjectionTurnsByThreadInput,
+    execute: ({ threadId }) =>
+      sql`
+        DELETE FROM projection_turn_start_cancellations
+        WHERE thread_id = ${threadId}
+      `,
+  });
+
   const upsertByTurnId: ProjectionTurnRepositoryShape["upsertByTurnId"] = (row) =>
     upsertProjectionTurnById(row).pipe(
       Effect.mapError(
@@ -287,6 +502,146 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           toPersistenceSqlError("ProjectionTurnRepository.getPendingTurnStartByThreadId:query"),
         ),
       );
+
+  const stageAcceptedTurnStart: ProjectionTurnRepositoryShape["stageAcceptedTurnStart"] = (row) =>
+    sql
+      .withTransaction(
+        insertAcceptedProjectionTurnStart(row).pipe(
+          Effect.andThen(getAcceptedProjectionTurnStart({ threadId: row.threadId })),
+          Effect.map(
+            Option.match({
+              onNone: () => false,
+              onSome: (accepted) => accepted.messageId === row.messageId,
+            }),
+          ),
+        ),
+      )
+      .pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionTurnRepository.stageAcceptedTurnStart:query",
+            "ProjectionTurnRepository.stageAcceptedTurnStart:encodeRequest",
+          ),
+        ),
+      );
+
+  const getAcceptedTurnStartByThreadId: ProjectionTurnRepositoryShape["getAcceptedTurnStartByThreadId"] =
+    (input) =>
+      getAcceptedProjectionTurnStart(input).pipe(
+        Effect.map(Option.map(decodeAcceptedTurnStart)),
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionTurnRepository.getAcceptedTurnStartByThreadId:query",
+            "ProjectionTurnRepository.getAcceptedTurnStartByThreadId:decodeRow",
+          ),
+        ),
+      );
+
+  const correlateAcceptedTurnStart: ProjectionTurnRepositoryShape["correlateAcceptedTurnStart"] = (
+    input,
+  ) =>
+    correlateAcceptedProjectionTurnStart(input).pipe(
+      Effect.map(Option.isSome),
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionTurnRepository.correlateAcceptedTurnStart:query",
+          "ProjectionTurnRepository.correlateAcceptedTurnStart:decodeRow",
+        ),
+      ),
+    );
+
+  const completeAcceptedTurnStartPhase: ProjectionTurnRepositoryShape["completeAcceptedTurnStartPhase"] =
+    (input) =>
+      sql
+        .withTransaction(
+          completeAcceptedProjectionTurnStartPhase(input).pipe(
+            Effect.flatMap(
+              Option.match({
+                onNone: () => Effect.succeed(Option.none()),
+                onSome: (dbRow) => {
+                  const accepted = decodeAcceptedTurnStart(dbRow);
+                  if (!accepted.providerSendCompleted || !accepted.runtimeAdmitted) {
+                    return Effect.succeed(Option.some({ ...accepted, finalized: false }));
+                  }
+                  return deleteAcceptedProjectionTurnStart(input).pipe(
+                    Effect.map(
+                      Option.match({
+                        onNone: () => Option.none(),
+                        onSome: () => Option.some({ ...accepted, finalized: true }),
+                      }),
+                    ),
+                  );
+                },
+              }),
+            ),
+          ),
+        )
+        .pipe(
+          Effect.mapError(
+            toPersistenceSqlOrDecodeError(
+              "ProjectionTurnRepository.completeAcceptedTurnStartPhase:query",
+              "ProjectionTurnRepository.completeAcceptedTurnStartPhase:decodeRow",
+            ),
+          ),
+        );
+
+  const deleteAcceptedTurnStart: ProjectionTurnRepositoryShape["deleteAcceptedTurnStart"] = (
+    input,
+  ) =>
+    deleteAcceptedProjectionTurnStart(input).pipe(
+      Effect.map(Option.isSome),
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionTurnRepository.deleteAcceptedTurnStart:query",
+          "ProjectionTurnRepository.deleteAcceptedTurnStart:decodeRow",
+        ),
+      ),
+    );
+
+  const cancelAcceptedTurnStart: ProjectionTurnRepositoryShape["cancelAcceptedTurnStart"] = (
+    input,
+  ) =>
+    sql
+      .withTransaction(
+        upsertCancelledProjectionTurnStart(input).pipe(
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Effect.succeed(false),
+              onSome: () => deleteAcceptedProjectionTurnStart(input).pipe(Effect.as(true)),
+            }),
+          ),
+        ),
+      )
+      .pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionTurnRepository.cancelAcceptedTurnStart:query",
+            "ProjectionTurnRepository.cancelAcceptedTurnStart:decodeRow",
+          ),
+        ),
+      );
+
+  const getCancelledTurnStartByProviderTurn: ProjectionTurnRepositoryShape["getCancelledTurnStartByProviderTurn"] =
+    (input) =>
+      getCancelledProjectionTurnStart(input).pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionTurnRepository.getCancelledTurnStartByProviderTurn:query",
+            "ProjectionTurnRepository.getCancelledTurnStartByProviderTurn:decodeRow",
+          ),
+        ),
+      );
+
+  const deletePendingTurnStart: ProjectionTurnRepositoryShape["deletePendingTurnStart"] = (input) =>
+    deletePendingProjectionTurnStart(input).pipe(
+      Effect.map(Option.isSome),
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionTurnRepository.deletePendingTurnStart:query",
+          "ProjectionTurnRepository.deletePendingTurnStart:decodeRow",
+        ),
+      ),
+    );
 
   const deletePendingTurnStartByThreadId: ProjectionTurnRepositoryShape["deletePendingTurnStartByThreadId"] =
     (input) =>
@@ -333,14 +688,29 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
       );
 
   const deleteByThreadId: ProjectionTurnRepositoryShape["deleteByThreadId"] = (input) =>
-    deleteProjectionTurnsByThread(input).pipe(
-      Effect.mapError(toPersistenceSqlError("ProjectionTurnRepository.deleteByThreadId:query")),
-    );
+    sql
+      .withTransaction(
+        deleteProjectionTurnsByThread(input).pipe(
+          Effect.andThen(deleteAcceptedProjectionTurnStartsByThread(input)),
+          Effect.andThen(deleteCancelledProjectionTurnStartsByThread(input)),
+        ),
+      )
+      .pipe(
+        Effect.mapError(toPersistenceSqlError("ProjectionTurnRepository.deleteByThreadId:query")),
+      );
 
   return {
     upsertByTurnId,
     replacePendingTurnStart,
     getPendingTurnStartByThreadId,
+    stageAcceptedTurnStart,
+    getAcceptedTurnStartByThreadId,
+    correlateAcceptedTurnStart,
+    completeAcceptedTurnStartPhase,
+    cancelAcceptedTurnStart,
+    getCancelledTurnStartByProviderTurn,
+    deleteAcceptedTurnStart,
+    deletePendingTurnStart,
     deletePendingTurnStartByThreadId,
     listByThreadId,
     getByTurnId,

@@ -908,7 +908,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         }).pipe(Effect.scoped),
       );
 
-    const sendTurn: GrokAdapterShape["sendTurn"] = (input) =>
+    const sendTurn: GrokAdapterShape["sendTurn"] = (input, onAccepted) =>
       Effect.gen(function* () {
         const prepared = yield* withThreadLock(
           input.threadId,
@@ -1026,6 +1026,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 ...(displayModel ? { model: displayModel } : {}),
               };
 
+              if (onAccepted !== undefined) {
+                yield* onAccepted({ threadId: input.threadId, turnId });
+              }
               if (steeringTurnId === undefined) {
                 yield* offerRuntimeEvent({
                   type: "turn.started",

@@ -1,0 +1,38 @@
+{
+  "name": "@t3tools/lightfast-artifact-3d",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./contracts": {
+      "types": "./src/contracts.ts",
+      "import": "./src/contracts.ts"
+    },
+    "./mobile": {
+      "types": "./src/mobile.ts",
+      "import": "./src/mobile.ts"
+    },
+    "./server": {
+      "types": "./src/server.ts",
+      "import": "./src/server.ts"
+    },
+    "./web": {
+      "types": "./src/web.tsx",
+      "import": "./src/web.tsx"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsgo --noEmit"
+  },
+  "dependencies": {
+    "@t3tools/lightfast-capability-core": "workspace:*",
+    "effect": "catalog:",
+    "lucide-react": "^0.564.0",
+    "react": "19.2.6",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.14",
+    "@types/three": "0.185.1",
+    "vite-plus": "catalog:"
+  }
+}

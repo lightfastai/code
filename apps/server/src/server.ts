@@ -82,6 +82,8 @@ import * as CloudCliState from "./cloud/CliState.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
+import * as NotebookRevisionStore from "./notebook/NotebookRevisionStore.ts";
+import * as NotebookRuntimeManager from "./notebook/NotebookRuntimeManager.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import {
   clearPersistedServerRuntimeState,
@@ -182,6 +184,10 @@ const ProviderLayerLive = ProviderServiceLive.pipe(
 );
 
 const PersistenceLayerLive = Layer.empty.pipe(Layer.provideMerge(SqlitePersistenceLayerLive));
+
+const NotebookRevisionStoreLayerLive = NotebookRevisionStore.layer.pipe(
+  Layer.provide(SqlitePersistenceLayerLive),
+);
 
 const VcsDriverRegistryLayerLive = VcsDriverRegistry.layer.pipe(
   Layer.provide(VcsProjectConfig.layer),
@@ -358,7 +364,12 @@ export const makeRoutesLayer = Layer.mergeAll(
     websocketRpcRouteLayer,
   ),
   McpHttpServer.layer.pipe(Layer.provide(McpSessionRegistry.layer)),
-).pipe(Layer.provide(PreviewAutomationBroker.layer), Layer.provide(browserApiCorsLayer));
+).pipe(
+  Layer.provide(NotebookRevisionStoreLayerLive),
+  Layer.provide(NotebookRuntimeManager.layer),
+  Layer.provide(PreviewAutomationBroker.layer),
+  Layer.provide(browserApiCorsLayer),
+);
 
 export const makeServerLayer = Layer.unwrap(
   Effect.gen(function* () {

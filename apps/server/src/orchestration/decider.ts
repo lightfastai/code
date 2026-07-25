@@ -7,6 +7,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import { normalizeStudyDocumentIds } from "@t3tools/shared/studyContext";
 import type * as PlatformError from "effect/PlatformError";
 
 import { OrchestrationCommandInvariantError } from "./Errors.ts";
@@ -457,6 +458,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           ...(command.modelSelection !== undefined
             ? { modelSelection: command.modelSelection }
             : {}),
+          documentIds: normalizeStudyDocumentIds(command.documentIds ?? []),
           ...(command.titleSeed !== undefined ? { titleSeed: command.titleSeed } : {}),
           runtimeMode: targetThread.runtimeMode,
           interactionMode: targetThread.interactionMode,
@@ -655,6 +657,47 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           turnId: command.turnId ?? null,
           streaming: false,
           createdAt: command.createdAt,
+          updatedAt: command.createdAt,
+        },
+      };
+    }
+
+    case "thread.message.artifact.publish": {
+      const thread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      const existingMessage = thread.messages.find((message) => message.id === command.messageId);
+      if (existingMessage && existingMessage.role !== "assistant") {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Artifact message '${command.messageId}' already exists with role '${existingMessage.role}'.`,
+        });
+      }
+      const attachments = [
+        ...(existingMessage?.attachments ?? []).filter(
+          (attachment) => attachment.id !== command.artifact.id,
+        ),
+        command.artifact,
+      ];
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.message-sent",
+        payload: {
+          threadId: command.threadId,
+          messageId: command.messageId,
+          role: "assistant",
+          text: "",
+          attachments,
+          turnId: existingMessage?.turnId ?? thread.latestTurn?.turnId ?? null,
+          streaming: false,
+          createdAt: existingMessage?.createdAt ?? command.createdAt,
           updatedAt: command.createdAt,
         },
       };

@@ -9,6 +9,7 @@ import type {
   RuntimeMode,
   ScopedThreadRef,
   ServerProvider,
+  StudyDocument,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -61,6 +62,9 @@ import { useComposerPathSearch } from "../../lib/composerPathSearchState";
 import { type ElementContextDraft } from "../../lib/elementContext";
 import { ComposerPendingElementContexts } from "./ComposerPendingElementContexts";
 import { ComposerPendingReviewComments } from "./ComposerPendingReviewComments";
+import { ComposerStudyDocumentChips } from "./ComposerStudyDocumentChips";
+import { ComposerStudyLibraryPicker } from "./ComposerStudyLibrary";
+import { ComposerVoiceControl } from "./ComposerVoiceControl";
 import { ComposerPreviewAnnotationCards } from "./ComposerPreviewAnnotationCards";
 import {
   shouldUseCompactComposerPrimaryActions,
@@ -415,6 +419,7 @@ export interface ChatComposerHandle {
     elementContexts: ElementContextDraft[];
     previewAnnotations: PreviewAnnotationPayload[];
     reviewComments: ReviewCommentContext[];
+    studyDocuments: StudyDocument[];
     selectedPromptEffort: string | null;
     selectedModelOptionsForDispatch: unknown;
     selectedModelSelection: ModelSelection;
@@ -619,6 +624,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const composerElementContexts = composerDraft.elementContexts;
   const composerPreviewAnnotations = composerDraft.previewAnnotations;
   const composerReviewComments = composerDraft.reviewComments;
+  const composerStudyDocuments = composerDraft.studyDocuments;
   const nonPersistedComposerImageIds = composerDraft.nonPersistedImageIds;
 
   const setComposerDraftPrompt = useComposerDraftStore((store) => store.setPrompt);
@@ -642,6 +648,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   );
   const removeComposerDraftReviewComment = useComposerDraftStore(
     (store) => store.removeReviewComment,
+  );
+  const setComposerDraftStudyDocuments = useComposerDraftStore((store) => store.setStudyDocuments);
+  const removeComposerDraftStudyDocument = useComposerDraftStore(
+    (store) => store.removeStudyDocument,
   );
   const clearComposerDraftPersistedAttachments = useComposerDraftStore(
     (store) => store.clearPersistedAttachments,
@@ -2001,6 +2011,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         elementContexts: composerElementContextsRef.current,
         previewAnnotations: composerPreviewAnnotations,
         reviewComments: composerReviewComments,
+        studyDocuments: composerStudyDocuments,
         selectedPromptEffort,
         selectedModelOptionsForDispatch,
         selectedModelSelection,
@@ -2021,6 +2032,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       composerElementContextsRef,
       composerPreviewAnnotations,
       composerReviewComments,
+      composerStudyDocuments,
       isConnecting,
       isComposerApprovalState,
       pendingUserInputs.length,
@@ -2261,6 +2273,19 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             {!isComposerCollapsedMobile &&
               !isComposerApprovalState &&
               pendingUserInputs.length === 0 &&
+              composerStudyDocuments.length > 0 && (
+                <ComposerStudyDocumentChips
+                  documents={composerStudyDocuments}
+                  onRemove={(documentId) =>
+                    removeComposerDraftStudyDocument(composerDraftTarget, documentId)
+                  }
+                  className="mb-3"
+                />
+              )}
+
+            {!isComposerCollapsedMobile &&
+              !isComposerApprovalState &&
+              pendingUserInputs.length === 0 &&
               composerPreviewAnnotations.length > 0 && (
                 <ComposerPreviewAnnotationCards
                   annotations={composerPreviewAnnotations}
@@ -2493,6 +2518,20 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   onInstanceModelChange={onProviderModelSelect}
                 />
 
+                <ComposerStudyLibraryPicker
+                  environmentId={environmentId}
+                  selected={composerStudyDocuments}
+                  compact={isComposerFooterCompact}
+                  disabled={
+                    isConnecting ||
+                    isComposerApprovalState ||
+                    (environmentUnavailable !== null && activePendingProgress === null)
+                  }
+                  onChange={(documents) =>
+                    setComposerDraftStudyDocuments(composerDraftTarget, documents)
+                  }
+                />
+
                 {isComposerFooterCompact ? (
                   <CompactComposerControlsMenu
                     activePlan={showPlanSidebarToggle}
@@ -2537,6 +2576,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 }
                 className="flex shrink-0 flex-nowrap items-center justify-end gap-2"
               >
+                <ComposerVoiceControl
+                  environmentId={environmentId}
+                  selectedDocuments={composerStudyDocuments}
+                  compact={isComposerPrimaryActionsCompact}
+                  disabled={
+                    isConnecting ||
+                    isComposerApprovalState ||
+                    (environmentUnavailable !== null && activePendingProgress === null)
+                  }
+                />
                 <ComposerFooterPrimaryActions
                   compact={isComposerPrimaryActionsCompact}
                   activeContextWindow={activeContextWindow}

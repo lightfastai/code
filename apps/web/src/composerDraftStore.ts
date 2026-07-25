@@ -15,6 +15,8 @@ import {
   type ServerProvider,
   type ScopedProjectRef,
   type ScopedThreadRef,
+  StudyDocument,
+  type StudyDocument as StudyDocumentType,
   ThreadId,
 } from "@t3tools/contracts";
 import {
@@ -55,9 +57,10 @@ import { ReviewCommentContextSchema, type ReviewCommentContext } from "./reviewC
 const isRuntimeMode = Schema.is(RuntimeMode);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
 const isReviewCommentContext = Schema.is(ReviewCommentContextSchema);
+const isStudyDocument = Schema.is(StudyDocument);
 
 export const COMPOSER_DRAFT_STORAGE_KEY = "t3code:composer-drafts:v1";
-const COMPOSER_DRAFT_STORAGE_VERSION = 8;
+const COMPOSER_DRAFT_STORAGE_VERSION = 9;
 const DraftThreadEnvModeSchema = Schema.Literals(["local", "worktree"]);
 export type DraftThreadEnvMode = typeof DraftThreadEnvModeSchema.Type;
 
@@ -132,6 +135,7 @@ const PersistedComposerThreadDraftState = Schema.Struct({
   elementContexts: Schema.optionalKey(Schema.Array(PersistedElementContextDraft)),
   previewAnnotations: Schema.optionalKey(Schema.Array(PreviewAnnotationPayloadSchema)),
   reviewComments: Schema.optionalKey(Schema.Array(ReviewCommentContextSchema)),
+  studyDocuments: Schema.optionalKey(Schema.Array(StudyDocument).check(Schema.isMaxLength(32))),
   // Keyed by `ProviderInstanceId` (open branded slug) so custom provider
   // instances (e.g. `codex_personal`) round-trip alongside the built-in
   // `codex` / `claudeAgent` / ... entries. Every prior `ProviderDriverKind`
@@ -262,6 +266,8 @@ export interface ComposerThreadDraftState {
   elementContexts: ElementContextDraft[];
   previewAnnotations: PreviewAnnotationPayload[];
   reviewComments: ReviewCommentContext[];
+  /** Immutable local-library documents pinned as grounding scope for this conversation. */
+  studyDocuments: StudyDocumentType[];
   /**
    * Per-instance model selection. Keyed by `ProviderInstanceId` (open
    * branded slug) so a default `codex` instance and a user-authored
@@ -480,6 +486,11 @@ interface ComposerDraftStoreState {
     comments: ReadonlyArray<ReviewCommentContext>,
   ) => void;
   removeReviewComment: (threadRef: ComposerThreadTarget, commentId: string) => void;
+  setStudyDocuments: (
+    threadRef: ComposerThreadTarget,
+    documents: ReadonlyArray<StudyDocumentType>,
+  ) => void;
+  removeStudyDocument: (threadRef: ComposerThreadTarget, documentId: string) => void;
   clearPersistedAttachments: (threadRef: ComposerThreadTarget) => void;
   syncPersistedAttachments: (
     threadRef: ComposerThreadTarget,
@@ -558,12 +569,14 @@ const EMPTY_TERMINAL_CONTEXTS: TerminalContextDraft[] = [];
 const EMPTY_ELEMENT_CONTEXTS: ElementContextDraft[] = [];
 const EMPTY_PREVIEW_ANNOTATIONS: PreviewAnnotationPayload[] = [];
 const EMPTY_REVIEW_COMMENTS: ReviewCommentContext[] = [];
+const EMPTY_STUDY_DOCUMENTS: StudyDocumentType[] = [];
 Object.freeze(EMPTY_IMAGES);
 Object.freeze(EMPTY_IDS);
 Object.freeze(EMPTY_PERSISTED_ATTACHMENTS);
 Object.freeze(EMPTY_ELEMENT_CONTEXTS);
 Object.freeze(EMPTY_PREVIEW_ANNOTATIONS);
 Object.freeze(EMPTY_REVIEW_COMMENTS);
+Object.freeze(EMPTY_STUDY_DOCUMENTS);
 const EMPTY_MODEL_SELECTION_BY_PROVIDER: Partial<Record<ProviderDriverKind, ModelSelection>> =
   Object.freeze({});
 const EMPTY_COMPOSER_DRAFT_MODEL_STATE = Object.freeze<ComposerDraftModelState>({
@@ -580,6 +593,7 @@ const EMPTY_THREAD_DRAFT = Object.freeze<ComposerThreadDraftState>({
   elementContexts: EMPTY_ELEMENT_CONTEXTS,
   previewAnnotations: EMPTY_PREVIEW_ANNOTATIONS,
   reviewComments: EMPTY_REVIEW_COMMENTS,
+  studyDocuments: EMPTY_STUDY_DOCUMENTS,
   modelSelectionByProvider: EMPTY_MODEL_SELECTION_BY_PROVIDER,
   activeProvider: null,
   runtimeMode: null,
@@ -602,6 +616,7 @@ export function createEmptyThreadDraft(): ComposerThreadDraftState {
     elementContexts: [],
     previewAnnotations: [],
     reviewComments: [],
+    studyDocuments: [],
     modelSelectionByProvider: {},
     activeProvider: null,
     runtimeMode: null,
@@ -666,6 +681,18 @@ function normalizeTerminalContextsForThread(
   return normalizedContexts;
 }
 
+function normalizeStudyDocuments(documents: ReadonlyArray<StudyDocumentType>): StudyDocumentType[] {
+  const ids = new Set<string>();
+  const normalized: StudyDocumentType[] = [];
+  for (const document of documents) {
+    if (ids.has(document.id)) continue;
+    normalized.push({ ...document, tags: [...document.tags] });
+    ids.add(document.id);
+    if (normalized.length >= 32) break;
+  }
+  return normalized;
+}
+
 function shouldRemoveDraft(draft: ComposerThreadDraftState): boolean {
   return (
     draft.prompt.length === 0 &&
@@ -675,6 +702,7 @@ function shouldRemoveDraft(draft: ComposerThreadDraftState): boolean {
     draft.elementContexts.length === 0 &&
     draft.previewAnnotations.length === 0 &&
     draft.reviewComments.length === 0 &&
+    draft.studyDocuments.length === 0 &&
     Object.keys(draft.modelSelectionByProvider).length === 0 &&
     draft.activeProvider === null &&
     draft.runtimeMode === null &&
@@ -1660,6 +1688,9 @@ function normalizePersistedDraftsByThreadId(
     const reviewComments = Array.isArray(draftCandidate.reviewComments)
       ? draftCandidate.reviewComments.filter(isReviewCommentContext)
       : [];
+    const studyDocuments = Array.isArray(draftCandidate.studyDocuments)
+      ? draftCandidate.studyDocuments.filter(isStudyDocument).slice(0, 32)
+      : [];
     const runtimeMode = isRuntimeMode(draftCandidate.runtimeMode)
       ? draftCandidate.runtimeMode
       : null;
@@ -1725,6 +1756,7 @@ function normalizePersistedDraftsByThreadId(
       terminalContexts.length === 0 &&
       elementContexts.length === 0 &&
       reviewComments.length === 0 &&
+      studyDocuments.length === 0 &&
       !hasModelData &&
       !runtimeMode &&
       !interactionMode
@@ -1749,6 +1781,7 @@ function normalizePersistedDraftsByThreadId(
       ...(terminalContexts.length > 0 ? { terminalContexts } : {}),
       ...(elementContexts.length > 0 ? { elementContexts } : {}),
       ...(reviewComments.length > 0 ? { reviewComments } : {}),
+      ...(studyDocuments.length > 0 ? { studyDocuments } : {}),
       ...(hasModelData
         ? {
             modelSelectionByProvider: compactModelSelectionByProvider(modelSelectionByProvider),
@@ -1834,6 +1867,7 @@ function partializeComposerDraftStoreState(
       draft.elementContexts.length === 0 &&
       draft.previewAnnotations.length === 0 &&
       draft.reviewComments.length === 0 &&
+      draft.studyDocuments.length === 0 &&
       !hasModelData &&
       draft.runtimeMode === null &&
       draft.interactionMode === null
@@ -1883,6 +1917,14 @@ function partializeComposerDraftStoreState(
       ...(draft.reviewComments.length > 0
         ? {
             reviewComments: draft.reviewComments.map((comment) => ({ ...comment })),
+          }
+        : {}),
+      ...(draft.studyDocuments.length > 0
+        ? {
+            studyDocuments: draft.studyDocuments.map((document) => ({
+              ...document,
+              tags: [...document.tags],
+            })),
           }
         : {}),
       ...(hasModelData
@@ -2128,6 +2170,11 @@ function toHydratedThreadDraft(
     previewAnnotations:
       persistedDraft.previewAnnotations?.map((annotation) => ({ ...annotation })) ?? [],
     reviewComments: persistedDraft.reviewComments?.map((comment) => ({ ...comment })) ?? [],
+    studyDocuments:
+      persistedDraft.studyDocuments?.map((document) => ({
+        ...document,
+        tags: [...document.tags],
+      })) ?? [],
     modelSelectionByProvider,
     activeProvider,
     runtimeMode: persistedDraft.runtimeMode ?? null,
@@ -3245,6 +3292,37 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             const reviewComments = current.reviewComments.filter((entry) => entry.id !== commentId);
             if (reviewComments.length === current.reviewComments.length) return state;
             const nextDraft = { ...current, reviewComments };
+            const nextDraftsByThreadKey = { ...state.draftsByThreadKey };
+            if (shouldRemoveDraft(nextDraft)) delete nextDraftsByThreadKey[threadKey];
+            else nextDraftsByThreadKey[threadKey] = nextDraft;
+            return { draftsByThreadKey: nextDraftsByThreadKey };
+          });
+        },
+        setStudyDocuments: (threadRef, documents) => {
+          const threadKey = resolveComposerDraftKey(get(), threadRef);
+          if (!threadKey) return;
+          const studyDocuments = normalizeStudyDocuments(documents);
+          set((state) => {
+            const existing = state.draftsByThreadKey[threadKey] ?? createEmptyThreadDraft();
+            if (Equal.equals(existing.studyDocuments, studyDocuments)) return state;
+            const nextDraft = { ...existing, studyDocuments };
+            const nextDraftsByThreadKey = { ...state.draftsByThreadKey };
+            if (shouldRemoveDraft(nextDraft)) delete nextDraftsByThreadKey[threadKey];
+            else nextDraftsByThreadKey[threadKey] = nextDraft;
+            return { draftsByThreadKey: nextDraftsByThreadKey };
+          });
+        },
+        removeStudyDocument: (threadRef, documentId) => {
+          const threadKey = resolveComposerDraftKey(get(), threadRef);
+          if (!threadKey || documentId.length === 0) return;
+          set((state) => {
+            const current = state.draftsByThreadKey[threadKey];
+            if (!current) return state;
+            const studyDocuments = current.studyDocuments.filter(
+              (document) => document.id !== documentId,
+            );
+            if (studyDocuments.length === current.studyDocuments.length) return state;
+            const nextDraft = { ...current, studyDocuments };
             const nextDraftsByThreadKey = { ...state.draftsByThreadKey };
             if (shouldRemoveDraft(nextDraft)) delete nextDraftsByThreadKey[threadKey];
             else nextDraftsByThreadKey[threadKey] = nextDraft;

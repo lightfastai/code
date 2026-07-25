@@ -1,8 +1,9 @@
 import {
-  type ChatAttachment,
+  type ChatImageAttachment,
   CommandId,
   EventId,
   type ModelSelection,
+  type MessageId,
   type OrchestrationEvent,
   ProviderDriverKind,
   type ProjectId,
@@ -19,6 +20,7 @@ import * as Crypto from "effect/Crypto";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -32,6 +34,8 @@ import type { ProviderServiceError } from "../../provider/Errors.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
@@ -41,6 +45,11 @@ import {
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import {
+  completeTurnStartAdmissionPhase,
+  reconcileInactiveTurnStartAdmission,
+} from "../TurnStartAdmission.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
 
@@ -192,6 +201,7 @@ const make = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
   const providerRegistry = yield* ProviderRegistry;
+  const projectionTurnRepository = yield* ProjectionTurnRepository;
   const gitWorkflow = yield* GitWorkflowService;
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
   const textGeneration = yield* TextGeneration;
@@ -213,6 +223,7 @@ const make = Effect.gen(function* () {
     );
 
   const threadModelSelections = new Map<string, ModelSelection>();
+  const pendingTurnStarts = new Map<ThreadId, MessageId>();
 
   const appendProviderFailureActivity = (input: {
     readonly threadId: ThreadId;
@@ -586,7 +597,7 @@ const make = Effect.gen(function* () {
   const buildSendTurnRequestForThread = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
     readonly messageText: string;
-    readonly attachments?: ReadonlyArray<ChatAttachment>;
+    readonly attachments?: ReadonlyArray<ChatImageAttachment>;
     readonly modelSelection?: ModelSelection;
     readonly interactionMode?: "default" | "plan";
     readonly createdAt: string;
@@ -651,7 +662,7 @@ const make = Effect.gen(function* () {
     readonly branch: string | null;
     readonly worktreePath: string | null;
     readonly messageText: string;
-    readonly attachments?: ReadonlyArray<ChatAttachment>;
+    readonly attachments?: ReadonlyArray<ChatImageAttachment>;
   }) {
     if (!input.branch || !input.worktreePath) {
       return;
@@ -704,7 +715,7 @@ const make = Effect.gen(function* () {
       readonly threadId: ThreadId;
       readonly cwd: string;
       readonly messageText: string;
-      readonly attachments?: ReadonlyArray<ChatAttachment>;
+      readonly attachments?: ReadonlyArray<ChatImageAttachment>;
       readonly titleSeed?: string;
     }) {
       const attachments = input.attachments ?? [];
@@ -752,13 +763,22 @@ const make = Effect.gen(function* () {
       return;
     }
 
+    const authorityTurn = {
+      threadId: event.payload.threadId,
+      messageId: event.payload.messageId,
+    } as const;
+    const deleteAcceptedTurnStart = projectionTurnRepository.deleteAcceptedTurnStart(authorityTurn);
+    const deleteProjectedTurnStart = projectionTurnRepository.deletePendingTurnStart(authorityTurn);
+
     const thread = yield* resolveThread(event.payload.threadId);
     if (!thread) {
+      yield* deleteProjectedTurnStart;
       return;
     }
 
     const message = thread.messages.find((entry) => entry.id === event.payload.messageId);
     if (!message || message.role !== "user") {
+      yield* deleteProjectedTurnStart;
       yield* appendProviderFailureActivity({
         threadId: event.payload.threadId,
         kind: "provider.turn.start.failed",
@@ -770,35 +790,157 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    const isFirstUserMessageTurn =
-      thread.messages.filter((entry) => entry.role === "user").length === 1;
-    if (isFirstUserMessageTurn) {
-      const project = yield* resolveProject(thread.projectId);
-      const generationCwd =
-        resolveThreadWorkspaceCwd({
-          thread,
-          projects: project ? [project] : [],
-        }) ?? process.cwd();
-      const generationInput = {
-        messageText: message.text,
-        ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
-        ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),
-      };
-
-      yield* maybeGenerateAndRenameWorktreeBranchForFirstTurn({
+    const runtimeSession = (yield* providerService.listSessions()).find(
+      (session) => session.threadId === event.payload.threadId,
+    );
+    const pendingMessageId = pendingTurnStarts.get(event.payload.threadId);
+    const hasActiveTurn =
+      thread.session?.activeTurnId !== null && thread.session?.activeTurnId !== undefined;
+    const runtimeHasActiveTurn =
+      runtimeSession?.activeTurnId !== null && runtimeSession?.activeTurnId !== undefined;
+    const appendBusyTurnStartFailure = (turnId: TurnId | null) =>
+      appendProviderFailureActivity({
         threadId: event.payload.threadId,
-        branch: thread.branch,
-        worktreePath: thread.worktreePath,
-        ...generationInput,
-      }).pipe(Effect.forkScoped);
-
-      if (canReplaceThreadTitle(thread.title, event.payload.titleSeed)) {
-        yield* maybeGenerateThreadTitleForFirstTurn({
+        kind: "provider.turn.start.failed",
+        summary: "Provider turn start failed",
+        detail: `Thread '${event.payload.threadId}' already has an active or pending provider turn. Wait for it to finish before starting another turn.`,
+        turnId,
+        createdAt: event.payload.createdAt,
+      });
+    const rejectBusyTurnStart = (turnId: TurnId | null) =>
+      projectionTurnRepository
+        .deletePendingTurnStart({
           threadId: event.payload.threadId,
-          cwd: generationCwd,
-          ...generationInput,
-        }).pipe(Effect.forkScoped);
+          messageId: event.payload.messageId,
+        })
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider turn rejection deferred pending cleanup", {
+              ...authorityTurn,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+          Effect.andThen(appendBusyTurnStartFailure(turnId)),
+        );
+    if (pendingMessageId !== undefined || hasActiveTurn || runtimeHasActiveTurn) {
+      yield* rejectBusyTurnStart(
+        thread.session?.activeTurnId ?? runtimeSession?.activeTurnId ?? null,
+      );
+      return;
+    }
+
+    pendingTurnStarts.set(event.payload.threadId, event.payload.messageId);
+    const clearPendingTurnStart = Effect.sync(() => {
+      if (pendingTurnStarts.get(event.payload.threadId) === event.payload.messageId) {
+        pendingTurnStarts.delete(event.payload.threadId);
       }
+    });
+    let providerSendAttempted = false;
+    let correlatedProviderTurnId: TurnId | undefined;
+
+    const runFailureCleanupStep = <A, E, R>(operation: string, effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("provider turn failure cleanup deferred", {
+            ...authorityTurn,
+            operation,
+            cause: Cause.pretty(cause),
+          }),
+        ),
+        Effect.asVoid,
+      );
+
+    const cleanupAcceptedTurnStart = Effect.gen(function* () {
+      if (!providerSendAttempted) {
+        yield* deleteAcceptedTurnStart;
+        return;
+      }
+
+      if (correlatedProviderTurnId === undefined) {
+        yield* deleteAcceptedTurnStart;
+        return;
+      }
+
+      const cancelled = yield* projectionTurnRepository.cancelAcceptedTurnStart({
+        ...authorityTurn,
+        providerTurnId: correlatedProviderTurnId,
+        cancelledAt: event.payload.createdAt,
+      });
+      if (!cancelled) {
+        yield* Effect.logWarning("provider turn failure cancellation tombstone deferred", {
+          ...authorityTurn,
+          providerTurnId: correlatedProviderTurnId,
+        });
+      }
+    });
+
+    const cleanupAcquiredTurnStart = Effect.gen(function* () {
+      yield* runFailureCleanupStep("accepted-turn", cleanupAcceptedTurnStart);
+      yield* runFailureCleanupStep("pending-turn", deleteProjectedTurnStart);
+      yield* runFailureCleanupStep(
+        "notebook-authority",
+        McpSessionRegistry.rollbackActiveNotebookDocumentAuthorityTurn(authorityTurn),
+      );
+      yield* clearPendingTurnStart;
+    });
+
+    const preAuthorityReconciliation = yield* reconcileInactiveTurnStartAdmission(
+      projectionTurnRepository,
+      {
+        threadId: event.payload.threadId,
+        nextMessageId: event.payload.messageId,
+      },
+    ).pipe(
+      Effect.onExit((exit) => (Exit.isFailure(exit) ? cleanupAcquiredTurnStart : Effect.void)),
+    );
+    if (preAuthorityReconciliation === "blocked") {
+      yield* cleanupAcquiredTurnStart;
+      yield* appendBusyTurnStartFailure(null);
+      return;
+    }
+
+    const stagedAuthority = yield* McpSessionRegistry.stageActiveNotebookDocumentAuthorityTurn({
+      ...authorityTurn,
+      documentIds: event.payload.documentIds ?? [],
+    });
+    if (!stagedAuthority) {
+      yield* clearPendingTurnStart;
+      yield* rejectBusyTurnStart(null);
+      return;
+    }
+
+    if (preAuthorityReconciliation === "authority-probe-required") {
+      const postAuthorityReconciliation = yield* reconcileInactiveTurnStartAdmission(
+        projectionTurnRepository,
+        {
+          threadId: event.payload.threadId,
+          nextMessageId: event.payload.messageId,
+          authorityProbeSucceeded: true,
+        },
+      ).pipe(
+        Effect.onExit((exit) => (Exit.isFailure(exit) ? cleanupAcquiredTurnStart : Effect.void)),
+      );
+      if (postAuthorityReconciliation !== "ready") {
+        yield* cleanupAcquiredTurnStart;
+        yield* appendBusyTurnStartFailure(null);
+        return;
+      }
+    }
+
+    const stagedAcceptedTurn = yield* projectionTurnRepository
+      .stageAcceptedTurnStart({
+        ...authorityTurn,
+        sourceProposedPlanThreadId: event.payload.sourceProposedPlan?.threadId ?? null,
+        sourceProposedPlanId: event.payload.sourceProposedPlan?.planId ?? null,
+        requestedAt: event.payload.createdAt,
+      })
+      .pipe(
+        Effect.onExit((exit) => (Exit.isFailure(exit) ? cleanupAcquiredTurnStart : Effect.void)),
+      );
+    if (!stagedAcceptedTurn) {
+      yield* cleanupAcquiredTurnStart;
+      yield* appendBusyTurnStartFailure(null);
+      return;
     }
 
     const handleTurnStartFailure = (cause: Cause.Cause<unknown>) => {
@@ -837,27 +979,94 @@ const make = Effect.gen(function* () {
         ),
       );
 
-    const sendTurnRequest = yield* buildSendTurnRequestForThread({
-      threadId: event.payload.threadId,
-      messageText: message.text,
-      ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
-      ...(event.payload.modelSelection !== undefined
-        ? { modelSelection: event.payload.modelSelection }
-        : {}),
-      interactionMode: event.payload.interactionMode,
-      createdAt: event.payload.createdAt,
-    }).pipe(
-      Effect.map(Option.some),
-      Effect.catchCause((cause) => handleTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
+    const runAcquiredTurnStart = Effect.gen(function* () {
+      const isFirstUserMessageTurn =
+        thread.messages.filter((entry) => entry.role === "user").length === 1;
+      const messageImages = message.attachments?.filter(
+        (attachment) => attachment.type === "image",
+      );
+      if (isFirstUserMessageTurn) {
+        const project = yield* resolveProject(thread.projectId);
+        const generationCwd =
+          resolveThreadWorkspaceCwd({
+            thread,
+            projects: project ? [project] : [],
+          }) ?? process.cwd();
+        const generationInput = {
+          messageText: message.text,
+          ...(messageImages !== undefined ? { attachments: messageImages } : {}),
+          ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),
+        };
+
+        yield* maybeGenerateAndRenameWorktreeBranchForFirstTurn({
+          threadId: event.payload.threadId,
+          branch: thread.branch,
+          worktreePath: thread.worktreePath,
+          ...generationInput,
+        }).pipe(Effect.forkScoped);
+
+        if (canReplaceThreadTitle(thread.title, event.payload.titleSeed)) {
+          yield* maybeGenerateThreadTitleForFirstTurn({
+            threadId: event.payload.threadId,
+            cwd: generationCwd,
+            ...generationInput,
+          }).pipe(Effect.forkScoped);
+        }
+      }
+
+      const sendTurnRequest = yield* buildSendTurnRequestForThread({
+        threadId: event.payload.threadId,
+        messageText: message.text,
+        ...(messageImages !== undefined ? { attachments: messageImages } : {}),
+        ...(event.payload.modelSelection !== undefined
+          ? { modelSelection: event.payload.modelSelection }
+          : {}),
+        interactionMode: event.payload.interactionMode,
+        createdAt: event.payload.createdAt,
+      });
+
+      providerSendAttempted = true;
+      const correlateAcceptedProviderTurn = (accepted: {
+        readonly turnId: TurnId;
+      }): Effect.Effect<void> =>
+        projectionTurnRepository
+          .correlateAcceptedTurnStart({
+            ...authorityTurn,
+            providerTurnId: accepted.turnId,
+          })
+          .pipe(
+            Effect.flatMap((correlated) =>
+              correlated
+                ? Effect.sync(() => {
+                    correlatedProviderTurnId = accepted.turnId;
+                  })
+                : Effect.die(
+                    new Error(
+                      `Provider generation '${accepted.turnId}' did not match accepted message '${authorityTurn.messageId}'.`,
+                    ),
+                  ),
+            ),
+            Effect.orDie,
+          );
+      const acceptedProviderTurn = yield* providerService.sendTurn(
+        sendTurnRequest,
+        correlateAcceptedProviderTurn,
+      );
+      yield* correlateAcceptedProviderTurn(acceptedProviderTurn);
+      yield* McpSessionRegistry.completeActiveNotebookDocumentAuthorityTurn(authorityTurn);
+      yield* completeTurnStartAdmissionPhase(projectionTurnRepository, {
+        ...authorityTurn,
+        phase: "provider-send-completed",
+      });
+    });
+
+    yield* runAcquiredTurnStart.pipe(
+      Effect.onExit((exit) =>
+        Exit.isFailure(exit) ? cleanupAcquiredTurnStart : clearPendingTurnStart,
+      ),
+      Effect.catchCause(recoverTurnStartFailure),
+      Effect.forkScoped,
     );
-
-    if (Option.isNone(sendTurnRequest)) {
-      return;
-    }
-
-    yield* providerService
-      .sendTurn(sendTurnRequest.value)
-      .pipe(Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
   });
 
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (
@@ -1085,4 +1294,6 @@ const make = Effect.gen(function* () {
   } satisfies ProviderCommandReactorShape;
 });
 
-export const ProviderCommandReactorLive = Layer.effect(ProviderCommandReactor, make);
+export const ProviderCommandReactorLive = Layer.effect(ProviderCommandReactor, make).pipe(
+  Layer.provide(ProjectionTurnRepositoryLive),
+);

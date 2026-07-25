@@ -7,6 +7,7 @@ import type {
   ProviderInteractionMode,
   RuntimeMode,
   ServerConfig as T3ServerConfig,
+  StudyDocument,
 } from "@t3tools/contracts";
 import {
   detectComposerTrigger,
@@ -15,6 +16,7 @@ import {
   type ComposerTrigger,
 } from "@t3tools/shared/composerTrigger";
 import type { ReactNode } from "react";
+import { useNavigation } from "@react-navigation/native";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
   ActivityIndicator,
@@ -62,7 +64,11 @@ import {
   resolveProviderOptionDescriptors,
 } from "../../lib/providerOptions";
 import { useComposerPathSearch } from "../../state/use-composer-path-search";
+import { useEnvironmentQuery } from "../../state/query";
+import { studyEnvironment } from "../../state/study";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
+import { StudyVoiceToolbarButton } from "./StudyVoiceToolbarButton";
+import { studyCanvasIdForThread } from "../study-canvas/studyCanvasModel";
 
 /**
  * Height of the collapsed composer (pill + vertical padding, excluding safe-area inset).
@@ -79,6 +85,7 @@ export const COMPOSER_EXPANDED_CHROME = 174;
 export interface ThreadComposerProps {
   readonly draftMessage: string;
   readonly draftAttachments: ReadonlyArray<DraftComposerImageAttachment>;
+  readonly studyDocuments: ReadonlyArray<StudyDocument>;
   readonly placeholder: string;
   readonly contentMaxWidth?: number;
   readonly bottomInset?: number;
@@ -107,6 +114,7 @@ export interface ThreadComposerProps {
   readonly onUpdateModelSelection: (modelSelection: ModelSelection) => void;
   readonly onUpdateRuntimeMode: (runtimeMode: RuntimeMode) => void;
   readonly onUpdateInteractionMode: (interactionMode: ProviderInteractionMode) => void;
+  readonly onUpdateStudyDocuments: (documents: ReadonlyArray<StudyDocument>) => void;
   readonly onReconnectEnvironment: () => void;
   readonly onExpandedChange?: (expanded: boolean) => void;
 }
@@ -255,6 +263,7 @@ const ComposerConnectionStatusPill = memo(function ComposerConnectionStatusPill(
 });
 
 export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposerProps) {
+  const navigation = useNavigation();
   const isDarkMode = useColorScheme() === "dark";
   const foregroundColor = useThemeColor("--color-foreground");
   const bodyText = useScaledTextRole("body");
@@ -354,6 +363,9 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     cwd: composerTrigger?.kind === "path" ? props.projectCwd : null,
     query: composerTrigger?.kind === "path" ? composerTrigger.query : null,
   });
+  const studyLibrary = useEnvironmentQuery(
+    studyEnvironment.library({ environmentId: props.environmentId, input: {} }),
+  );
 
   const composerMenuItems: ComposerCommandItem[] = useMemo(() => {
     if (!composerTrigger) return [];
@@ -660,6 +672,20 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     ],
     [currentInteractionMode, currentRuntimeMode, providerOptionDescriptors],
   );
+  const studyDocumentIds = useMemo(
+    () => new Set(props.studyDocuments.map((document) => document.id)),
+    [props.studyDocuments],
+  );
+  const studyMenuActions = useMemo(
+    () =>
+      (studyLibrary.data ?? []).map((document) => ({
+        id: `study:${document.id}`,
+        title: document.title,
+        subtitle: [document.format.toUpperCase(), ...document.tags.slice(0, 2)].join(" · "),
+        state: studyDocumentIds.has(document.id) ? ("on" as const) : undefined,
+      })),
+    [studyDocumentIds, studyLibrary.data],
+  );
 
   // ── Menu handlers ────────────────────────────────────────
   function handleModelMenuAction(event: string) {
@@ -691,6 +717,19 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       const interactionMode = event.slice("options:interaction:".length) as ProviderInteractionMode;
       props.onUpdateInteractionMode(interactionMode);
     }
+  }
+
+  function handleStudyMenuAction(event: string) {
+    if (!event.startsWith("study:")) return;
+    const documentId = event.slice("study:".length);
+    const selected = studyDocumentIds.has(documentId);
+    const document = studyLibrary.data?.find((candidate) => candidate.id === documentId);
+    if (!selected && !document) return;
+    props.onUpdateStudyDocuments(
+      selected
+        ? props.studyDocuments.filter((candidate) => candidate.id !== documentId)
+        : [...props.studyDocuments, document!],
+    );
   }
 
   return (
@@ -852,6 +891,37 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                   showChevron={false}
                 />
                 <ControlPillMenu
+                  actions={studyMenuActions}
+                  onPressAction={({ nativeEvent }) => handleStudyMenuAction(nativeEvent.event)}
+                >
+                  <ComposerToolbarTrigger
+                    accessibilityLabel="Study books"
+                    icon="book.closed"
+                    label={
+                      props.studyDocuments.length > 0
+                        ? `${props.studyDocuments.length} book${props.studyDocuments.length === 1 ? "" : "s"}`
+                        : studyLibrary.isPending
+                          ? "Books…"
+                          : "Books"
+                    }
+                  />
+                </ControlPillMenu>
+                <ComposerToolbarButton
+                  accessibilityLabel="Open study canvas"
+                  icon="square.and.pencil"
+                  label="Canvas"
+                  onPress={() =>
+                    navigation.navigate("StudyCanvas", {
+                      environmentId: String(props.environmentId),
+                      threadId: String(props.selectedThread.id),
+                      canvasId: studyCanvasIdForThread(
+                        String(props.environmentId),
+                        String(props.selectedThread.id),
+                      ),
+                    })
+                  }
+                />
+                <ControlPillMenu
                   actions={modelMenuActions}
                   onPressAction={({ nativeEvent }) => handleModelMenuAction(nativeEvent.event)}
                 >
@@ -873,6 +943,11 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                     label={configurationLabel}
                   />
                 </ControlPillMenu>
+                <StudyVoiceToolbarButton
+                  environmentId={props.environmentId}
+                  selectedDocuments={props.studyDocuments}
+                  disabled={props.connectionState !== "connected"}
+                />
                 {showStopAction ? (
                   <ComposerToolbarButton
                     accessibilityLabel="Stop"

@@ -8,6 +8,7 @@ import {
   type ModelSelection,
   type ProviderInteractionMode,
   type RuntimeMode,
+  type SelectedStudyDocumentIds,
 } from "@t3tools/contracts";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import * as Cause from "effect/Cause";
@@ -37,6 +38,7 @@ export function useCreateProjectThread() {
       readonly interactionMode: ProviderInteractionMode;
       readonly initialMessageText: string;
       readonly initialAttachments: ReadonlyArray<DraftComposerImageAttachment>;
+      readonly initialDocumentIds: SelectedStudyDocumentIds;
       /** Reuse identifiers from a queued pending task instead of minting new ones. */
       readonly turnMetadata?: TurnCommandMetadata;
     }) => {
@@ -67,6 +69,7 @@ export function useCreateProjectThread() {
           createdAt: metadata.createdAt,
           text: initialMessageText,
           attachments: input.initialAttachments,
+          documentIds: input.initialDocumentIds,
           modelSelection: input.modelSelection,
           runtimeMode: input.runtimeMode,
           interactionMode: input.interactionMode,

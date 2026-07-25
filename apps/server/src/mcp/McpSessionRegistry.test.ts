@@ -1,7 +1,9 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
-import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, MessageId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import { HttpServer } from "effect/unstable/http";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -86,5 +88,340 @@ it.effect("expires credentials after inactivity", () =>
     const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
     timestamp += 101;
     expect(yield* registry.resolve(token)).toBeUndefined();
+  }),
+);
+
+it.effect("defaults notebook execution to denied and updates every credential for one thread", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const threadId = ThreadId.make("thread-notebook-grant");
+    const otherThreadId = ThreadId.make("thread-notebook-other");
+    const issued = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const other = yield* registry.issue({
+      threadId: otherThreadId,
+      providerInstanceId: ProviderInstanceId.make("claude"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    const otherToken = other.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    expect((yield* registry.resolve(token))?.allowNotebookExecution).toBe(false);
+    expect(yield* registry.getNotebookExecutionPermission(threadId)).toEqual({
+      threadId,
+      allowNotebookExecution: false,
+    });
+
+    yield* registry.setNotebookExecutionPermission({
+      threadId,
+      allowNotebookExecution: true,
+    });
+
+    expect((yield* registry.resolve(token))?.allowNotebookExecution).toBe(true);
+    expect((yield* registry.resolve(otherToken))?.allowNotebookExecution).toBe(false);
+    expect(yield* registry.getNotebookExecutionPermission(threadId)).toEqual({
+      threadId,
+      allowNotebookExecution: true,
+    });
+  }),
+);
+
+it.effect("defaults notebook document authority closed and updates every thread credential", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const threadId = ThreadId.make("thread-notebook-documents");
+    const otherThreadId = ThreadId.make("thread-notebook-documents-other");
+    const issued = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const other = yield* registry.issue({
+      threadId: otherThreadId,
+      providerInstanceId: ProviderInstanceId.make("claude"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    const otherToken = other.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([]);
+    const normalized = yield* registry.setNotebookDocumentAuthority({
+      threadId,
+      documentIds: ["b".repeat(64), "a".repeat(64), "b".repeat(64)],
+    });
+
+    expect(normalized).toEqual(["a".repeat(64), "b".repeat(64)]);
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual(normalized);
+    expect((yield* registry.resolve(otherToken))?.notebookDocumentIds).toEqual([]);
+
+    const replacement = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const replacementToken = replacement.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    expect((yield* registry.resolve(replacementToken))?.notebookDocumentIds).toEqual(normalized);
+  }),
+);
+
+it.effect("stages notebook authority invisibly and rolls an admitted turn back atomically", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const threadId = ThreadId.make("thread-notebook-authority-transaction");
+    const messageId = MessageId.make("message-notebook-authority-b");
+    const wrongMessageId = MessageId.make("message-notebook-authority-wrong");
+    const documentA = "a".repeat(64);
+    const documentB = "b".repeat(64);
+
+    yield* registry.setNotebookDocumentAuthority({ threadId, documentIds: [documentA] });
+    const issued = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    yield* registry.stageNotebookDocumentAuthorityTurn({
+      threadId,
+      messageId,
+      documentIds: [documentB],
+    });
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentA]);
+
+    expect(
+      yield* registry.stageNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId: wrongMessageId,
+        documentIds: ["c".repeat(64)],
+      }),
+    ).toBe(false);
+    yield* registry.admitNotebookDocumentAuthorityTurn({ threadId, messageId: wrongMessageId });
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentA]);
+
+    yield* registry.admitNotebookDocumentAuthorityTurn({ threadId, messageId });
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentB]);
+
+    yield* registry.rollbackNotebookDocumentAuthorityTurn({ threadId, messageId });
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentA]);
+  }),
+);
+
+it.effect(
+  "retains send-first authority until exact runtime admission completes the transaction",
+  () =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry(() => 1_000);
+      const threadId = ThreadId.make("thread-notebook-authority-complete");
+      const firstMessageId = MessageId.make("message-notebook-authority-first");
+      const overlappingMessageId = MessageId.make("message-notebook-authority-overlapping");
+      const staleMessageId = MessageId.make("message-notebook-authority-stale");
+      const documentA = "a".repeat(64);
+      const documentB = "b".repeat(64);
+      const documentC = "c".repeat(64);
+      const issued = yield* registry.issue({
+        threadId,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+      });
+      const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+      yield* registry.stageNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId: firstMessageId,
+        documentIds: [documentB],
+      });
+      expect(
+        yield* registry.completeNotebookDocumentAuthorityTurn({
+          threadId,
+          messageId: firstMessageId,
+        }),
+      ).toBe(true);
+      expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([]);
+      expect(
+        yield* registry.stageNotebookDocumentAuthorityTurn({
+          threadId,
+          messageId: overlappingMessageId,
+          documentIds: [documentA],
+        }),
+      ).toBe(false);
+      expect(
+        yield* registry.admitNotebookDocumentAuthorityTurn({
+          threadId,
+          messageId: firstMessageId,
+        }),
+      ).toBe(true);
+      expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentB]);
+      expect(
+        yield* registry.stageNotebookDocumentAuthorityTurn({
+          threadId,
+          messageId: overlappingMessageId,
+          documentIds: [documentA],
+        }),
+      ).toBe(false);
+      expect(
+        yield* registry.finalizeNotebookDocumentAuthorityTurn({
+          threadId,
+          messageId: firstMessageId,
+        }),
+      ).toBe(true);
+
+      yield* registry.stageNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId: staleMessageId,
+        documentIds: [documentA],
+      });
+      yield* registry.setNotebookDocumentAuthority({ threadId, documentIds: [documentC] });
+      yield* registry.admitNotebookDocumentAuthorityTurn({ threadId, messageId: staleMessageId });
+      yield* registry.completeNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId: staleMessageId,
+      });
+      expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentC]);
+    }),
+);
+
+it.effect("retains runtime-first authority for post-admission rollback until send completes", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const threadId = ThreadId.make("thread-notebook-authority-runtime-first");
+    const messageId = MessageId.make("message-notebook-authority-runtime-first");
+    const nextMessageId = MessageId.make("message-notebook-authority-runtime-next");
+    const documentA = "a".repeat(64);
+    const documentB = "b".repeat(64);
+    const issued = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    yield* registry.setNotebookDocumentAuthority({ threadId, documentIds: [documentA] });
+    expect(
+      yield* registry.stageNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId,
+        documentIds: [documentB],
+      }),
+    ).toBe(true);
+    expect(yield* registry.admitNotebookDocumentAuthorityTurn({ threadId, messageId })).toBe(true);
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentB]);
+    expect(
+      yield* registry.stageNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId: nextMessageId,
+        documentIds: [],
+      }),
+    ).toBe(false);
+
+    expect(yield* registry.rollbackNotebookDocumentAuthorityTurn({ threadId, messageId })).toBe(
+      true,
+    );
+    expect((yield* registry.resolve(token))?.notebookDocumentIds).toEqual([documentA]);
+    expect(
+      yield* registry.stageNotebookDocumentAuthorityTurn({
+        threadId,
+        messageId: nextMessageId,
+        documentIds: [],
+      }),
+    ).toBe(true);
+  }),
+);
+
+it.effect("revalidates the authenticated thread grant atomically at runtime start", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const threadId = ThreadId.make("thread-notebook-race");
+    const issued = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    yield* registry.setNotebookExecutionPermission({ threadId, allowNotebookExecution: true });
+    const invocation = yield* registry.resolve(token);
+    expect(invocation?.allowNotebookExecution).toBe(true);
+    if (invocation === undefined) return;
+
+    const lookupFinished = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    const runtimeStarts: string[] = [];
+    const execution = yield* Effect.forkChild(
+      Effect.gen(function* () {
+        yield* Deferred.succeed(lookupFinished, undefined);
+        yield* Deferred.await(resume);
+        return yield* registry.withNotebookExecutionStart(
+          invocation,
+          [],
+          Effect.sync(() => runtimeStarts.push(invocation.threadId)),
+        );
+      }),
+    );
+
+    yield* Deferred.await(lookupFinished);
+    yield* registry.setNotebookExecutionPermission({ threadId, allowNotebookExecution: false });
+    yield* Deferred.succeed(resume, undefined);
+    const denied = yield* Fiber.join(execution).pipe(Effect.flip);
+
+    expect(denied).toMatchObject({ reason: "permission-denied" });
+    expect(runtimeStarts).toEqual([]);
+
+    yield* registry.setNotebookExecutionPermission({ threadId, allowNotebookExecution: true });
+    yield* registry.setNotebookDocumentAuthority({
+      threadId,
+      documentIds: ["a".repeat(64)],
+    });
+    const swapped = yield* registry
+      .withNotebookExecutionStart(
+        { ...invocation, threadId: ThreadId.make("thread-notebook-swapped") },
+        [],
+        Effect.sync(() => runtimeStarts.push("swapped")),
+      )
+      .pipe(Effect.flip);
+    expect(swapped).toMatchObject({ reason: "permission-denied" });
+    expect(runtimeStarts).toEqual([]);
+
+    const widened = yield* registry
+      .withNotebookExecutionStart(
+        { ...invocation, notebookDocumentIds: ["a".repeat(64)] },
+        ["b".repeat(64)],
+        Effect.sync(() => runtimeStarts.push("widened")),
+      )
+      .pipe(Effect.flip);
+    expect(widened).toMatchObject({ reason: "scope-mismatch" });
+    expect(runtimeStarts).toEqual([]);
+  }),
+);
+
+it.effect("serializes permission revocation with the complete runtime start boundary", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const threadId = ThreadId.make("thread-notebook-start-lock");
+    const issued = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    yield* registry.setNotebookExecutionPermission({ threadId, allowNotebookExecution: true });
+    const invocation = yield* registry.resolve(token);
+    if (invocation === undefined) throw new Error("missing invocation");
+    const startEntered = yield* Deferred.make<void>();
+    const releaseStart = yield* Deferred.make<void>();
+    const execution = yield* Effect.forkChild(
+      registry.withNotebookExecutionStart(
+        invocation,
+        [],
+        Deferred.succeed(startEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseStart)),
+        ),
+      ),
+    );
+    yield* Deferred.await(startEntered);
+    const revocation = yield* Effect.forkChild(
+      registry.setNotebookExecutionPermission({ threadId, allowNotebookExecution: false }),
+    );
+    yield* Effect.yieldNow;
+
+    expect(revocation.pollUnsafe()).toBeUndefined();
+    yield* Deferred.succeed(releaseStart, undefined);
+    yield* Fiber.join(execution);
+    yield* Fiber.join(revocation);
+    expect(yield* registry.getNotebookExecutionPermission(threadId)).toEqual({
+      threadId,
+      allowNotebookExecution: false,
+    });
   }),
 );

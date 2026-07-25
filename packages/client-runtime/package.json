@@ -67,6 +67,14 @@
       "types": "./src/state/models.ts",
       "default": "./src/state/models.ts"
     },
+    "./state/notebook": {
+      "types": "./src/state/notebook.ts",
+      "default": "./src/state/notebook.ts"
+    },
+    "./state/notebook-controller": {
+      "types": "./src/state/notebook-controller.ts",
+      "default": "./src/state/notebook-controller.ts"
+    },
     "./state/orchestration": {
       "types": "./src/state/orchestration.ts",
       "default": "./src/state/orchestration.ts"
@@ -114,6 +122,10 @@
     "./state/source-control": {
       "types": "./src/state/sourceControl.ts",
       "default": "./src/state/sourceControl.ts"
+    },
+    "./state/study": {
+      "types": "./src/state/study.ts",
+      "default": "./src/state/study.ts"
     },
     "./state/terminal": {
       "types": "./src/state/terminal.ts",

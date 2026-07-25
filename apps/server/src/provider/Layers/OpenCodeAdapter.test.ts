@@ -18,6 +18,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  type TurnId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { ServerConfig } from "../../config.ts";
@@ -392,6 +393,40 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.equal(sessions[0]?.status, "ready");
       NodeAssert.equal(sessions[0]?.activeTurnId, undefined);
       NodeAssert.equal(sessions[0]?.lastError, "prompt failed");
+    }),
+  );
+
+  it.effect("reports the exact fresh generation before OpenCode clears it on send failure", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-send-turn-failure-correlation");
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      let acceptedTurnId: TurnId | undefined;
+      runtimeMock.state.promptAsyncError = new Error("prompt failed after generation allocation");
+      yield* adapter
+        .sendTurn(
+          {
+            threadId,
+            input: "Fix it",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("opencode"),
+              model: "openai/gpt-5",
+            },
+          },
+          (accepted) =>
+            Effect.sync(() => {
+              acceptedTurnId = accepted.turnId;
+            }),
+        )
+        .pipe(Effect.flip);
+
+      NodeAssert.match(String(acceptedTurnId), /^opencode-turn-/);
+      NodeAssert.equal((yield* adapter.listSessions())[0]?.activeTurnId, undefined);
     }),
   );
 

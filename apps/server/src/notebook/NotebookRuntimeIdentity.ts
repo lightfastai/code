@@ -1,0 +1,2 @@
+export const NOTEBOOK_RUNTIME_KERNEL_LOCK_HASH =
+  "b722ee2863b81c5e7eeebfc929b917ca0ab654bf1616dfee5c4e9cd8b8c78a88";

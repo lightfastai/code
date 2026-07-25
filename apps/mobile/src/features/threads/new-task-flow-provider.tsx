@@ -55,6 +55,7 @@ import {
 } from "../../state/use-remote-environment-registry";
 import { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import { type VcsRef } from "@t3tools/client-runtime/state/vcs";
+import { selectedStudyDocumentIds } from "@t3tools/shared/studyContext";
 
 type WorkspaceMode = "local" | "worktree";
 
@@ -686,6 +687,10 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
         commandId: CommandId.make(metadata.commandId),
         text,
         attachments: draft.attachments,
+        documentIds:
+          draft.studyDocuments !== undefined
+            ? selectedStudyDocumentIds(draft.studyDocuments)
+            : (editingPendingTask?.documentIds ?? []),
         modelSelection: draftModelSelection,
         runtimeMode: draft.runtimeMode ?? DEFAULT_RUNTIME_MODE,
         interactionMode: draft.interactionMode ?? DEFAULT_PROVIDER_INTERACTION_MODE,

@@ -22,6 +22,7 @@ const invocation = {
   providerSessionId: "provider-session-mcp-test",
   providerInstanceId: ProviderInstanceId.make("codex"),
   capabilities: new Set(["preview"] as const),
+  allowNotebookExecution: false,
   issuedAt: 1,
   expiresAt: Number.MAX_SAFE_INTEGER,
 };
@@ -38,6 +39,15 @@ const TestLayer = McpHttpServer.PreviewToolkitRegistrationLive.pipe(
   Layer.provideMerge(McpServer.McpServer.layer),
   Layer.provideMerge(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
 );
+const ToolkitRegistrationTestLayer = Layer.mergeAll(
+  McpHttpServer.PreviewToolkitRegistrationLive,
+  McpHttpServer.ArtifactToolkitRegistrationLive,
+  McpHttpServer.StudyToolkitRegistrationLive,
+  McpHttpServer.NotebookToolkitRegistrationLive,
+).pipe(
+  Layer.provideMerge(McpServer.McpServer.layer),
+  Layer.provideMerge(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
+);
 
 it("normalizes empty successful notification responses to accepted", () => {
   const notificationResponse = McpHttpServer.normalizeMcpHttpResponse(
@@ -50,6 +60,59 @@ it("normalizes empty successful notification responses to accepted", () => {
   );
   expect(resultResponse.status).toBe(200);
 });
+
+it.effect("registers study, semantic artifact, and notebook tools with safe annotations", () =>
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+
+    const studyList = server.tools.find(({ tool }) => tool.name === "study_library_list");
+    expect(studyList?.tool.annotations).toMatchObject({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+
+    const studySearch = server.tools.find(({ tool }) => tool.name === "study_library_search");
+    expect(studySearch?.tool.annotations).toMatchObject({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+
+    const artifact = server.tools.find(({ tool }) => tool.name === "artifact_publish_3d_scene");
+    expect(artifact?.tool.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    });
+
+    const publishNotebook = server.tools.find(
+      ({ tool }) => tool.name === "artifact_publish_notebook",
+    );
+    expect(publishNotebook?.tool.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    });
+
+    for (const name of [
+      "artifact_create_notebook",
+      "notebook_execute_cell",
+      "notebook_execute_all",
+    ]) {
+      expect(server.tools.find(({ tool }) => tool.name === name)?.tool.annotations).toMatchObject({
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      });
+    }
+  }).pipe(Effect.provide(ToolkitRegistrationTestLayer)),
+);
 
 it.effect("returns bounded structural preview snapshot failures", () =>
   Effect.scoped(

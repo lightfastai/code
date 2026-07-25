@@ -50,6 +50,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type CodexAdapterShape } from "../Services/CodexAdapter.ts";
+import type { ProviderTurnAcceptedObserver } from "../Services/ProviderAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import {
@@ -89,6 +90,7 @@ interface CodexAdapterSessionContext {
   readonly scope: Scope.Closeable;
   readonly runtime: CodexSessionRuntimeShape;
   readonly eventFiber: Fiber.Fiber<void, never>;
+  pendingTurnAcceptedObserver: ProviderTurnAcceptedObserver | undefined;
   stopped: boolean;
 }
 
@@ -1451,9 +1453,24 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               });
               return;
             }
+            const acceptedTurn = runtimeEvents.find(
+              (runtimeEvent) =>
+                runtimeEvent.type === "turn.started" && runtimeEvent.turnId !== undefined,
+            );
+            if (acceptedTurn?.turnId !== undefined) {
+              const session = sessions.get(event.threadId);
+              const observer = session?.pendingTurnAcceptedObserver;
+              if (session !== undefined && observer !== undefined) {
+                session.pendingTurnAcceptedObserver = undefined;
+                yield* observer({
+                  threadId: event.threadId,
+                  turnId: acceptedTurn.turnId,
+                });
+              }
+            }
             yield* Queue.offerAll(runtimeEventQueue, runtimeEvents);
           }),
-        ).pipe(Effect.forkChild);
+        ).pipe(Effect.forkIn(sessionScope));
 
         const started = yield* runtime.start().pipe(
           Effect.mapError(
@@ -1479,6 +1496,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           scope: sessionScope,
           runtime,
           eventFiber,
+          pendingTurnAcceptedObserver: undefined,
           stopped: false,
         });
         sessionScopeTransferred = true;
@@ -1519,39 +1537,61 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     };
   });
 
-  const sendTurn: CodexAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
-    const codexAttachments = yield* Effect.forEach(
-      input.attachments ?? [],
-      (attachment) => resolveAttachment(input, attachment),
-      { concurrency: 1 },
-    );
+  const sendTurn: CodexAdapterShape["sendTurn"] = Effect.fn("sendTurn")(
+    function* (input, onAccepted) {
+      const codexAttachments = yield* Effect.forEach(
+        input.attachments ?? [],
+        (attachment) => resolveAttachment(input, attachment),
+        { concurrency: 1 },
+      );
 
-    const session = yield* requireSession(input.threadId);
-    const reasoningEffort =
-      input.modelSelection?.instanceId === boundInstanceId
-        ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
-        : undefined;
-    const serviceTier =
-      input.modelSelection?.instanceId === boundInstanceId
-        ? getCodexServiceTierOptionValue(input.modelSelection)
-        : undefined;
-    return yield* session.runtime
-      .sendTurn({
-        ...(input.input !== undefined ? { input: input.input } : {}),
-        ...(input.modelSelection?.instanceId === boundInstanceId
-          ? { model: input.modelSelection.model }
-          : {}),
-        ...(reasoningEffort
-          ? {
-              effort: reasoningEffort as EffectCodexSchema.V2TurnStartParams__ReasoningEffort,
+      const session = yield* requireSession(input.threadId);
+      session.pendingTurnAcceptedObserver = onAccepted;
+      const reasoningEffort =
+        input.modelSelection?.instanceId === boundInstanceId
+          ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
+          : undefined;
+      const serviceTier =
+        input.modelSelection?.instanceId === boundInstanceId
+          ? getCodexServiceTierOptionValue(input.modelSelection)
+          : undefined;
+      return yield* session.runtime
+        .sendTurn({
+          ...(input.input !== undefined ? { input: input.input } : {}),
+          ...(input.modelSelection?.instanceId === boundInstanceId
+            ? { model: input.modelSelection.model }
+            : {}),
+          ...(reasoningEffort
+            ? {
+                effort: reasoningEffort as EffectCodexSchema.V2TurnStartParams__ReasoningEffort,
+              }
+            : {}),
+          ...(serviceTier ? { serviceTier } : {}),
+          ...(input.interactionMode !== undefined
+            ? { interactionMode: input.interactionMode }
+            : {}),
+          ...(codexAttachments.length > 0 ? { attachments: codexAttachments } : {}),
+        })
+        .pipe(
+          Effect.tap((accepted) => {
+            const observer = session.pendingTurnAcceptedObserver;
+            if (observer === undefined) {
+              return Effect.void;
             }
-          : {}),
-        ...(serviceTier ? { serviceTier } : {}),
-        ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
-        ...(codexAttachments.length > 0 ? { attachments: codexAttachments } : {}),
-      })
-      .pipe(Effect.mapError((cause) => mapCodexRuntimeError(input.threadId, "turn/start", cause)));
-  });
+            session.pendingTurnAcceptedObserver = undefined;
+            return observer(accepted);
+          }),
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (session.pendingTurnAcceptedObserver === onAccepted) {
+                session.pendingTurnAcceptedObserver = undefined;
+              }
+            }),
+          ),
+          Effect.mapError((cause) => mapCodexRuntimeError(input.threadId, "turn/start", cause)),
+        );
+    },
+  );
 
   const requireSession = Effect.fn("requireSession")(function* (threadId: ThreadId) {
     const session = sessions.get(threadId);

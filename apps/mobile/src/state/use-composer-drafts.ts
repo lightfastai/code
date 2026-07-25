@@ -3,10 +3,12 @@ import {
   ModelSelection as ModelSelectionSchema,
   ProviderInteractionMode as ProviderInteractionModeSchema,
   RuntimeMode as RuntimeModeSchema,
+  StudyDocument as StudyDocumentSchema,
   type EnvironmentId,
   type ModelSelection,
   type ProviderInteractionMode,
   type RuntimeMode,
+  type StudyDocument,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { useEffect } from "react";
@@ -42,6 +44,7 @@ export interface ComposerDraft {
   readonly runtimeMode?: RuntimeMode;
   readonly interactionMode?: ProviderInteractionMode;
   readonly workspaceSelection?: ComposerDraftWorkspaceSelection;
+  readonly studyDocuments?: ReadonlyArray<StudyDocument>;
 }
 
 export interface ComposerDraftWorkspaceSelection {
@@ -53,7 +56,7 @@ export interface ComposerDraftWorkspaceSelection {
 
 export type ComposerDraftSettingsUpdate = Pick<
   ComposerDraft,
-  "modelSelection" | "runtimeMode" | "interactionMode" | "workspaceSelection"
+  "modelSelection" | "runtimeMode" | "interactionMode" | "workspaceSelection" | "studyDocuments"
 >;
 
 const ComposerDraftWorkspaceSelectionSchema = Schema.Struct({
@@ -70,6 +73,7 @@ const ComposerDraftSchema = Schema.Struct({
   runtimeMode: Schema.optional(RuntimeModeSchema),
   interactionMode: Schema.optional(ProviderInteractionModeSchema),
   workspaceSelection: Schema.optional(ComposerDraftWorkspaceSelectionSchema),
+  studyDocuments: Schema.optional(Schema.Array(StudyDocumentSchema).check(Schema.isMaxLength(32))),
 });
 
 const PersistedComposerDraftsSchema = Schema.Struct({
@@ -120,7 +124,8 @@ function isEmptyDraft(draft: ComposerDraft): boolean {
     draft.modelSelection === undefined &&
     draft.runtimeMode === undefined &&
     draft.interactionMode === undefined &&
-    draft.workspaceSelection === undefined
+    draft.workspaceSelection === undefined &&
+    (draft.studyDocuments?.length ?? 0) === 0
   );
 }
 

@@ -8,7 +8,7 @@ import * as Semaphore from "effect/Semaphore";
 import {
   NonNegativeInt,
   TextGenerationError,
-  type ChatAttachment,
+  type ChatImageAttachment,
   type ModelSelection,
   type OpenCodeSettings,
 } from "@t3tools/contracts";
@@ -364,7 +364,7 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
     readonly prompt: string;
     readonly outputSchemaJson: S;
     readonly modelSelection: ModelSelection;
-    readonly attachments?: ReadonlyArray<ChatAttachment> | undefined;
+    readonly attachments?: ReadonlyArray<ChatImageAttachment> | undefined;
   }) {
     const parsedModel = OpenCodeRuntime.parseOpenCodeModelSlug(input.modelSelection.model);
     if (!parsedModel) {

@@ -61,6 +61,7 @@ const asItemId = (value: string): ProviderItemId => ProviderItemId.make(value);
 class FakeCodexRuntime implements CodexSessionRuntimeShape {
   private readonly eventQueue = Effect.runSync(Queue.unbounded<ProviderEvent>());
   private readonly now = "2026-01-01T00:00:00.000Z";
+  public eventBeforeSendTurn: ProviderEvent | undefined;
 
   public readonly startImpl = vi.fn(() =>
     Promise.resolve({
@@ -127,8 +128,14 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
 
   getSession = Effect.promise(() => this.startImpl());
 
-  sendTurn(input: CodexSessionRuntimeSendTurnInput) {
-    return Effect.promise(() => this.sendTurnImpl(input));
+  sendTurn(input: CodexSessionRuntimeSendTurnInput): Effect.Effect<ProviderTurnStartResult> {
+    const eventBeforeSendTurn = this.eventBeforeSendTurn;
+    this.eventBeforeSendTurn = undefined;
+    const publishEvent =
+      eventBeforeSendTurn === undefined
+        ? Effect.void
+        : Queue.offer(this.eventQueue, eventBeforeSendTurn).pipe(Effect.asVoid);
+    return publishEvent.pipe(Effect.andThen(Effect.promise(() => this.sendTurnImpl(input))));
   }
 
   interruptTurn(turnId?: TurnId) {
@@ -448,6 +455,90 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect("keeps forwarding runtime events after the startSession caller completes", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const startFiber = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("codex"),
+          threadId: asThreadId("thread-start-caller-complete"),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Fiber.join(startFiber);
+
+      const runtime = lifecycleRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+
+      yield* runtime.emit({
+        id: asEventId("evt-after-start-caller-complete"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "turn/started",
+        threadId: asThreadId("thread-start-caller-complete"),
+        turnId: asTurnId("turn-after-start-caller-complete"),
+      });
+
+      const firstEvent = yield* Fiber.join(firstEventFiber).pipe(Effect.timeout("1 second"));
+      NodeAssert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some") {
+        return;
+      }
+      NodeAssert.equal(firstEvent.value.type, "turn.started");
+      NodeAssert.equal(firstEvent.value.turnId, "turn-after-start-caller-complete");
+    }),
+  );
+
+  it.effect(
+    "correlates Codex turn.started before publishing an event queued before send returns",
+    () =>
+      Effect.gen(function* () {
+        const { adapter, runtime } = yield* startLifecycleRuntime();
+        const order: string[] = [];
+        const turnId = asTurnId("turn-event-before-send-return");
+        runtime.eventBeforeSendTurn = {
+          id: asEventId("evt-turn-event-before-send-return"),
+          kind: "notification",
+          provider: ProviderDriverKind.make("codex"),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          method: "turn/started",
+          threadId: asThreadId("thread-1"),
+          turnId,
+        };
+        runtime.sendTurnImpl.mockImplementationOnce(() =>
+          Promise.resolve({
+            threadId: asThreadId("thread-1"),
+            turnId,
+          }),
+        );
+        const eventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              order.push("event");
+            }),
+          ),
+          Effect.forkChild,
+        );
+
+        yield* adapter.sendTurn(
+          {
+            threadId: asThreadId("thread-1"),
+            input: "correlate before ingest",
+            attachments: [],
+          },
+          (accepted) =>
+            Effect.sync(() => {
+              order.push(`accepted:${accepted.turnId}`);
+            }),
+        );
+        yield* Fiber.join(eventFiber);
+
+        NodeAssert.deepEqual(order, [`accepted:${turnId}`, "event"]);
+      }),
+  );
+
   it.effect("maps completed agent message items to canonical item.completed events", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();

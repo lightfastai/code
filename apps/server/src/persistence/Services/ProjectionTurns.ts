@@ -1,8 +1,8 @@
 /**
  * ProjectionTurnRepository - Projection repository interface for unified turn state.
  *
- * Owns persistence operations for pending starts, running/completed turn lifecycle,
- * and checkpoint metadata in a single projection table.
+ * Owns persistence operations for projected turn intent/lifecycle/checkpoint rows and the
+ * separate exact accepted-start admission record used by provider runtime ingestion.
  *
  * @module ProjectionTurnRepository
  */
@@ -78,6 +78,77 @@ export const ProjectionPendingTurnStart = Schema.Struct({
 });
 export type ProjectionPendingTurnStart = typeof ProjectionPendingTurnStart.Type;
 
+export const ProjectionAcceptedTurnStart = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
+  sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
+  requestedAt: IsoDateTime,
+});
+export type ProjectionAcceptedTurnStart = typeof ProjectionAcceptedTurnStart.Type;
+
+export const ProjectionAcceptedTurnStartState = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  providerTurnId: Schema.NullOr(TurnId),
+  sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
+  sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
+  requestedAt: IsoDateTime,
+  providerSendCompleted: Schema.Boolean,
+  runtimeAdmitted: Schema.Boolean,
+});
+export type ProjectionAcceptedTurnStartState = typeof ProjectionAcceptedTurnStartState.Type;
+
+export const ProjectionAcceptedTurnStartCorrelation = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  providerTurnId: TurnId,
+});
+export type ProjectionAcceptedTurnStartCorrelation =
+  typeof ProjectionAcceptedTurnStartCorrelation.Type;
+
+export const ProjectionAcceptedTurnStartPhase = Schema.Literals([
+  "provider-send-completed",
+  "runtime-admitted",
+]);
+export type ProjectionAcceptedTurnStartPhase = typeof ProjectionAcceptedTurnStartPhase.Type;
+
+export const CompleteProjectionAcceptedTurnStartPhaseInput = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  phase: ProjectionAcceptedTurnStartPhase,
+});
+export type CompleteProjectionAcceptedTurnStartPhaseInput =
+  typeof CompleteProjectionAcceptedTurnStartPhaseInput.Type;
+
+export const ProjectionAcceptedTurnStartPhaseResult = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
+  sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
+  requestedAt: IsoDateTime,
+  providerTurnId: Schema.NullOr(TurnId),
+  providerSendCompleted: Schema.Boolean,
+  runtimeAdmitted: Schema.Boolean,
+  finalized: Schema.Boolean,
+});
+export type ProjectionAcceptedTurnStartPhaseResult =
+  typeof ProjectionAcceptedTurnStartPhaseResult.Type;
+
+export const ProjectionCancelledTurnStart = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  providerTurnId: TurnId,
+  cancelledAt: IsoDateTime,
+});
+export type ProjectionCancelledTurnStart = typeof ProjectionCancelledTurnStart.Type;
+
+export const GetProjectionCancelledTurnStartInput = Schema.Struct({
+  threadId: ThreadId,
+  providerTurnId: TurnId,
+});
+export type GetProjectionCancelledTurnStartInput = typeof GetProjectionCancelledTurnStartInput.Type;
+
 export const ListProjectionTurnsByThreadInput = Schema.Struct({
   threadId: ThreadId,
 });
@@ -93,6 +164,12 @@ export const GetProjectionPendingTurnStartInput = Schema.Struct({
   threadId: ThreadId,
 });
 export type GetProjectionPendingTurnStartInput = typeof GetProjectionPendingTurnStartInput.Type;
+
+export const ProjectionTurnStartKey = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+});
+export type ProjectionTurnStartKey = typeof ProjectionTurnStartKey.Type;
 
 export const DeleteProjectionTurnsByThreadInput = Schema.Struct({
   threadId: ThreadId,
@@ -127,6 +204,55 @@ export interface ProjectionTurnRepositoryShape {
   readonly getPendingTurnStartByThreadId: (
     input: GetProjectionPendingTurnStartInput,
   ) => Effect.Effect<Option.Option<ProjectionPendingTurnStart>, ProjectionRepositoryError>;
+
+  /**
+   * Persists the exact turn start admitted by the reactor without replacing a different admission.
+   * Replaying the same `{threadId, messageId}` is idempotent.
+   */
+  readonly stageAcceptedTurnStart: (
+    row: ProjectionAcceptedTurnStart,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
+
+  /** Returns the reactor-admitted turn start independently of the latest projected intent. */
+  readonly getAcceptedTurnStartByThreadId: (
+    input: GetProjectionPendingTurnStartInput,
+  ) => Effect.Effect<Option.Option<ProjectionAcceptedTurnStartState>, ProjectionRepositoryError>;
+
+  /**
+   * Binds the provider generation to the exact reactor-admitted message. Replays of the same
+   * generation are idempotent; another message or generation cannot overwrite the binding.
+   */
+  readonly correlateAcceptedTurnStart: (
+    input: ProjectionAcceptedTurnStartCorrelation,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
+
+  /** Records one exact completion phase and atomically finalizes the row when both phases exist. */
+  readonly completeAcceptedTurnStartPhase: (
+    input: CompleteProjectionAcceptedTurnStartPhaseInput,
+  ) => Effect.Effect<
+    Option.Option<ProjectionAcceptedTurnStartPhaseResult>,
+    ProjectionRepositoryError
+  >;
+
+  /** Atomically records an exact failed provider generation and removes its accepted start. */
+  readonly cancelAcceptedTurnStart: (
+    input: ProjectionCancelledTurnStart,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
+
+  /** Returns an exact failed provider generation tombstone when present. */
+  readonly getCancelledTurnStartByProviderTurn: (
+    input: GetProjectionCancelledTurnStartInput,
+  ) => Effect.Effect<Option.Option<ProjectionCancelledTurnStart>, ProjectionRepositoryError>;
+
+  /** Deletes an accepted turn start only when both its thread and message identity match. */
+  readonly deleteAcceptedTurnStart: (
+    input: ProjectionTurnStartKey,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
+
+  /** Deletes a projected pending intent only when both its thread and message identity match. */
+  readonly deletePendingTurnStart: (
+    input: ProjectionTurnStartKey,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
 
   /**
    * Deletes only pending-start placeholder rows (`turnId = null`) for a thread and leaves concrete turn rows untouched.
