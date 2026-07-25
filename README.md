@@ -63,6 +63,8 @@ credentials are generated internally for each container and are never operator c
 ## Operate and verify
 
 - [Notebook Docker runtime runbook](./docs/lightfast/notebook-runtime.md)
+- [Local operator and test runbook](./docs/lightfast/local-testing.md)
+- [Core-cutoff pending tasks](./docs/lightfast/pending-tasks.md)
 - [Upstream synchronization runbook](./docs/lightfast/upstream-sync.md)
 - [Environment example](./.env.example)
 - [Documentation index](./docs/README.md)
