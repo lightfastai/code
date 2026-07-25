@@ -5,8 +5,9 @@ This is the handoff for the core-testable prototype slice in
 slice. Every unchecked item is a merge blocker: it must be completed or explicitly resolved and
 recorded in the PR before the draft can be marked ready or merged.
 
-For a cold restart after time away from the project, begin with
-[the PR #1 restart packet](./pr-1-restart.md).
+For a cold restart after time away from the project, begin with the restart packet recorded as a
+durable comment on PR #1, then read this checklist and the
+[operator and test runbook](./local-testing.md).
 
 ## Core-shippable slice
 
