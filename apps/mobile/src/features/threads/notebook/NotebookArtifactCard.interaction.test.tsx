@@ -14,11 +14,15 @@ import type {
 } from "@t3tools/lightfast-artifact-notebook/runtime";
 import type {
   NotebookArtifactPayload,
+  NotebookOutput,
   NotebookRevision,
 } from "@t3tools/lightfast-artifact-notebook/contracts";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
+  true;
 
 const controllerMocks = vi.hoisted(() => ({
   controller: {
@@ -53,10 +57,12 @@ vi.mock("react-native", async () => {
     ({
       accessibilityLabel,
       children,
+      horizontal: _horizontal,
       ...props
     }: {
       readonly accessibilityLabel?: string;
       readonly children?: React.ReactNode;
+      readonly horizontal?: boolean;
       readonly [key: string]: unknown;
     }) =>
       React.createElement(tag, { ...props, "aria-label": accessibilityLabel }, children);
@@ -108,7 +114,13 @@ vi.mock("react-native", async () => {
   };
 });
 
-vi.mock("react-native-svg", () => ({ SvgXml: () => null }));
+vi.mock("react-native-svg", async () => {
+  const React = await import("react");
+  return {
+    SvgXml: ({ xml }: { readonly xml: string }) =>
+      React.createElement("pre", { "data-notebook-svg-source": "true" }, xml),
+  };
+});
 vi.mock("../../../components/AppText", async () => {
   const React = await import("react");
   return {
@@ -154,6 +166,7 @@ const runtimeState = (
 const revision = (
   revisionId = referencedRevisionId,
   source = "print('hello')",
+  outputs: ReadonlyArray<NotebookOutput> = [],
 ): NotebookRevision => ({
   documentId: "notebook-1",
   revisionId,
@@ -173,11 +186,54 @@ const revision = (
         metadata: {},
         source,
         execution_count: null,
-        outputs: [],
+        outputs: [...outputs],
       },
     ],
   },
 });
+
+const outputRevision = (): NotebookRevision =>
+  revision(referencedRevisionId, "display_outputs()", [
+    { output_type: "stream", name: "stdout", text: "plain text output" },
+    {
+      output_type: "display_data",
+      metadata: {},
+      data: { "application/json": { answer: 42 } },
+    },
+    {
+      output_type: "display_data",
+      metadata: {},
+      data: {
+        "application/vnd.dataresource+json": {
+          schema: { fields: [{ name: "name" }, { name: "score" }] },
+          data: [{ name: "Ada", score: 9 }],
+        },
+      },
+    },
+    {
+      output_type: "display_data",
+      metadata: {},
+      data: { "image/png": "aGVsbG8=" },
+    },
+    {
+      output_type: "display_data",
+      metadata: {},
+      data: {
+        "image/svg+xml":
+          '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><text>safe svg</text></svg>',
+      },
+    },
+    {
+      output_type: "display_data",
+      metadata: {},
+      data: { "text/html": "<script>globalThis.pwned=true</script><b>unsafe html</b>" },
+    },
+    {
+      output_type: "display_data",
+      metadata: {},
+      data: { "application/javascript": "globalThis.pwned=true" },
+    },
+  ]);
 
 function artifact(documentIds?: ReadonlyArray<string>): ChatArtifactAttachment {
   const payload: NotebookArtifactPayload = {
@@ -378,6 +434,74 @@ describe("NotebookArtifactCard interactions", () => {
 
     await click(button(container, "Allow agent notebook execution"));
     expect(permissionMocks.change).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders supported native outputs and never executes active HTML or JavaScript", async () => {
+    controllerMocks.controller.readRevision.mockResolvedValue(outputRevision());
+    const { container } = renderCard("connected");
+    await flushEffects();
+
+    expect(container.textContent).toContain("plain text output");
+    expect(container.textContent).toContain('"answer": 42');
+    expect(container.textContent).toContain("name");
+    expect(container.textContent).toContain("score");
+    expect(container.textContent).toContain("Ada");
+    expect(container.textContent).toContain("9");
+    expect(
+      container.querySelector<HTMLImageElement>('img[alt^="Notebook image output"]')?.src,
+    ).toBe("data:image/png;base64,aGVsbG8=");
+
+    const svg = container.querySelector<HTMLElement>('[data-notebook-svg-source="true"]');
+    expect(svg?.textContent).toContain("<text>safe svg</text>");
+    expect(svg?.textContent).not.toContain("<script");
+    expect(container.textContent).toContain("HTML output is stored but never executed on mobile.");
+    expect(container.textContent).toContain(
+      "Active or unsupported notebook output is stored but not executed.",
+    );
+    expect(container.textContent).not.toContain("unsafe html");
+    expect(container.textContent).not.toContain("globalThis.pwned");
+  });
+
+  it("locks the editor and both revision-switch controls until pending actions complete", async () => {
+    const { container } = renderCard("connected");
+    await flushEffects();
+    const editor = container.querySelector<HTMLTextAreaElement>(
+      'textarea[aria-label="Edit code cell code-1"]',
+    );
+    if (editor === null) throw new Error("Missing code editor");
+    await changeSource(editor, "print('saved')");
+    await click(button(container, "Save immutable revision"));
+
+    let resolveLatestRestart!: () => void;
+    controllerMocks.controller.restart.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveLatestRestart = resolve;
+        }),
+    );
+    await click(button(container, "Restart / Reconnect"));
+    expect(editor.disabled).toBe(true);
+    expect(button(container, "View referenced revision").disabled).toBe(true);
+    await act(async () => resolveLatestRestart());
+    await flushEffects();
+    expect(editor.disabled).toBe(false);
+    expect(button(container, "View referenced revision").disabled).toBe(false);
+
+    await click(button(container, "View referenced revision"));
+    let resolveReferencedRestart!: () => void;
+    controllerMocks.controller.restart.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveReferencedRestart = resolve;
+        }),
+    );
+    await click(button(container, "Restart / Reconnect"));
+    expect(editor.disabled).toBe(true);
+    expect(button(container, "Open latest saved revision").disabled).toBe(true);
+    await act(async () => resolveReferencedRestart());
+    await flushEffects();
+    expect(editor.disabled).toBe(false);
+    expect(button(container, "Open latest saved revision").disabled).toBe(false);
   });
 
   it("reconnects a disconnected runtime through the public Reconnect control", async () => {
