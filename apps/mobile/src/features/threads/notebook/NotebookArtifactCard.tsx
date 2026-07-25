@@ -58,6 +58,8 @@ const INITIAL_RUNTIME_STATE: NotebookRuntimeView = {
   error: null,
 };
 
+const EMPTY_DOCUMENT_IDS: ReadonlyArray<string> = [];
+
 function artifactPayload(artifact: ChatArtifactAttachment): NotebookArtifactPayload | null {
   if (artifact.kind !== "notebook" || artifact.schemaVersion !== 1) return null;
   const candidate = artifact.payload;
@@ -217,6 +219,7 @@ function NotebookCellView({
   executionCount,
   running,
   runDisabled,
+  editDisabled,
   onChangeSource,
   onRun,
 }: {
@@ -226,6 +229,7 @@ function NotebookCellView({
   readonly executionCount: number | null;
   readonly running: boolean;
   readonly runDisabled: boolean;
+  readonly editDisabled: boolean;
   readonly onChangeSource: (source: string) => void;
   readonly onRun: () => void;
 }) {
@@ -247,6 +251,7 @@ function NotebookCellView({
         accessibilityLabel={`Edit ${cell.cell_type} cell ${cell.id}`}
         multiline
         value={cell.source}
+        editable={!editDisabled}
         onChangeText={onChangeSource}
         className="min-h-16 rounded-lg bg-neutral-100 px-3 py-2 font-mono text-sm text-foreground dark:bg-neutral-900"
       />
@@ -286,7 +291,11 @@ export function NotebookArtifactCard({
   const targetRef = useRef<ReturnType<typeof notebookRuntimeTarget> | null>(null);
   const connectedRef = useRef(connectionPhase === "connected");
   connectedRef.current = connectionPhase === "connected";
-  const documentIds = payload?.documentIds ?? [];
+  const documentIdsKey = payload?.documentIds?.join("\0") ?? "";
+  const documentIds = useMemo<ReadonlyArray<string>>(
+    () => (documentIdsKey.length === 0 ? EMPTY_DOCUMENT_IDS : documentIdsKey.split("\0")),
+    [documentIdsKey],
+  );
 
   const onRuntimeState = useCallback((state: NotebookRuntimeView) => {
     setRuntime(state);
@@ -404,6 +413,7 @@ export function NotebookArtifactCard({
             })),
         );
   const bookLabels = notebookBookScopeLabels(documentIds, studyDocuments);
+  const workingCopyMutationDisabled = connection.mutationsDisabled || pendingAction !== null;
   const revision =
     working === null
       ? null
@@ -525,7 +535,7 @@ export function NotebookArtifactCard({
             {revision?.canViewReferenced ? (
               <NotebookActionButton
                 label="View referenced revision"
-                disabled={connection.mutationsDisabled}
+                disabled={workingCopyMutationDisabled}
                 onPress={() => {
                   void perform("reference", async () => {
                     await replaceNotebookWorkingCopyRuntime({
@@ -545,7 +555,7 @@ export function NotebookArtifactCard({
             {revision?.canOpenLatest ? (
               <NotebookActionButton
                 label="Open latest saved revision"
-                disabled={connection.mutationsDisabled}
+                disabled={workingCopyMutationDisabled}
                 onPress={() => {
                   void perform("latest", async () => {
                     await replaceNotebookWorkingCopyRuntime({
@@ -584,11 +594,13 @@ export function NotebookArtifactCard({
                   runDisabled={
                     cell.cell_type !== "code" || controls.runDisabled || runtimeRequest === null
                   }
-                  onChangeSource={(source) =>
+                  editDisabled={workingCopyMutationDisabled}
+                  onChangeSource={(source) => {
+                    if (workingCopyMutationDisabled) return;
                     setWorking((current) =>
                       current === null ? null : updateNotebookCellSource(current, cell.id, source),
-                    )
-                  }
+                    );
+                  }}
                   onRun={() => {
                     if (cell.cell_type !== "code" || runtimeRequest === null) return;
                     void perform(`run:${cell.id}`, () =>
